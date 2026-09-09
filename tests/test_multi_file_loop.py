@@ -53,6 +53,34 @@ def test_succeeds_across_files_with_tests_and_integration_check(tmp_path: Path):
     assert (session.run_dir / "helper.py").read_text() == "def add(a, b):\n    return a + b"
 
 
+def test_catches_and_fixes_a_bad_cross_file_import_during_its_own_generation(tmp_path: Path):
+    # Mirrors a real failure: a file imports a sibling module under the
+    # wrong name. The bug must be caught (and fixed) during that file's
+    # own generation, not misattributed to its later companion test file.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            _PLAN_TWO_FILES,
+            "- add two numbers",  # spec for helper.py
+            "def add(a, b):\n    return a + b\n",  # codegen for helper.py
+            "from helper import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",  # test for helper.py
+            "- expose a main() that adds two numbers and print it when run",  # spec for main.py
+            "from helpr import add\n\ndef main():\n    return add(2, 3)\n",  # codegen: wrong module name
+            "from helper import add\n\ndef main():\n    return add(2, 3)\n",  # fix: corrected import
+            "from main import main\n\ndef test_main():\n    assert main() == 5\n",  # test for main.py
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("a script that adds two numbers")
+
+    assert result.success
+    main_file = next(f for f in result.files if Path(f.path).name == "main.py")
+    assert main_file.attempts == 1
+    test_files = [f for f in result.files if Path(f.path).name.startswith("test_")]
+    assert len(test_files) == 2  # test generation for main.py still happened after the fix
+
+
 def test_auto_fixes_a_per_file_lint_issue_without_calling_the_llm(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)

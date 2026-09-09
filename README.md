@@ -28,7 +28,7 @@ goal -> generate one Python file -> verify (compile, then run)
 
 ```
 goal -> plan (JSON-schema constrained list of files)
-  -> for each file: write a short spec -> generate -> verify (compile, then lint)
+  -> for each file: write a short spec -> generate -> verify (compile, then lint, then import-check)
        -> on failure, feed the exact error back for a scoped fix (bounded retries)
 ```
 
@@ -77,13 +77,28 @@ suppresses these and prints only the final summary, for scripting/
 log-parsing use. No changes to the orchestrator or prompts -- this taps
 the same event stream `summary.py` already reads, live.
 
-**Auto-fixable lint issues (this commit):** running against real local
-models surfaced a fix loop that burned all its retries on a lint error
-ruff's own output said was `[*] fixable with the --fix option` -- pure
-import-formatting noise, not something that needed the model at all. The
-lint check now runs `ruff check --fix`, which only ever applies fixes
-ruff considers safe (no semantic changes), so trivial nits get resolved
-for free and only genuinely unfixable violations cost an LLM fix attempt.
+**Auto-fixable lint issues:** running against real local models surfaced
+a fix loop that burned all its retries on a lint error ruff's own output
+said was `[*] fixable with the --fix option` -- pure import-formatting
+noise, not something that needed the model at all. The lint check now
+runs `ruff check --fix`, which only ever applies fixes ruff considers
+safe (no semantic changes), so trivial nits get resolved for free and
+only genuinely unfixable violations cost an LLM fix attempt.
+
+**Catch bad cross-file imports where they're caused (this commit):** a
+real run had one file import a sibling module under the wrong name (a
+typo). Its own verify (compile + lint) couldn't catch that -- neither
+actually resolves an import -- so the bug surfaced downstream, in its
+companion test file's fix loop, which has no bug of its own and no way to
+fix a different file. An implementation file's own verify now also
+import-checks it (`runpy.run_path` with a non-`"__main__"` run name, so
+`if __name__ == "__main__":` blocks never execute -- only import-time
+resolution is checked, no side effects). Since files are generated in the
+planner's declared dependency order, anything a file legitimately depends
+on already exists on disk by the time this runs, so it's safe -- and it
+means this class of bug gets caught, correctly attributed, and fixed
+during the file's own generation instead of wasting retries somewhere
+else.
 
 Multi-language support is a later phase (see the architecture doc) and
 not implemented yet.

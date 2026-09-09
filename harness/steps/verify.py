@@ -89,14 +89,54 @@ def lint_check(path: Path) -> VerifyResult:
     return VerifyResult(success=result.returncode == 0, stage="lint", output=_truncate(combined))
 
 
+def import_check(path: Path, timeout_seconds: int = 15) -> VerifyResult:
+    """Actually resolve the file's imports, without running its logic.
+
+    Files are generated in the planner's declared dependency order, so by
+    the time any file's own verify step runs, everything it can
+    legitimately depend on already exists on disk -- it's safe to import
+    it for real, not just syntax-check it. Uses runpy.run_path with a
+    run_name other than "__main__" so any `if __name__ == "__main__":`
+    block never executes (no side effects, only import-time resolution is
+    checked). The path is passed as a real subprocess argument, never
+    interpolated into the executed Python source text, so nothing
+    planner-controlled ever becomes part of the code that actually runs.
+    """
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import runpy, sys; runpy.run_path(sys.argv[1], run_name='not_main')",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+            cwd=path.parent,
+        )
+    except subprocess.TimeoutExpired as exc:
+        combined = (exc.stdout or "") + (exc.stderr or "")
+        return VerifyResult(
+            success=False,
+            stage="import",
+            output=_truncate(combined + f"\n[timed out after {timeout_seconds}s]"),
+        )
+    combined = result.stdout + result.stderr
+    return VerifyResult(success=result.returncode == 0, stage="import", output=_truncate(combined))
+
+
 def verify_python_file_static(path: Path) -> VerifyResult:
-    """Compile-check then lint-check. Used while a multi-file project is
-    still being assembled, when running the file isn't meaningful yet
-    because sibling files it depends on may not exist."""
+    """Compile-check, lint-check, then import-check. Used while a
+    multi-file project is still being assembled."""
     compiled = compile_check(path)
     if not compiled.success:
         return compiled
-    return lint_check(path)
+    linted = lint_check(path)
+    if not linted.success:
+        return linted
+    return import_check(path)
 
 
 def run_pytest(target: Path, timeout_seconds: int = 60) -> VerifyResult:

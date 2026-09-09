@@ -2,6 +2,7 @@ from pathlib import Path
 
 from harness.steps.verify import (
     compile_check,
+    import_check,
     lint_check,
     run_pytest,
     run_script,
@@ -97,14 +98,50 @@ def test_verify_python_file_static_stops_at_compile_on_syntax_error(tmp_path: Pa
     assert result.stage == "compile"
 
 
-def test_verify_python_file_static_never_executes_the_file(tmp_path: Path):
-    # A file that would fail if actually run (the module doesn't exist) but
-    # is syntactically valid and doesn't trip any lint rule must still pass
-    # the static check -- neither compiling nor linting executes imports.
-    f = tmp_path / "ok.py"
+def test_import_check_succeeds_when_a_sibling_module_exists(tmp_path: Path):
+    (tmp_path / "helper.py").write_text("def add(a, b):\n    return a + b\n")
+    f = tmp_path / "main.py"
+    f.write_text("from helper import add\n\nprint(add(2, 3))\n")
+    result = import_check(f)
+    assert result.success
+    assert result.stage == "import"
+
+
+def test_import_check_fails_on_an_unresolvable_import(tmp_path: Path):
+    f = tmp_path / "main.py"
+    f.write_text("import definitely_not_a_real_module_xyz\n")
+    result = import_check(f)
+    assert not result.success
+    assert result.stage == "import"
+    assert "definitely_not_a_real_module_xyz" in result.output
+
+
+def test_import_check_does_not_execute_the_main_block(tmp_path: Path):
+    # A __main__ block that would raise if actually run must not fire --
+    # only import-time resolution is being checked.
+    f = tmp_path / "main.py"
+    f.write_text('if __name__ == "__main__":\n    raise RuntimeError("should not run")\n')
+    result = import_check(f)
+    assert result.success
+
+
+def test_verify_python_file_static_stops_at_lint_before_import_check(tmp_path: Path):
+    f = tmp_path / "undefined_name.py"
+    f.write_text("print(undefined_name)\n")
+    result = verify_python_file_static(f)
+    assert not result.success
+    assert result.stage == "lint"
+
+
+def test_verify_python_file_static_runs_import_check_after_compile_and_lint(tmp_path: Path):
+    # Compiles fine, lints clean (the import is used, so ruff has nothing
+    # to flag or auto-fix), but the import doesn't resolve -- proves
+    # import_check runs as a third stage, not instead of compile/lint.
+    f = tmp_path / "main.py"
     f.write_text("import definitely_not_a_real_module_xyz\n\nprint(definitely_not_a_real_module_xyz)\n")
     result = verify_python_file_static(f)
-    assert result.success
+    assert not result.success
+    assert result.stage == "import"
 
 
 def test_run_pytest_passes_on_passing_test(tmp_path: Path):
