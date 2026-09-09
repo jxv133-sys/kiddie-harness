@@ -16,24 +16,40 @@ LLM call in this harness does exactly one thing.
 
 ## Status
 
-**Phase 0 + Phase 1 (this commit):** scaffolding, config, an Ollama client
-wrapper, and the single-file core loop:
+**Phase 0 + Phase 1:** scaffolding, config, an Ollama client wrapper, and
+the single-file core loop:
 
 ```
 goal -> generate one Python file -> verify (compile, then run)
   -> on failure, feed the exact error back for a scoped fix (bounded retries)
 ```
 
-Multi-file planning, a dedicated test-writing step, and multi-language
-support are later phases (see the architecture doc) and not implemented
-yet.
+**Phase 2 (this commit):** multi-file planning, layered on the same
+per-file loop:
+
+```
+goal -> plan (JSON-schema constrained list of files)
+  -> for each file: write a short spec -> generate -> verify (compile, then lint)
+       -> on failure, feed the exact error back for a scoped fix (bounded retries)
+  -> once every file passes: integration check
+       (run the test suite if any test_*.py file was planned, else run the entry file)
+       -> on failure, find which generated file the error names and fix just that file
+          (bounded rounds, and a global iteration budget across the whole run)
+```
+
+Every step above is still a single, narrow LLM call: the planner never
+writes code, the spec writer never writes code, and code generation for
+one file never sees any other file's contents.
+
+A dedicated test-writing step and multi-language support are later phases
+(see the architecture doc) and not implemented yet.
 
 ## Setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e .
 ```
 
 You'll also need [Ollama](https://ollama.com) running locally with a model
@@ -47,18 +63,23 @@ ollama serve   # if not already running
 ## Usage
 
 ```bash
+# single file (Phase 1)
 harness run --goal "a script that prints the first 20 Fibonacci numbers"
+
+# multi-file project (Phase 2)
+harness run --multi-file --goal "a CLI todo list app with add/remove/list commands"
 ```
 
 Options:
 
 - `--model` — override the model from `config/default.yaml` (default `deepseek-coder:8b`)
 - `--host` — override the Ollama host (default `http://localhost:11434`)
-- `--max-retries` — override the bounded fix-loop attempt count (default `3`)
-- `--filename` — output filename (default `main.py`)
+- `--max-retries` — override the bounded fix-loop attempt count per file (default `3`)
+- `--filename` — output filename, single-file mode only (default `main.py`)
+- `--multi-file` — plan and generate a multi-file project instead of one script
 
-Each run creates `workspace/<run-id>/` containing the generated file and a
-`log.jsonl` transcript of every prompt, response, and verifier result --
+Each run creates `workspace/<run-id>/` containing the generated file(s) and
+a `log.jsonl` transcript of every prompt, response, and verifier result --
 useful for seeing exactly where a small model went wrong.
 
 ## Tests

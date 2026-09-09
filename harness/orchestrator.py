@@ -8,11 +8,15 @@ narrow, single-purpose functions in harness.steps.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
+from pathlib import Path
 
 from .config import Config
 from .llm_client import OllamaClient
 from .session import Session
-from .steps import codegen, verify
+from .steps import codegen, plan, spec, verify
+from .steps.plan import FileTask
+from .steps.verify import VerifyResult
 
 
 @dataclasses.dataclass
@@ -21,6 +25,87 @@ class RunResult:
     file_path: str
     attempts: int
     last_output: str
+
+
+@dataclasses.dataclass
+class FileRunResult:
+    path: str
+    purpose: str
+    success: bool
+    attempts: int
+    last_output: str
+
+
+@dataclasses.dataclass
+class MultiFileRunResult:
+    success: bool
+    run_dir: str
+    files: list[FileRunResult]
+    integration: VerifyResult | None
+    total_iterations: int
+    stopped_early: bool
+
+
+def _safe_relative_path(raw: str) -> Path:
+    """Keep a model-provided file path confined to the run directory.
+
+    The planner's output ultimately controls where files get written, so a
+    stray "../" or absolute path must never be allowed to escape the
+    session's workspace directory.
+    """
+    candidate = Path(raw.strip())
+    parts = [p for p in candidate.parts if p not in ("..", ".", "/")]
+    if not parts:
+        parts = ["unnamed.py"]
+    return Path(*parts)
+
+
+def _generate_and_fix(
+    client: OllamaClient,
+    config: Config,
+    session: Session,
+    file_path: Path,
+    instruction: str,
+    verify_fn: Callable[[Path], VerifyResult],
+) -> tuple[VerifyResult, int]:
+    """Shared bounded-retry loop: generate once, verify, fix on failure.
+
+    Used by both the single-file loop and each file of the multi-file loop
+    so the "atomic prompt + deterministic verify + bounded retry" pattern
+    only has one implementation. Returns the final VerifyResult and how
+    many fix attempts were used.
+    """
+    code = codegen.generate_file(
+        client, instruction, temperature=config.temperature, max_tokens=config.max_tokens
+    )
+    session.log("codegen", path=str(file_path), code=code)
+
+    attempts = 0
+    while True:
+        file_path.write_text(code)
+        result = verify_fn(file_path)
+        session.log(
+            "verify",
+            path=str(file_path),
+            attempt=attempts,
+            stage=result.stage,
+            success=result.success,
+            output=result.output,
+        )
+
+        if result.success or attempts >= config.max_fix_attempts:
+            return result, attempts
+
+        code = codegen.fix_file(
+            client,
+            code=code,
+            error=result.output,
+            stage=result.stage,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+        )
+        attempts += 1
+        session.log("fix", path=str(file_path), attempt=attempts, code=code)
 
 
 class SingleFileLoop:
@@ -40,53 +125,173 @@ class SingleFileLoop:
         self.session.log("goal", goal=goal)
         file_path = self.session.run_dir / filename
 
-        code = codegen.generate_file(
-            self.client,
-            goal,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
+        result, attempts = _generate_and_fix(
+            self.client, self.config, self.session, file_path, goal, verify.verify_python_file
         )
-        self.session.log("codegen", code=code)
 
-        attempts = 0
-        result = None
-        while attempts <= self.config.max_fix_attempts:
-            file_path.write_text(code)
-            result = verify.verify_python_file(file_path)
-            self.session.log(
-                "verify",
-                attempt=attempts,
-                stage=result.stage,
-                success=result.success,
-                output=result.output,
+        if not result.success:
+            self.session.log("giving_up", attempts=attempts)
+
+        return RunResult(
+            success=result.success,
+            file_path=str(file_path),
+            attempts=attempts,
+            last_output=result.output,
+        )
+
+
+class MultiFileLoop:
+    """Phase 2: goal -> planned file list -> per-file spec + codegen + fix
+    -> integration verify.
+
+    Every stage is a fixed, narrow prompt: the planner never writes code,
+    the spec writer never writes code, and the code generator only ever
+    sees one file's spec at a time -- never the whole growing project.
+    """
+
+    def __init__(self, client: OllamaClient, config: Config, session: Session):
+        self.client = client
+        self.config = config
+        self.session = session
+
+    def run(self, goal: str) -> MultiFileRunResult:
+        self.session.log("goal", goal=goal)
+
+        tasks = plan.plan_files(
+            self.client, goal, temperature=self.config.temperature, max_tokens=self.config.max_tokens
+        )
+        self.session.log("plan", files=[dataclasses.asdict(t) for t in tasks])
+
+        iterations = 1  # the planning call itself
+        file_results: list[FileRunResult] = []
+        stopped_early = False
+
+        for task in tasks:
+            if iterations >= self.config.max_total_iterations:
+                self.session.log("budget_exhausted", before=task.path, iterations=iterations)
+                stopped_early = True
+                break
+
+            spec_text = spec.write_spec(
+                self.client,
+                goal,
+                task,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
             )
+            iterations += 1
+            self.session.log("spec", path=task.path, spec=spec_text)
 
-            if result.success:
-                return RunResult(
-                    success=True,
-                    file_path=str(file_path),
+            file_path = self.session.run_dir / _safe_relative_path(task.path)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            instruction = (
+                f"Create the file `{task.path}`.\n"
+                f"Purpose: {task.purpose}\n\n"
+                f"Specification:\n{spec_text}"
+            )
+            result, attempts = _generate_and_fix(
+                self.client,
+                self.config,
+                self.session,
+                file_path,
+                instruction,
+                verify.verify_python_file_static,
+            )
+            iterations += 1 + attempts
+
+            file_results.append(
+                FileRunResult(
+                    path=str(file_path),
+                    purpose=task.purpose,
+                    success=result.success,
                     attempts=attempts,
                     last_output=result.output,
                 )
+            )
 
-            if attempts == self.config.max_fix_attempts:
+        integration = None
+        all_files_ok = bool(file_results) and all(f.success for f in file_results)
+        if all_files_ok and not stopped_early:
+            integration, iterations = self._run_integration_with_fixes(tasks, iterations)
+
+        overall_success = (
+            all_files_ok and not stopped_early and (integration is None or integration.success)
+        )
+
+        if not overall_success:
+            self.session.log("giving_up", iterations=iterations, stopped_early=stopped_early)
+
+        return MultiFileRunResult(
+            success=overall_success,
+            run_dir=str(self.session.run_dir),
+            files=file_results,
+            integration=integration,
+            total_iterations=iterations,
+            stopped_early=stopped_early,
+        )
+
+    def _run_integration_with_fixes(
+        self, tasks: list[FileTask], iterations: int
+    ) -> tuple[VerifyResult | None, int]:
+        result = self._run_integration(tasks)
+        if result is None:
+            return None, iterations
+
+        rounds = 0
+        max_rounds = self.config.max_fix_attempts
+        while (
+            not result.success
+            and rounds < max_rounds
+            and iterations < self.config.max_total_iterations
+        ):
+            target = self._find_implicated_file(result.output, tasks)
+            if target is None:
                 break
 
-            code = codegen.fix_file(
+            fixed = codegen.fix_file(
                 self.client,
-                code=code,
+                code=target.read_text(),
                 error=result.output,
                 stage=result.stage,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
             )
-            self.session.log("fix", attempt=attempts + 1, code=code)
-            attempts += 1
+            target.write_text(fixed)
+            iterations += 1
+            rounds += 1
+            self.session.log("integration_fix", path=str(target), round=rounds, code=fixed)
+            result = self._run_integration(tasks)
 
-        self.session.log("giving_up", attempts=attempts)
-        return RunResult(
-            success=False,
-            file_path=str(file_path),
-            attempts=attempts,
-            last_output=result.output if result else "",
+        return result, iterations
+
+    def _run_integration(self, tasks: list[FileTask]) -> VerifyResult | None:
+        test_files = [t for t in tasks if Path(t.path).name.startswith("test_")]
+        if test_files:
+            result = verify.run_pytest(self.session.run_dir)
+        else:
+            entry = self._pick_entry_path(tasks)
+            if entry is None:
+                return None
+            result = verify.run_script(self.session.run_dir / entry)
+
+        self.session.log(
+            "integration_verify", stage=result.stage, success=result.success, output=result.output
         )
+        return result
+
+    def _pick_entry_path(self, tasks: list[FileTask]) -> Path | None:
+        for task in tasks:
+            if Path(task.path).name == "main.py":
+                return _safe_relative_path(task.path)
+        return _safe_relative_path(tasks[0].path) if tasks else None
+
+    def _find_implicated_file(self, error_text: str, tasks: list[FileTask]) -> Path | None:
+        """Best-effort: a traceback almost always names the file it failed
+        in, so look for one of the generated files' names in the error
+        text. If none matches, there's nothing safe to scope a fix to."""
+        for task in tasks:
+            safe_path = _safe_relative_path(task.path)
+            if safe_path.name in error_text:
+                return self.session.run_dir / safe_path
+        return None
