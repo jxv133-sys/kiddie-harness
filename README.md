@@ -69,6 +69,14 @@ same loop shape -- no changes to what the model is asked to do:
   table prints at the end of every `harness run`, and `harness inspect
   --run-id <id>` re-renders it for any past run.
 
+**Live progress output (this commit):** a multi-file run can sit silent
+for minutes on modest hardware, so `harness run` now prints a line per
+step as it happens (`[plan]`, `[spec]`, `[codegen]`, `[verify:<stage>]`,
+`[fix]`, `[integration:<stage>]`, ...) instead of only the final table.
+`--quiet` suppresses these and prints only the final summary, for
+scripting/log-parsing use. No changes to the orchestrator or prompts --
+this taps the same event stream `summary.py` already reads, live.
+
 Multi-language support is a later phase (see the architecture doc) and
 not implemented yet.
 
@@ -105,6 +113,7 @@ Options:
 - `--max-retries` — override the bounded fix-loop attempt count per file (default `3`)
 - `--filename` — output filename, single-file mode only (default `main.py`)
 - `--multi-file` — plan and generate a multi-file project instead of one script
+- `--quiet` — suppress live per-step progress lines; print only the final summary
 
 Each run creates `workspace/<run-id>/` containing the generated file(s) and
 a `log.jsonl` transcript of every prompt, response, and verifier result --

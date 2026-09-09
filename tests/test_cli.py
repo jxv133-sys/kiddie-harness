@@ -80,3 +80,53 @@ def test_inspect_reports_error_for_missing_run(tmp_path, monkeypatch, capsys):
 
     assert exit_code == 2
     assert "No such run" in capsys.readouterr().out
+
+
+def test_main_run_prints_live_progress_by_default(tmp_path, monkeypatch, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: FakeClient(["print('hi')\n"]))
+
+    exit_code = cli.main(["run", "--goal", "print hi"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "[codegen]" in out
+    assert "[verify:" in out
+    assert out.index("[codegen]") < out.index("Result:")
+
+
+def test_main_run_quiet_suppresses_live_progress(tmp_path, monkeypatch, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: FakeClient(["print('hi')\n"]))
+
+    exit_code = cli.main(["run", "--quiet", "--goal", "print hi"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "[codegen]" not in out
+    assert "[verify:" not in out
+    assert "Result: SUCCESS" in out
+
+
+def test_main_multi_file_prints_plan_and_spec_progress(tmp_path, monkeypatch, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    plan_json = '{"files": [{"path": "main.py", "purpose": "entry point"}]}'
+    monkeypatch.setattr(
+        cli,
+        "OllamaClient",
+        lambda *a, **k: FakeClient(
+            [
+                plan_json,
+                "- print hello",  # spec
+                "print('hello')\n",  # codegen
+                "def test_placeholder():\n    assert True\n",  # test for main.py
+            ]
+        ),
+    )
+
+    exit_code = cli.main(["run", "--multi-file", "--goal", "print hello"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "[plan] 1 file(s) planned" in out
+    assert "[spec] main.py" in out

@@ -11,6 +11,7 @@ import dataclasses
 import datetime
 import json
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,14 +26,20 @@ class Session:
     run_id: str
     run_dir: Path
     log_path: Path
+    on_event: Callable[[str, dict], None] | None = None
 
     @classmethod
-    def create(cls, workspace_root: Path, run_id: str | None = None) -> Session:
+    def create(
+        cls,
+        workspace_root: Path,
+        run_id: str | None = None,
+        on_event: Callable[[str, dict], None] | None = None,
+    ) -> Session:
         run_id = run_id or new_run_id()
         run_dir = workspace_root / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "log.jsonl"
-        return cls(run_id=run_id, run_dir=run_dir, log_path=log_path)
+        return cls(run_id=run_id, run_dir=run_dir, log_path=log_path, on_event=on_event)
 
     def log(self, event: str, **fields: Any) -> None:
         record = {
@@ -42,3 +49,9 @@ class Session:
         }
         with self.log_path.open("a") as f:
             f.write(json.dumps(record) + "\n")
+
+        if self.on_event is not None:
+            try:
+                self.on_event(event, fields)
+            except Exception:  # noqa: S110, BLE001 -- a broken reporter must never take down a run
+                pass

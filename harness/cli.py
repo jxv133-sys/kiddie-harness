@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import summary
+from . import progress, summary
 from .config import Config
 from .llm_client import OllamaClient, OllamaError
 from .orchestrator import MultiFileLoop, SingleFileLoop
@@ -36,6 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--multi-file",
         action="store_true",
         help="Plan and generate a multi-file project instead of a single script",
+    )
+    run.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress live per-step progress lines; print only the final summary",
     )
 
     inspect = subparsers.add_parser("inspect", help="Summarize a previous run from its log.jsonl")
@@ -105,10 +110,11 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model, host=args.host, max_fix_attempts=args.max_retries
         )
         client = OllamaClient(config.ollama_host, config.model, config.timeout_seconds)
-        session = Session.create(config.workspace_root)
+        reporter = None if args.quiet else progress.console_reporter()
+        session = Session.create(config.workspace_root, on_event=reporter)
 
-        print(f"Run {session.run_id}: goal = {args.goal!r}")
-        print(f"Model: {config.model} @ {config.ollama_host}")
+        print(f"Run {session.run_id}: goal = {args.goal!r}", flush=True)
+        print(f"Model: {config.model} @ {config.ollama_host}", flush=True)
 
         if args.multi_file:
             return _run_multi_file(client, config, session, args)
