@@ -32,8 +32,8 @@ goal -> plan (JSON-schema constrained list of files)
        -> on failure, feed the exact error back for a scoped fix (bounded retries)
 ```
 
-**Phase 3 (this commit):** a dedicated test-writing step, added after each
-implementation file:
+**Phase 3:** a dedicated test-writing step, added after each implementation
+file:
 
 ```
   -> for each implementation file that passed: write a test file for it
@@ -49,6 +49,25 @@ Every step above is still a single, narrow LLM call: the planner never
 writes code, the spec writer never writes code, code generation for one
 file never sees any other file's contents, and the test writer is always
 a separate call from the implementation it's testing.
+
+**Phase 4 (this commit):** hardening and observability, on top of the
+same loop shape -- no changes to what the model is asked to do:
+
+- **Truncation-aware retries.** Ollama reports `done_reason: "length"`
+  when a response was cut off by hitting `max_tokens` mid-file, a
+  distinct failure mode from an ordinary syntax error. The next attempt
+  for that file gets more room (`max_tokens` doubles, capped at
+  `generation.max_tokens_ceiling`) and the fix prompt is told the
+  previous output was cut off, instead of just being handed a confusing
+  syntax error.
+- **Graceful CLI errors.** An unreachable Ollama host or a malformed
+  planner response now prints one clean line and exits with code `2`,
+  instead of a raw Python traceback.
+- **Run summary / inspector.** `harness/summary.py` turns a run's
+  `log.jsonl` into a compact table (per-file pass/fail, fix-attempt
+  count, truncation flag, integration result, total LLM calls). The same
+  table prints at the end of every `harness run`, and `harness inspect
+  --run-id <id>` re-renders it for any past run.
 
 Multi-language support is a later phase (see the architecture doc) and
 not implemented yet.
@@ -89,7 +108,13 @@ Options:
 
 Each run creates `workspace/<run-id>/` containing the generated file(s) and
 a `log.jsonl` transcript of every prompt, response, and verifier result --
-useful for seeing exactly where a small model went wrong.
+useful for seeing exactly where a small model went wrong. A summary table
+prints at the end of every run; to see it again later (or for a run that
+crashed before finishing), use:
+
+```bash
+harness inspect --run-id <run-id>
+```
 
 ## Tests
 
@@ -104,5 +129,6 @@ and verifier logic can be exercised without a running Ollama server.
 
 Defaults live in `config/default.yaml`: model name, generation temperature
 (kept low — small models drift more at higher temperature and every step
-here needs one predictable output, not creative variety), token limits,
-and retry budgets.
+here needs one predictable output, not creative variety), token limits
+(including `max_tokens_ceiling`, the cap on adaptive growth after a
+truncated response), and retry budgets.

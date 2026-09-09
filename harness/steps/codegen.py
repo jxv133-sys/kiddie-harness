@@ -7,6 +7,7 @@ what happens next -- that's the orchestrator's job.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 from ..llm_client import OllamaClient
@@ -17,11 +18,17 @@ _CODEGEN_TEMPLATE = (_PROMPTS_DIR / "codegen.md").read_text()
 _FIX_TEMPLATE = (_PROMPTS_DIR / "fix.md").read_text()
 
 
-def generate_file(client: OllamaClient, goal: str, *, temperature: float, max_tokens: int) -> str:
+@dataclasses.dataclass
+class GeneratedCode:
+    code: str
+    truncated: bool
+
+
+def generate_file(client: OllamaClient, goal: str, *, temperature: float, max_tokens: int) -> GeneratedCode:
     """Goal -> full file content. One-shot, no prior code, no error context."""
     prompt = _CODEGEN_TEMPLATE.format(goal=goal)
     response = client.generate(prompt, temperature=temperature, max_tokens=max_tokens)
-    return strip_code_fences(response.text)
+    return GeneratedCode(code=strip_code_fences(response.text), truncated=response.truncated)
 
 
 def fix_file(
@@ -32,8 +39,8 @@ def fix_file(
     stage: str,
     temperature: float,
     max_tokens: int,
-) -> str:
+) -> GeneratedCode:
     """Current file + exact error -> corrected full file. Nothing else in context."""
     prompt = _FIX_TEMPLATE.format(code=code, error=error, stage=stage)
     response = client.generate(prompt, temperature=temperature, max_tokens=max_tokens)
-    return strip_code_fences(response.text)
+    return GeneratedCode(code=strip_code_fences(response.text), truncated=response.truncated)

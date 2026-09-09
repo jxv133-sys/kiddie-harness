@@ -11,6 +11,11 @@ generation:
   # and every step here needs a single predictable output, not creative variety.
   temperature: 0.2
   max_tokens: 2048
+  # Ceiling for the adaptive doubling in _generate_and_fix when a response
+  # is truncated (Ollama's done_reason == "length") -- gives a fix attempt
+  # room to finish a file that ran out of tokens, without letting a single
+  # file's budget grow unbounded.
+  max_tokens_ceiling: 8192
 
 retries:
   # Bounded retries per single-file fix loop (Phase 1).

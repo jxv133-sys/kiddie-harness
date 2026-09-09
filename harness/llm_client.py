@@ -23,6 +23,14 @@ class OllamaError(RuntimeError):
 class LLMResponse:
     text: str
     raw: dict[str, Any]
+    done_reason: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        """True if Ollama stopped because it ran out of max_tokens, not
+        because the model finished -- a distinct failure mode from an
+        ordinary syntax error."""
+        return self.done_reason == "length"
 
 
 class OllamaClient:
@@ -79,7 +87,7 @@ class OllamaClient:
         if text is None:
             raise OllamaError(f"Ollama response missing 'response' field: {data}")
 
-        return LLMResponse(text=text, raw=data)
+        return LLMResponse(text=text, raw=data, done_reason=data.get("done_reason"))
 
     def generate_json(
         self,

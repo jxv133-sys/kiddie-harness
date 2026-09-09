@@ -17,6 +17,7 @@ class Config:
     timeout_seconds: int
     temperature: float
     max_tokens: int
+    max_tokens_ceiling: int
     max_fix_attempts: int
     max_total_iterations: int
     workspace_root: Path
@@ -35,6 +36,7 @@ class Config:
             timeout_seconds=ollama["timeout_seconds"],
             temperature=generation["temperature"],
             max_tokens=generation["max_tokens"],
+            max_tokens_ceiling=generation["max_tokens_ceiling"],
             max_fix_attempts=retries["max_fix_attempts"],
             max_total_iterations=retries["max_total_iterations"],
             workspace_root=Path(workspace["root"]),

@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import sys
 
+from . import summary
 from .config import Config
-from .llm_client import OllamaClient
+from .llm_client import OllamaClient, OllamaError
 from .orchestrator import MultiFileLoop, SingleFileLoop
 from .session import Session
+from .steps.plan import PlanError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,55 +38,67 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plan and generate a multi-file project instead of a single script",
     )
 
+    inspect = subparsers.add_parser("inspect", help="Summarize a previous run from its log.jsonl")
+    inspect.add_argument("--run-id", required=True, help="Run id (the workspace/<run-id> directory name)")
+
     return parser
 
 
 def _run_single_file(client: OllamaClient, config: Config, session: Session, args) -> int:
-    loop = SingleFileLoop(client, config, session)
-    result = loop.run(args.goal, filename=args.filename)
+    try:
+        loop = SingleFileLoop(client, config, session)
+        result = loop.run(args.goal, filename=args.filename)
+    except (OllamaError, PlanError) as exc:
+        print(f"ERROR: {exc}")
+        return 2
 
-    if result.success:
-        print(f"SUCCESS after {result.attempts} fix attempt(s): {result.file_path}")
-        return 0
-
-    print(f"FAILED after {result.attempts} fix attempt(s): {result.file_path}")
-    print("Last error:")
-    print(result.last_output)
+    print(summary.render_table(summary.load_run_summary(session.log_path)))
+    if not result.success:
+        print("Last error:")
+        print(result.last_output)
     print(f"Full transcript: {session.log_path}")
-    return 1
+    return 0 if result.success else 1
 
 
 def _run_multi_file(client: OllamaClient, config: Config, session: Session, args) -> int:
-    loop = MultiFileLoop(client, config, session)
-    result = loop.run(args.goal)
+    try:
+        loop = MultiFileLoop(client, config, session)
+        result = loop.run(args.goal)
+    except (OllamaError, PlanError) as exc:
+        print(f"ERROR: {exc}")
+        return 2
 
-    for f in result.files:
-        status = "ok" if f.success else "FAILED"
-        print(f"  [{status}] {f.path} ({f.attempts} fix attempt(s)) -- {f.purpose}")
-
-    if result.integration is not None:
-        status = "ok" if result.integration.success else "FAILED"
-        print(f"  [{status}] integration check ({result.integration.stage})")
-
+    print(summary.render_table(summary.load_run_summary(session.log_path)))
+    if (
+        not result.success
+        and not result.stopped_early
+        and result.integration is not None
+        and not result.integration.success
+    ):
+        print("Last integration error:")
+        print(result.integration.output)
     print(f"Full transcript: {session.log_path}")
+    return 0 if result.success else 1
 
-    if result.success:
-        print(f"SUCCESS: {result.run_dir} ({result.total_iterations} LLM call(s) total)")
-        return 0
 
-    if result.stopped_early:
-        print(f"STOPPED: iteration budget exhausted after {result.total_iterations} LLM call(s)")
-    else:
-        print(f"FAILED after {result.total_iterations} LLM call(s) total")
-        if result.integration is not None and not result.integration.success:
-            print("Last integration error:")
-            print(result.integration.output)
-    return 1
+def _inspect(args) -> int:
+    config = Config.load()
+    log_path = config.workspace_root / args.run_id / "log.jsonl"
+    if not log_path.exists():
+        print(f"No such run: {args.run_id} (expected {log_path})")
+        return 2
+
+    run_summary = summary.load_run_summary(log_path)
+    print(summary.render_table(run_summary))
+    return 0 if run_summary.succeeded else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "inspect":
+        return _inspect(args)
 
     if args.command == "run":
         config = Config.load().with_overrides(

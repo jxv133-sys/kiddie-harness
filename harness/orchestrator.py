@@ -60,6 +60,12 @@ def _safe_relative_path(raw: str) -> Path:
     return Path(*parts)
 
 
+_TRUNCATION_NOTE = (
+    "[NOTE: the previous response was cut off before finishing -- "
+    "write a shorter, complete file if possible.]\n"
+)
+
+
 def _generate_and_fix(
     client: OllamaClient,
     config: Config,
@@ -68,7 +74,7 @@ def _generate_and_fix(
     instruction: str,
     verify_fn: Callable[[Path], VerifyResult],
     *,
-    generate_fn: Callable[..., str] = codegen.generate_file,
+    generate_fn: Callable[..., codegen.GeneratedCode] = codegen.generate_file,
 ) -> tuple[VerifyResult, int]:
     """Shared bounded-retry loop: generate once, verify, fix on failure.
 
@@ -79,9 +85,18 @@ def _generate_and_fix(
     codegen.fix_file since a fix only ever needs the current code and the
     exact error, regardless of what kind of file it is. Returns the final
     VerifyResult and how many fix attempts were used.
+
+    Tracks a per-file max_tokens that doubles (capped at
+    config.max_tokens_ceiling) whenever a generation was truncated -- a
+    file that ran out of tokens needs more room on the next attempt, not
+    just a generic "here's the error" retry.
     """
-    code = generate_fn(client, instruction, temperature=config.temperature, max_tokens=config.max_tokens)
-    session.log("codegen", path=str(file_path), code=code)
+    max_tokens = config.max_tokens
+    gen = generate_fn(client, instruction, temperature=config.temperature, max_tokens=max_tokens)
+    code = gen.code
+    session.log("codegen", path=str(file_path), code=code, truncated=gen.truncated)
+    if gen.truncated:
+        max_tokens = min(max_tokens * 2, config.max_tokens_ceiling)
 
     attempts = 0
     while True:
@@ -99,16 +114,23 @@ def _generate_and_fix(
         if result.success or attempts >= config.max_fix_attempts:
             return result, attempts
 
-        code = codegen.fix_file(
+        error = result.output
+        if gen.truncated:
+            error = _TRUNCATION_NOTE + error
+
+        gen = codegen.fix_file(
             client,
             code=code,
-            error=result.output,
+            error=error,
             stage=result.stage,
             temperature=config.temperature,
-            max_tokens=config.max_tokens,
+            max_tokens=max_tokens,
         )
+        code = gen.code
         attempts += 1
-        session.log("fix", path=str(file_path), attempt=attempts, code=code)
+        session.log("fix", path=str(file_path), attempt=attempts, code=code, truncated=gen.truncated)
+        if gen.truncated:
+            max_tokens = min(max_tokens * 2, config.max_tokens_ceiling)
 
 
 class SingleFileLoop:

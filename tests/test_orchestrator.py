@@ -57,3 +57,39 @@ def test_strips_markdown_fence_from_model_output(tmp_path: Path):
 
     assert result.success
     assert Path(result.file_path).read_text() == "print('hello world')"
+
+
+def test_grows_max_tokens_and_notes_truncation_after_a_cut_off_response(tmp_path: Path):
+    config = make_config(tmp_path, max_tokens=512, max_tokens_ceiling=4096)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            ("print('unterminated", "length"),  # cut off mid-string, syntax error
+            "print('hello world')\n",  # fixed, complete
+        ]
+    )
+
+    result = SingleFileLoop(client, config, session).run("print hello world")
+
+    assert result.success
+    assert result.attempts == 1
+    assert client.max_tokens_calls == [512, 1024]
+    assert "cut off" in client.calls[1]
+
+
+def test_max_tokens_growth_is_capped_by_ceiling(tmp_path: Path):
+    config = make_config(tmp_path, max_tokens=3000, max_tokens_ceiling=4000, max_fix_attempts=2)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            ("bad(", "length"),
+            ("also bad(", "length"),
+            "print('ok')\n",
+        ]
+    )
+
+    result = SingleFileLoop(client, config, session).run("goal")
+
+    assert result.success
+    assert result.attempts == 2
+    assert client.max_tokens_calls == [3000, 4000, 4000]

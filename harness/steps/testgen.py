@@ -12,17 +12,20 @@ from pathlib import Path
 
 from ..llm_client import OllamaClient
 from ..postprocess import strip_code_fences
+from .codegen import GeneratedCode
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 _TESTGEN_TEMPLATE = (_PROMPTS_DIR / "testgen.md").read_text()
 
 
-def generate_test_file(client: OllamaClient, instruction: str, *, temperature: float, max_tokens: int) -> str:
+def generate_test_file(
+    client: OllamaClient, instruction: str, *, temperature: float, max_tokens: int
+) -> GeneratedCode:
     """Instruction describing the module under test -> full test file content.
 
-    Mirrors codegen.generate_file's signature exactly so the same bounded
-    generate/verify/fix loop can drive either one.
+    Mirrors codegen.generate_file's signature (and return type) exactly so
+    the same bounded generate/verify/fix loop can drive either one.
     """
     prompt = _TESTGEN_TEMPLATE.format(instruction=instruction)
     response = client.generate(prompt, temperature=temperature, max_tokens=max_tokens)
-    return strip_code_fences(response.text)
+    return GeneratedCode(code=strip_code_fences(response.text), truncated=response.truncated)
