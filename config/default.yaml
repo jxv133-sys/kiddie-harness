@@ -1,0 +1,22 @@
+# Default configuration for the harness.
+# Any of these can be overridden with --model / --host / --max-retries CLI flags.
+
+ollama:
+  host: "http://localhost:11434"
+  model: "deepseek-coder:8b"
+  timeout_seconds: 120
+
+generation:
+  # Kept low and stable on purpose: small models drift more at higher temperature,
+  # and every step here needs a single predictable output, not creative variety.
+  temperature: 0.2
+  max_tokens: 2048
+
+retries:
+  # Bounded retries per single-file fix loop (Phase 1).
+  max_fix_attempts: 3
+  # Bounded total LLM calls across an entire multi-file run (Phase 2+).
+  max_total_iterations: 25
+
+workspace:
+  root: "workspace"
