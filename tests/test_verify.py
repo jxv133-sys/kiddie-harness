@@ -67,9 +67,22 @@ def test_lint_check_passes_on_clean_file(tmp_path: Path):
     assert result.stage == "lint"
 
 
-def test_lint_check_fails_on_unused_import(tmp_path: Path):
+def test_lint_check_auto_fixes_an_unused_import(tmp_path: Path):
+    # Unused imports are safe for ruff to fix itself -- this must succeed
+    # without needing an LLM fix call.
     f = tmp_path / "unused_import.py"
     f.write_text("import os\nx = 1\n")
+    result = lint_check(f)
+    assert result.success
+    assert result.stage == "lint"
+    assert "os" not in f.read_text()
+
+
+def test_lint_check_fails_on_a_violation_ruff_cannot_fix(tmp_path: Path):
+    # An undefined name isn't something ruff can guess a fix for, so it
+    # must still be reported as a real failure.
+    f = tmp_path / "undefined_name.py"
+    f.write_text("print(undefined_name)\n")
     result = lint_check(f)
     assert not result.success
     assert result.stage == "lint"

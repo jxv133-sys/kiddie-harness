@@ -3,6 +3,7 @@ from pathlib import Path
 
 from harness.orchestrator import MultiFileLoop
 from harness.session import Session
+from harness.steps.plan import FileTask
 
 from .fakes import FakeClient, make_config
 
@@ -52,14 +53,34 @@ def test_succeeds_across_files_with_tests_and_integration_check(tmp_path: Path):
     assert (session.run_dir / "helper.py").read_text() == "def add(a, b):\n    return a + b"
 
 
-def test_recovers_from_a_per_file_lint_failure(tmp_path: Path):
+def test_auto_fixes_a_per_file_lint_issue_without_calling_the_llm(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
     client = FakeClient(
         [
             json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
             "- print hello",  # spec
-            "import os\nprint('hello')\n",  # codegen: unused import -> lint failure
+            "import os\nprint('hello')\n",  # codegen: unused import -- ruff auto-fixes this itself
+            "def test_placeholder():\n    assert True\n",  # test for main.py
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("print hello")
+
+    assert result.success
+    assert len(result.files) == 2
+    assert result.files[0].attempts == 0
+    assert len(client.calls) == 4  # no LLM fix call was needed
+
+
+def test_recovers_from_an_unfixable_per_file_lint_issue(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
+            "- print hello",  # spec
+            "print(undefined_name)\n",  # codegen: undefined name -- ruff can't fix this itself
             "print('hello')\n",  # fix: clean
             "def test_placeholder():\n    assert True\n",  # test for main.py
         ]
@@ -150,3 +171,40 @@ def test_skips_test_generation_for_a_planner_provided_test_file(tmp_path: Path):
     assert len(result.files) == 1
     assert result.integration is not None
     assert result.integration.stage == "pytest"
+
+
+def test_fix_prompt_reflects_ruffs_autofix_when_a_second_issue_remains(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
+            "- print hello",  # spec
+            # unused import (auto-fixed by ruff) + undefined name (not auto-fixable)
+            "import os\nprint(undefined_name)\n",
+            "print('hello')\n",  # fix: clean
+            "def test_placeholder():\n    assert True\n",  # test for main.py
+        ]
+    )
+
+    MultiFileLoop(client, config, session).run("print hello")
+
+    fix_prompt = client.calls[3]  # plan, spec, codegen, fix
+    assert "import os" not in fix_prompt
+
+
+def test_integration_fix_writes_corrected_code_to_the_implicated_file(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    loop = MultiFileLoop(FakeClient(["def test_thing():\n    assert True\n"]), config, session)
+
+    test_path = session.run_dir / "test_thing.py"
+    test_path.write_text("def test_thing():\n    assert False\n")
+
+    tasks = [FileTask(path="thing.py", purpose="x")]
+    result, _iterations = loop._run_integration_with_fixes(
+        tasks, [test_path], has_tests=True, iterations=1
+    )
+
+    assert test_path.read_text() == "def test_thing():\n    assert True"
+    assert result.success

@@ -114,6 +114,13 @@ def _generate_and_fix(
         if result.success or attempts >= config.max_fix_attempts:
             return result, attempts
 
+        if result.stage == "lint":
+            # ruff's --fix may have just rewritten the file in place; make
+            # sure the fix prompt sees the current file, not stale
+            # pre-autofix content (matters when a second, genuinely
+            # unfixable issue remains alongside an auto-fixed one).
+            code = file_path.read_text()
+
         error = result.output
         if gen.truncated:
             error = _TRUNCATION_NOTE + error
@@ -330,7 +337,7 @@ class MultiFileLoop:
             if target is None:
                 break
 
-            fixed = codegen.fix_file(
+            gen = codegen.fix_file(
                 self.client,
                 code=target.read_text(),
                 error=result.output,
@@ -338,10 +345,10 @@ class MultiFileLoop:
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
             )
-            target.write_text(fixed)
+            target.write_text(gen.code)
             iterations += 1
             rounds += 1
-            self.session.log("integration_fix", path=str(target), round=rounds, code=fixed)
+            self.session.log("integration_fix", path=str(target), round=rounds, code=gen.code)
             result = self._run_integration(tasks, has_tests)
 
         return result, iterations

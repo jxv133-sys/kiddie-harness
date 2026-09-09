@@ -69,13 +69,21 @@ same loop shape -- no changes to what the model is asked to do:
   table prints at the end of every `harness run`, and `harness inspect
   --run-id <id>` re-renders it for any past run.
 
-**Live progress output (this commit):** a multi-file run can sit silent
-for minutes on modest hardware, so `harness run` now prints a line per
-step as it happens (`[plan]`, `[spec]`, `[codegen]`, `[verify:<stage>]`,
-`[fix]`, `[integration:<stage>]`, ...) instead of only the final table.
-`--quiet` suppresses these and prints only the final summary, for
-scripting/log-parsing use. No changes to the orchestrator or prompts --
-this taps the same event stream `summary.py` already reads, live.
+**Live progress output:** a multi-file run can sit silent for minutes on
+modest hardware, so `harness run` prints a line per step as it happens
+(`[plan]`, `[spec]`, `[codegen]`, `[verify:<stage>]`, `[fix]`,
+`[integration:<stage>]`, ...) instead of only the final table. `--quiet`
+suppresses these and prints only the final summary, for scripting/
+log-parsing use. No changes to the orchestrator or prompts -- this taps
+the same event stream `summary.py` already reads, live.
+
+**Auto-fixable lint issues (this commit):** running against real local
+models surfaced a fix loop that burned all its retries on a lint error
+ruff's own output said was `[*] fixable with the --fix option` -- pure
+import-formatting noise, not something that needed the model at all. The
+lint check now runs `ruff check --fix`, which only ever applies fixes
+ruff considers safe (no semantic changes), so trivial nits get resolved
+for free and only genuinely unfixable violations cost an LLM fix attempt.
 
 Multi-language support is a later phase (see the architecture doc) and
 not implemented yet.

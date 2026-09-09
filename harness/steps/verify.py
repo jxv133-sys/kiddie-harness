@@ -70,9 +70,16 @@ def verify_python_file(path: Path, *, execute: bool = True, timeout_seconds: int
 
 def lint_check(path: Path) -> VerifyResult:
     """Static lint only -- never executes the file, safe even when sibling
-    files it imports don't exist yet."""
+    files it imports don't exist yet.
+
+    Runs with --fix: ruff only applies fixes it considers safe (no
+    semantic changes), so this can't change program behavior, and it
+    means trivially-fixable nits (import sorting/formatting) never cost
+    an LLM fix attempt -- only violations ruff can't fix itself count as
+    a failure.
+    """
     result = subprocess.run(
-        [sys.executable, "-m", "ruff", "check", str(path)],
+        [sys.executable, "-m", "ruff", "check", "--fix", str(path)],
         capture_output=True,
         text=True,
         timeout=30,
