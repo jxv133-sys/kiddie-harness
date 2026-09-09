@@ -24,25 +24,34 @@ goal -> generate one Python file -> verify (compile, then run)
   -> on failure, feed the exact error back for a scoped fix (bounded retries)
 ```
 
-**Phase 2 (this commit):** multi-file planning, layered on the same
-per-file loop:
+**Phase 2:** multi-file planning, layered on the same per-file loop:
 
 ```
 goal -> plan (JSON-schema constrained list of files)
   -> for each file: write a short spec -> generate -> verify (compile, then lint)
        -> on failure, feed the exact error back for a scoped fix (bounded retries)
-  -> once every file passes: integration check
-       (run the test suite if any test_*.py file was planned, else run the entry file)
+```
+
+**Phase 3 (this commit):** a dedicated test-writing step, added after each
+implementation file:
+
+```
+  -> for each implementation file that passed: write a test file for it
+       (its own call, its own prompt -- never combined with implementation)
+       -> verify (compile, then run just that test), fix on failure the same way
+  -> once every file (and its test) passes: integration check
+       (run the whole test suite with pytest if any test succeeded, else run the entry file)
        -> on failure, find which generated file the error names and fix just that file
           (bounded rounds, and a global iteration budget across the whole run)
 ```
 
 Every step above is still a single, narrow LLM call: the planner never
-writes code, the spec writer never writes code, and code generation for
-one file never sees any other file's contents.
+writes code, the spec writer never writes code, code generation for one
+file never sees any other file's contents, and the test writer is always
+a separate call from the implementation it's testing.
 
-A dedicated test-writing step and multi-language support are later phases
-(see the architecture doc) and not implemented yet.
+Multi-language support is a later phase (see the architecture doc) and
+not implemented yet.
 
 ## Setup
 

@@ -92,11 +92,11 @@ def verify_python_file_static(path: Path) -> VerifyResult:
     return lint_check(path)
 
 
-def run_pytest(directory: Path, timeout_seconds: int = 60) -> VerifyResult:
-    """Run the full test suite for a multi-file project (integration check)."""
+def run_pytest(target: Path, timeout_seconds: int = 60) -> VerifyResult:
+    """Run pytest against a directory (full suite) or a single test file."""
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", str(directory), "-q"],
+            [sys.executable, "-m", "pytest", str(target), "-q"],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -111,3 +111,15 @@ def run_pytest(directory: Path, timeout_seconds: int = 60) -> VerifyResult:
         )
     combined = result.stdout + result.stderr
     return VerifyResult(success=result.returncode == 0, stage="pytest", output=_truncate(combined))
+
+
+def verify_test_file(path: Path, timeout_seconds: int = 30) -> VerifyResult:
+    """Compile-check a single test file, then run just that file with pytest.
+
+    Scoped to one file: the module it imports already exists on disk by the
+    time this runs (its own generate/verify/fix loop already succeeded).
+    """
+    compiled = compile_check(path)
+    if not compiled.success:
+        return compiled
+    return run_pytest(path, timeout_seconds=timeout_seconds)
