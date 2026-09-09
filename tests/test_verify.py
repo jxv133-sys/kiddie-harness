@@ -116,6 +116,30 @@ def test_import_check_fails_on_an_unresolvable_import(tmp_path: Path):
     assert "definitely_not_a_real_module_xyz" in result.output
 
 
+def test_import_check_succeeds_with_a_relative_path_from_a_different_cwd(tmp_path: Path, monkeypatch):
+    # Regression: config/default.yaml's workspace root is relative, so in
+    # real CLI use `path` is a relative path like "workspace/<run-id>/x.py"
+    # -- and the caller's cwd need not match the file's directory at all.
+    # A prior version of import_check set cwd to the file's own directory
+    # but still passed that same relative string as the argument, which
+    # got re-resolved against the new cwd and doubled the path.
+    project_dir = tmp_path / "project"
+    run_dir = project_dir / "workspace" / "run123"
+    run_dir.mkdir(parents=True)
+    (run_dir / "helper.py").write_text("def add(a, b):\n    return a + b\n")
+    (run_dir / "main.py").write_text("from helper import add\n\nprint(add(2, 3))\n")
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    relative_path = Path("..") / "project" / "workspace" / "run123" / "main.py"
+    result = import_check(relative_path)
+
+    assert result.success
+    assert result.stage == "import"
+
+
 def test_import_check_does_not_execute_the_main_block(tmp_path: Path):
     # A __main__ block that would raise if actually run must not fire --
     # only import-time resolution is being checked.

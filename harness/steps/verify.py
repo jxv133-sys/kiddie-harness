@@ -101,7 +101,14 @@ def import_check(path: Path, timeout_seconds: int = 15) -> VerifyResult:
     checked). The path is passed as a real subprocess argument, never
     interpolated into the executed Python source text, so nothing
     planner-controlled ever becomes part of the code that actually runs.
+
+    Resolved to absolute first: cwd is set to the file's own directory
+    (empirically required for runpy.run_path's sibling-import resolution
+    to work), and running against a caller-relative path (as `path` is
+    in practice, since config/default.yaml's workspace root is relative)
+    would otherwise get re-resolved against that new cwd and double up.
     """
+    path = path.resolve()
     try:
         result = subprocess.run(
             [
