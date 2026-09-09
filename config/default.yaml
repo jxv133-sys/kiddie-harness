@@ -4,7 +4,7 @@
 ollama:
   host: "http://localhost:11434"
   model: "deepseek-coder:8b"
-  timeout_seconds: 120
+  timeout_seconds: 300
 
 generation:
   # Kept low and stable on purpose: small models drift more at higher temperature,
