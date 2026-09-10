@@ -193,6 +193,7 @@ class SingleFileLoop:
 
         if not result.success:
             self.session.log("giving_up", attempts=attempts)
+        self.session.log("run_result", success=result.success)
 
         return RunResult(
             success=result.success,
@@ -311,6 +312,7 @@ class MultiFileLoop:
 
         if not overall_success:
             self.session.log("giving_up", iterations=iterations, stopped_early=stopped_early)
+        self.session.log("run_result", success=overall_success)
 
         return MultiFileRunResult(
             success=overall_success,

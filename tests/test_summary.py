@@ -72,6 +72,7 @@ def test_load_run_summary_with_fix_and_truncation(tmp_path: Path):
                 "success": True,
                 "output": "",
             },
+            {"event": "run_result", "success": True},
         ],
     )
 
@@ -80,6 +81,54 @@ def test_load_run_summary_with_fix_and_truncation(tmp_path: Path):
     assert summary.files == [FileSummary(path="main.py", success=True, attempts=1, truncated=True)]
     assert summary.total_llm_calls == 2  # codegen + fix
     assert summary.succeeded
+    assert summary.finished
+
+
+def test_load_run_summary_flags_a_run_that_never_finished(tmp_path: Path):
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "codegen", "path": "main.py", "code": "x = 1", "truncated": False},
+            {
+                "event": "verify",
+                "path": "main.py",
+                "attempt": 0,
+                "stage": "compile",
+                "success": True,
+                "output": "",
+            },
+            # process was killed here -- no run_result, no giving_up
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert not summary.finished
+    assert "INCOMPLETE" in render_table(summary)
+
+
+def test_run_result_event_is_authoritative_over_the_giving_up_heuristic(tmp_path: Path):
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "codegen", "path": "a.py", "code": "x=1", "truncated": False},
+            {
+                "event": "verify",
+                "path": "a.py",
+                "attempt": 0,
+                "stage": "import",
+                "success": True,
+                "output": "",
+            },
+            {"event": "integration_verify", "stage": "pytest", "success": True, "output": ""},
+            {"event": "run_result", "success": True},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert summary.succeeded
+    assert summary.finished
 
 
 def test_load_run_summary_gives_up_and_stopped_early(tmp_path: Path):

@@ -64,6 +64,7 @@ def test_inspect_reports_summary_for_existing_run(tmp_path, monkeypatch, capsys)
     session = Session.create(config.workspace_root, run_id="myrun")
     session.log("codegen", path="main.py", code="print(1)", truncated=False)
     session.log("verify", path="main.py", attempt=0, stage="run", success=True, output="")
+    session.log("run_result", success=True)
 
     exit_code = cli.main(["inspect", "--run-id", "myrun"])
 
@@ -71,6 +72,19 @@ def test_inspect_reports_summary_for_existing_run(tmp_path, monkeypatch, capsys)
     out = capsys.readouterr().out
     assert "Run myrun" in out
     assert "[ok] main.py" in out
+
+
+def test_inspect_reports_incomplete_for_a_killed_run(tmp_path, monkeypatch, capsys):
+    config = _patch_config(monkeypatch, tmp_path)
+    session = Session.create(config.workspace_root, run_id="killed")
+    session.log("codegen", path="main.py", code="x = 1", truncated=False)
+    session.log("verify", path="main.py", attempt=0, stage="compile", success=True, output="")
+    # no run_result / giving_up -- process was killed
+
+    exit_code = cli.main(["inspect", "--run-id", "killed"])
+
+    assert exit_code == 1
+    assert "INCOMPLETE" in capsys.readouterr().out
 
 
 def test_inspect_reports_error_for_missing_run(tmp_path, monkeypatch, capsys):

@@ -38,6 +38,9 @@ class RunSummary:
     total_llm_calls: int
     stopped_early: bool
     succeeded: bool
+    # False when the log has no terminal event -- the process was killed
+    # (Ctrl-C, OOM, timeout) before the run reached a verdict.
+    finished: bool = True
 
 
 def load_run_summary(log_path: Path) -> RunSummary:
@@ -47,7 +50,9 @@ def load_run_summary(log_path: Path) -> RunSummary:
     integration: IntegrationSummary | None = None
     total_llm_calls = 0
     stopped_early = False
-    succeeded = True
+    saw_giving_up = False
+    run_result: bool | None = None
+    finished = False
 
     for line in log_path.read_text().splitlines():
         if not line.strip():
@@ -71,10 +76,20 @@ def load_run_summary(log_path: Path) -> RunSummary:
             advisory_paths.add(record["path"])
         elif event == "integration_verify":
             integration = IntegrationSummary(stage=record["stage"], success=record["success"])
+            finished = True
         elif event == "budget_exhausted":
             stopped_early = True
+            finished = True
         elif event == "giving_up":
-            succeeded = False
+            saw_giving_up = True
+            finished = True
+        elif event == "run_result":
+            run_result = record["success"]
+            finished = True
+
+    # A run_result event is authoritative; the giving_up heuristic is the
+    # fallback for logs written before that event existed.
+    succeeded = run_result if run_result is not None else not saw_giving_up
 
     file_summaries = [
         FileSummary(
@@ -94,6 +109,7 @@ def load_run_summary(log_path: Path) -> RunSummary:
         total_llm_calls=total_llm_calls,
         stopped_early=stopped_early,
         succeeded=succeeded,
+        finished=finished,
     )
 
 
@@ -117,7 +133,9 @@ def render_table(summary: RunSummary) -> str:
         status = "ok" if summary.integration.success else "FAILED"
         lines.append(f"  [{status}] integration check ({summary.integration.stage})")
 
-    if summary.succeeded:
+    if not summary.finished:
+        result = "INCOMPLETE: the run did not finish (log has no terminal event)"
+    elif summary.succeeded:
         result = "SUCCESS"
     elif summary.stopped_early:
         result = "STOPPED: iteration budget exhausted"

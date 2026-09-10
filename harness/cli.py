@@ -107,7 +107,7 @@ def _inspect(args) -> int:
 
     run_summary = summary.load_run_summary(log_path)
     print(summary.render_table(run_summary))
-    return 0 if run_summary.succeeded else 1
+    return 0 if run_summary.finished and run_summary.succeeded else 1
 
 
 def main(argv: list[str] | None = None) -> int:

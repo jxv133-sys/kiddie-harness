@@ -77,10 +77,12 @@ core design, not just style.
   optional `on_event` callback fired right after each write (used for
   live progress output; never lets a broken callback break a run).
 - `harness/summary.py` / `harness/progress.py` — two views of the same
-  event stream: `summary.py` parses a finished `log.jsonl` into a status
-  table (used by `harness inspect` and at the end of every run);
-  `progress.py` formats events into live one-line-per-step output while a
-  run is in progress.
+  event stream: `summary.py` parses a `log.jsonl` into a status table
+  (used by `harness inspect` and at the end of every run); `progress.py`
+  formats events into live one-line-per-step output while a run is in
+  progress. Both loops log a terminal `run_result` event; a log without
+  one is reported `INCOMPLETE` (the process was killed) rather than
+  guessed at, and `harness inspect` exits non-zero for it.
 - `harness/cli.py` — `harness run [--multi-file] [--quiet] --goal "..."`
   and `harness inspect --run-id <id>`.
 - `config/default.yaml` — model, host, temperature (the *base*; retries
