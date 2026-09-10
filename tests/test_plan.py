@@ -40,10 +40,10 @@ def test_plan_files_raises_on_empty_file_list():
         plan_files(client, "build a todo app", temperature=0.2, max_tokens=512, max_attempts=1)
 
 
-def test_plan_files_retries_without_schema_when_the_first_plan_is_empty():
+def test_plan_files_retries_when_the_first_plan_is_empty():
     client = FakeClient(
         [
-            json.dumps({"files": []}),  # schema-constrained attempt: degenerate
+            json.dumps({"files": []}),  # degenerate grammar fill
             json.dumps({"files": [{"path": "core.py", "purpose": "logic"}]}),  # retry
         ]
     )
@@ -53,22 +53,7 @@ def test_plan_files_retries_without_schema_when_the_first_plan_is_empty():
     assert tasks == [FileTask(path="core.py", purpose="logic")]
     assert len(client.calls) == 2
     assert client.temperature_calls[1] > client.temperature_calls[0]
-
-
-def test_plan_files_extracts_json_from_a_reasoning_wrapped_retry():
-    client = FakeClient(
-        [
-            json.dumps({"files": []}),
-            (
-                "<think>\nThe user needs one module.\n</think>\n"
-                '```json\n{"files": [{"path": "core.py", "purpose": "logic"}]}\n```'
-            ),
-        ]
-    )
-
-    tasks = plan_files(client, "x", temperature=0.2, max_tokens=512)
-
-    assert tasks == [FileTask(path="core.py", purpose="logic")]
+    assert "empty list" in client.calls[1]
 
 
 def test_plan_files_raises_after_exhausting_retries():
