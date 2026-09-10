@@ -86,7 +86,14 @@ core design, not just style.
   guessed at, and `harness inspect` exits non-zero for it.
 - `harness/cli.py` — `harness run [--multi-file] [--quiet] --goal "..."`
   (`--model` / `--host` / `--max-retries` / `--timeout` override the
-  config) and `harness inspect --run-id <id>`. An aborted run exits 2.
+  config), `harness inspect --run-id <id>`, `harness gui`. An aborted run
+  exits 2.
+- `harness/gui.py` — a stdlib `http.server` GUI (`harness gui`). Pure
+  core is testable: `available_models(host)`, `RunManager` (one run at a
+  time, in a daemon thread; takes a `client_factory` seam for tests),
+  `stream_events(log_path)` (tails `log.jsonl` → SSE frames using
+  `progress.format_event`). The page is one embedded HTML string. No new
+  deps; it reuses `progress` + `summary` and changes nothing elsewhere.
 - `config/default.yaml` — model, host, temperature (the *base*; retries
   step up from it), token limits/ceiling, retry budgets, timeout.
 - `tests/fakes.py` — shared `FakeClient`/`FakeResponse`/`make_config` test

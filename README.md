@@ -194,7 +194,20 @@ crashed before finishing), use:
 harness inspect --run-id <run-id>
 ```
 
-## Tests
+## GUI
+
+```bash
+harness gui          # opens a browser at http://127.0.0.1:8765
+```
+
+A single minimalist page: pick a model (the list is pulled live from the
+Ollama host), point at a host, type a goal, hit **Generate**. The
+progress log streams in as it happens (`[plan]`, `[codegen]`,
+`[verify:*]`, `[fix]`, ...), a small strip tracks files / fix attempts /
+LLM calls / elapsed time, and the final verdict and per-file table drop
+in when the run finishes. One run at a time; stdlib `http.server`, no new
+dependencies, binds to localhost only. `--port` and `--no-browser` are
+available.
 
 ```bash
 pytest

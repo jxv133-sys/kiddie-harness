@@ -53,6 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = subparsers.add_parser("inspect", help="Summarize a previous run from its log.jsonl")
     inspect.add_argument("--run-id", required=True, help="Run id (the workspace/<run-id> directory name)")
 
+    gui_cmd = subparsers.add_parser("gui", help="Open a minimal local web GUI")
+    gui_cmd.add_argument("--port", type=int, default=8765, help="Port to bind (default 8765)")
+    gui_cmd.add_argument("--no-browser", action="store_true", help="Do not open a browser")
+
     return parser
 
 
@@ -126,6 +130,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "inspect":
         return _inspect(args)
+
+    if args.command == "gui":
+        from . import gui
+
+        gui.serve(Config.load(), port=args.port, open_browser=not args.no_browser)
+        return 0
 
     if args.command == "run":
         config = Config.load().with_overrides(
