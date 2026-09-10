@@ -29,6 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the max fix attempts per file",
     )
     run.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="Override the per-call Ollama timeout in seconds (raise it for slow reasoning models)",
+    )
+    run.add_argument(
         "--filename",
         default="main.py",
         help="Output filename for the generated file (single-file mode only)",
@@ -123,7 +129,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         config = Config.load().with_overrides(
-            model=args.model, host=args.host, max_fix_attempts=args.max_retries
+            model=args.model,
+            host=args.host,
+            max_fix_attempts=args.max_retries,
+            timeout_seconds=args.timeout,
         )
         client = OllamaClient(config.ollama_host, config.model, config.timeout_seconds)
         reporter = None if args.quiet else progress.console_reporter()

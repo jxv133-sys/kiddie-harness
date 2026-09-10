@@ -173,6 +173,7 @@ Options:
 - `--model` — override the model from `config/default.yaml` (default `deepseek-coder:8b`)
 - `--host` — override the Ollama host (default `http://localhost:11434`)
 - `--max-retries` — override the bounded fix-loop attempt count per file (default `5`; each retry samples a little hotter)
+- `--timeout` — override the per-call Ollama timeout in seconds (default `300`; raise it for slow reasoning models)
 - `--filename` — output filename, single-file mode only (default `main.py`)
 - `--multi-file` — plan and generate a multi-file project instead of one script
 - `--quiet` — suppress live per-step progress lines; print only the final summary

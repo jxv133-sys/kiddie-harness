@@ -48,10 +48,12 @@ class Config:
         model: str | None = None,
         host: str | None = None,
         max_fix_attempts: int | None = None,
+        timeout_seconds: int | None = None,
     ) -> Config:
         return dataclasses.replace(
             self,
             model=model or self.model,
             ollama_host=host or self.ollama_host,
             max_fix_attempts=max_fix_attempts or self.max_fix_attempts,
+            timeout_seconds=timeout_seconds or self.timeout_seconds,
         )
