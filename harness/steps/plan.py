@@ -1,12 +1,12 @@
 """Atomic planning step: goal -> ordered list of files to build.
 
-This is the one step whose output is structured data rather than code, so
-every attempt uses Ollama's JSON-schema constrained decoding: the
-response is always parseable JSON, never prose. The failure mode that
-still exists -- a reasoning model, unable to think first inside the
-grammar, fills it with the minimal legal value `{"files": []}` -- is met
-with a bounded retry at a rising temperature and a blunter prompt, the
-same shape of retry every other step already has.
+This is the one step whose output is structured data rather than code.
+Attempt 0 uses Ollama's JSON-schema constrained decoding, so the response
+is guaranteed to parse. A reasoning model, unable to think first inside
+the grammar, sometimes fills it with `{"files": []}`; the retries escalate
+temperature with a blunter prompt, and the final attempt drops the schema
+entirely so the model can think and answer in its own format (JSON or a
+markdown list), which is then parsed here.
 """
 
 from __future__ import annotations
@@ -14,9 +14,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import posixpath
+import re
 from pathlib import Path
 
 from ..llm_client import OllamaClient, OllamaError
+from ..postprocess import strip_code_fences
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 _PLAN_TEMPLATE = (_PROMPTS_DIR / "plan.md").read_text()
@@ -55,6 +57,64 @@ class PlanError(RuntimeError):
 class FileTask:
     path: str
     purpose: str
+
+
+_PY_NAME_RE = re.compile(r"([A-Za-z_][\w-]*\.py)")
+
+
+def _parse_free_form(text: str) -> dict:
+    """Turn an unconstrained planner response into `{"files": [...]}`.
+
+    Tries, in order: the whole thing as JSON, a `{...}` object embedded in
+    prose, then a markdown/numbered list of `*.py` filenames (a reasoning
+    model's natural format when it isn't grammar-constrained).
+    """
+    candidate = strip_code_fences(text)  # also drops a leading <think> block
+
+    for blob in (candidate, _first_brace_object(candidate)):
+        if blob is None:
+            continue
+        try:
+            data = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and "files" in data:
+            return data
+
+    lines = candidate.splitlines()
+    files: list[dict] = []
+    seen: set[str] = set()
+    for i, line in enumerate(lines):
+        match = _PY_NAME_RE.search(line)
+        if not match:
+            continue
+        name = match.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        purpose = line[match.end() :].lstrip(" \t:-*").strip(" *`")
+        if not purpose:
+            # a common layout is `1. **name.py**` then `- Purpose: ...`
+            # on one of the next couple of lines
+            for follow in lines[i + 1 : i + 3]:
+                if _PY_NAME_RE.search(follow):
+                    break
+                stripped = follow.strip(" \t-*`")
+                if ":" in stripped:
+                    stripped = stripped.split(":", 1)[1].strip()
+                if stripped:
+                    purpose = stripped
+                    break
+        files.append({"path": name, "purpose": purpose or "(purpose not specified by the planner)"})
+    if files:
+        return {"files": files}
+
+    raise PlanError(f"No file list found in planner response: {text[:200]}")
+
+
+def _first_brace_object(text: str) -> str | None:
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    return match.group(0) if match else None
 
 
 def _tasks_from_plan(data: dict) -> list[FileTask]:
@@ -110,21 +170,25 @@ def plan_files(
     last_error = "no attempts made"
 
     for attempt in range(max_attempts):
-        prompt = base_prompt
+        # The last attempt drops the schema so a reasoning model can think
+        # first and answer in its own format; earlier attempts stay
+        # grammar-constrained and just escalate.
+        free_form = attempt == max_attempts - 1 and max_attempts > 1
+        prompt = base_prompt if attempt == 0 else base_prompt + _RETRY_SUFFIX
         temp = temperature
         if attempt:
-            prompt = base_prompt + _RETRY_SUFFIX
             temp = round(
                 min(temperature + _RETRY_TEMPERATURE_STEP * attempt, _RETRY_TEMPERATURE_MAX), 3
             )
         try:
             response = client.generate(
                 prompt,
-                json_schema=PLAN_SCHEMA,
+                json_schema=None if free_form else PLAN_SCHEMA,
                 temperature=temp,
                 max_tokens=max_tokens,
             )
-            return _tasks_from_plan(json.loads(response.text))
+            data = _parse_free_form(response.text) if free_form else json.loads(response.text)
+            return _tasks_from_plan(data)
         except (OllamaError, PlanError, json.JSONDecodeError) as exc:
             last_error = str(exc)
 

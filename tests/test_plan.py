@@ -2,9 +2,31 @@ import json
 
 import pytest
 
-from harness.steps.plan import FileTask, PlanError, plan_files
+from harness.steps.plan import FileTask, PlanError, _parse_free_form, plan_files
 
 from .fakes import FakeClient
+
+
+def test_parse_free_form_reads_a_numbered_markdown_list():
+    text = (
+        "### Files Needed:\n\n"
+        "1. **prime.py**\n   - **Purpose:** check whether a number is prime\n"
+        "2. **primes.py**\n   - Purpose: return the first n primes\n"
+    )
+
+    data = _parse_free_form(text)
+
+    assert [f["path"] for f in data["files"]] == ["prime.py", "primes.py"]
+    assert "prime" in data["files"][0]["purpose"].lower()
+
+
+def test_parse_free_form_reads_json_inside_a_fence_after_reasoning():
+    text = (
+        "<think>\nI need one module.\n</think>\n"
+        '```json\n{"files": [{"path": "core.py", "purpose": "logic"}]}\n```'
+    )
+
+    assert _parse_free_form(text) == {"files": [{"path": "core.py", "purpose": "logic"}]}
 
 
 def test_plan_files_parses_schema_constrained_json():
@@ -61,6 +83,22 @@ def test_plan_files_raises_after_exhausting_retries():
 
     with pytest.raises(PlanError):
         plan_files(client, "x", temperature=0.2, max_tokens=512, max_attempts=3)
+
+
+def test_plan_files_recovers_via_a_markdown_list_on_the_final_attempt():
+    client = FakeClient(
+        [
+            json.dumps({"files": []}),  # schema attempt 0
+            json.dumps({"files": []}),  # schema attempt 1
+            "### Files\n1. **prime.py** - checks primality\n2. **primes.py** - lists primes\n",
+        ]
+    )
+
+    tasks = plan_files(client, "primes", temperature=0.2, max_tokens=512, max_attempts=3)
+
+    assert [t.path for t in tasks] == ["prime.py", "primes.py"]
+    # the last call was unconstrained
+    assert client.temperature_calls[-1] > client.temperature_calls[0]
 
 
 def test_plan_files_drops_non_python_entries():
