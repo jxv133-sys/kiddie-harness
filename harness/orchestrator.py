@@ -122,7 +122,18 @@ def _generate_and_fix(
     attempts = 0
     while True:
         file_path.write_text(code)
-        result = verify_fn(file_path)
+        if code.strip():
+            result = verify_fn(file_path)
+        else:
+            # An empty file compiles and imports fine -- it would sail
+            # through verification as a "success" and leave a blank module
+            # for its companion test to import. Treat it as a failure the
+            # fix loop can act on instead.
+            result = VerifyResult(
+                success=False,
+                stage="generate",
+                output="The model returned an empty file. Write the complete file.",
+            )
         session.log(
             "verify",
             path=str(file_path),

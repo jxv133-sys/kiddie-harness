@@ -68,6 +68,29 @@ def test_retries_run_at_a_rising_temperature_when_a_fix_repeats_itself(tmp_path:
     assert client.temperature_calls[-1] > client.temperature_calls[0]
 
 
+def test_an_empty_generation_is_retried_not_accepted(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=2)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(["   \n  ", "print('hello world')\n"])
+
+    result = SingleFileLoop(client, config, session).run("print hello world")
+
+    assert result.success
+    assert result.attempts == 1
+    assert Path(result.file_path).read_text() == "print('hello world')"
+
+
+def test_a_run_that_only_ever_returns_blank_fails(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=1)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(["", "  "])
+
+    result = SingleFileLoop(client, config, session).run("do a thing")
+
+    assert not result.success
+    assert "empty" in result.last_output.lower()
+
+
 def test_strips_markdown_fence_from_model_output(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
