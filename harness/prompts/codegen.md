@@ -11,6 +11,10 @@ Rules:
   with `if __name__ == "__main__":` then `main()` -- nothing else runs at
   module level, so the file can be imported (and its functions tested)
   without running or exiting.
+- Do not keep mutable state (a list, dict, counter, open file) at module
+  level. Hold it in a class the caller instantiates, or pass it in and
+  out of functions, so importing the module twice or calling it many
+  times starts clean each time.
 - Write the whole file from the first line to the last; never omit or
   abbreviate any part of it.
 
