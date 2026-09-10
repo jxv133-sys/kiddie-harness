@@ -4,6 +4,8 @@ created.
 
 Rules:
 - List only Python (.py) files.
+- Put every file in one flat directory: bare filenames like `core.py`, no
+  slashes, no subpackages.
 - Give each file a short one-sentence purpose.
 - Keep the list small: only files that are actually necessary for the goal.
 - Do not include a README, config files, or any non-Python files.

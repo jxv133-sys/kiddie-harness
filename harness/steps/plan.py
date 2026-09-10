@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import posixpath
 from pathlib import Path
 
 from ..llm_client import OllamaClient
@@ -65,22 +66,25 @@ def plan_files(
     if not isinstance(files, list) or not files:
         raise PlanError(f"Planner returned no files: {data}")
 
-    # Weak planners slip in a README, a requirements.txt, a setup.cfg --
-    # this harness only generates and verifies Python, so drop anything
-    # else here rather than letting codegen try to write Python into it.
-    # Repeated paths (also common) would just have the second generation
-    # overwrite the first and waste the iteration budget, so keep the
-    # first mention of each.
+    # Normalise what a weak planner hands back:
+    #  - drop non-Python entries (a README, a requirements.txt) -- this
+    #    harness only generates and verifies Python;
+    #  - flatten any subdirectory path to a bare filename -- every file
+    #    lives in one flat run directory, and a `pkg/core.py` would break
+    #    both its import-check (wrong cwd) and its companion test (wrong
+    #    import path);
+    #  - keep only the first mention of each name -- a repeat would just
+    #    have the second generation overwrite the first and burn budget.
     tasks: list[FileTask] = []
     seen: set[str] = set()
     for f in files:
-        path = str(f["path"]).strip()
-        if not path.endswith(".py"):
+        name = posixpath.basename(str(f["path"]).strip().replace("\\", "/"))
+        if not name.endswith(".py"):
             continue
-        if path in seen:
+        if name in seen:
             continue
-        seen.add(path)
-        tasks.append(FileTask(path=path, purpose=f["purpose"]))
+        seen.add(name)
+        tasks.append(FileTask(path=name, purpose=f["purpose"]))
 
     if not tasks:
         raise PlanError(f"Planner returned no Python files: {data}")

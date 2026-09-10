@@ -178,8 +178,9 @@ def test_sanitizes_path_traversal_in_planned_file_path(tmp_path: Path):
     result = MultiFileLoop(client, config, session).run("try to escape the workspace")
 
     written_path = Path(result.files[0].path)
-    assert session.run_dir in written_path.parents
-    assert written_path == session.run_dir / "etc" / "evil.py"
+    # plan_files flattens to a bare filename, so the traversal collapses
+    # to a plain file directly in the run directory.
+    assert written_path == session.run_dir / "evil.py"
 
 
 def test_skips_test_generation_for_a_planner_provided_test_file(tmp_path: Path):

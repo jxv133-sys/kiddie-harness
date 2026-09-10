@@ -65,6 +65,25 @@ def test_plan_files_raises_when_no_python_files_remain():
         plan_files(client, "x", temperature=0.2, max_tokens=512)
 
 
+def test_plan_files_flattens_subdirectory_paths_to_bare_filenames():
+    payload = json.dumps(
+        {
+            "files": [
+                {"path": "pkg/core.py", "purpose": "logic"},
+                {"path": "app/main.py", "purpose": "entry"},
+            ]
+        }
+    )
+    client = FakeClient([payload])
+
+    tasks = plan_files(client, "x", temperature=0.2, max_tokens=512)
+
+    assert tasks == [
+        FileTask(path="core.py", purpose="logic"),
+        FileTask(path="main.py", purpose="entry"),
+    ]
+
+
 def test_plan_files_deduplicates_repeated_paths_keeping_the_first():
     payload = json.dumps(
         {
