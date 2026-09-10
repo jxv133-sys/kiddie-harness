@@ -147,6 +147,37 @@ def test_stream_events_formats_log_lines_and_ends_on_run_result(tmp_path: Path):
     assert "[plan] 1 file(s) planned" in text
     assert "[codegen] a.py" in text
     assert chunks[-1].strip() == "event: done\ndata: {}"
+    assert "id: 3\n" in text  # each data frame carries the line count
+
+
+def test_stream_events_resumes_from_a_start_offset(tmp_path: Path):
+    log_path = tmp_path / "log.jsonl"
+    records = [
+        {"event": "plan", "files": []},
+        {"event": "codegen", "path": "a.py", "code": "x", "truncated": False},
+        {"event": "run_result", "success": True},
+    ]
+    log_path.write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    text = "".join(gui.stream_events(log_path, start=2, poll_interval=0, idle_timeout=0.1))
+
+    assert "[plan]" not in text  # line 0 skipped
+    assert "run_result" in text  # line 2 still delivered
+
+
+def test_stream_events_keeps_polling_while_the_run_is_active(tmp_path: Path):
+    log_path = tmp_path / "log.jsonl"
+    log_path.write_text(json.dumps({"event": "plan", "files": []}) + "\n")
+    active = iter([True, True, False])  # run stops after two idle polls
+
+    chunks = list(
+        gui.stream_events(
+            log_path, is_active=lambda: next(active, False), poll_interval=0, idle_timeout=999
+        )
+    )
+
+    # never bailed on idle_timeout; ended only once is_active went False
+    assert chunks[-1].strip() == "event: done\ndata: {}"
 
 
 def test_the_index_page_and_config_endpoint_serve(tmp_path: Path):

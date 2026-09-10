@@ -16,7 +16,7 @@ import json
 import threading
 import time
 import webbrowser
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -119,16 +119,27 @@ class RunManager:
 
 
 def stream_events(
-    log_path: Path, *, poll_interval: float = 0.4, idle_timeout: float = 600.0
+    log_path: Path,
+    *,
+    start: int = 0,
+    is_active: Callable[[], bool] | None = None,
+    poll_interval: float = 0.4,
+    idle_timeout: float = 1800.0,
 ) -> Iterator[str]:
     """Tail a run's log.jsonl and yield Server-Sent-Event chunks.
 
-    Each `data:` frame is `{"line": <formatted or null>, "event": <raw>,
-    "fields": {...}}`; the stream ends with an `event: done` frame once a
-    `run_result` is logged (or after `idle_timeout` with no new lines).
+    Each `data:` frame carries an `id:` (the count of log lines consumed)
+    and `{"line": <formatted or null>, "event": <raw>, "fields": {...}}`.
+    On reconnect the browser sends the last id as `Last-Event-ID`; pass it
+    as `start` and the stream resumes without replaying. The stream ends
+    with an `event: done` frame once a `run_result` is logged. `is_active`,
+    when given, says whether the run is still going: while it returns True
+    the stream keeps polling no matter how long a single LLM call takes;
+    `idle_timeout` is only a safety net for an orphaned stream.
     """
-    seen = 0
+    seen = max(start, 0)
     last_activity = time.monotonic()
+    grace = 5  # polls to keep reading after the run stops, for a late run_result
     while True:
         try:
             lines = Path(log_path).read_text().splitlines()
@@ -151,18 +162,28 @@ def stream_events(
             fields = {k: v for k, v in record.items() if k not in ("event", "ts")}
             formatted = progress.format_event(event, fields) if event else None
             payload = json.dumps({"line": formatted, "event": event, "fields": fields})
-            yield f"data: {payload}\n\n"
+            yield f"id: {seen}\ndata: {payload}\n\n"
             if event == "run_result":
                 yield "event: done\ndata: {}\n\n"
                 return
 
         if emitted:
             last_activity = time.monotonic()
+            grace = 5
+            continue
+
+        if is_active is not None:
+            if is_active():
+                time.sleep(poll_interval)  # run still going, no matter how slow
+                continue
+            grace -= 1  # run stopped; a few more reads for a late run_result
+            if grace <= 0:
+                yield "event: done\ndata: {}\n\n"
+                return
         elif time.monotonic() - last_activity > idle_timeout:
             yield "event: done\ndata: {}\n\n"
             return
-        else:
-            time.sleep(poll_interval)
+        time.sleep(poll_interval)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -262,8 +283,17 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
+
+        def still_running() -> bool:
+            st = self._runs.status()
+            return st["run_id"] == run_id and st["state"] == "running"
+
+        last_id = self.headers.get("Last-Event-ID", "")
+        start = int(last_id) if last_id.isdigit() else 0
         try:
-            for chunk in stream_events(self._runs.log_path(run_id)):
+            for chunk in stream_events(
+                self._runs.log_path(run_id), start=start, is_active=still_running
+            ):
                 self.wfile.write(chunk.encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ValueError):
@@ -530,14 +560,24 @@ $("#go").addEventListener("click", async () => {
   const data = await res.json();
   if (!res.ok) return fail(data.error || "run failed to start");
 
-  es = new EventSource("/api/events/" + data.run_id);
-  es.onmessage = e => onEvent(JSON.parse(e.data));
-  es.addEventListener("done", async () => {
+  const runId = data.run_id;
+  const finish = async () => {
     es.close(); clearInterval(tick);
-    await showSummary(data.run_id);
+    await showSummary(runId);
     goBtn.disabled = false;
-  });
-  es.onerror = () => { es.close(); clearInterval(tick); goBtn.disabled = false; };
+  };
+  es = new EventSource("/api/events/" + runId);
+  es.onmessage = e => onEvent(JSON.parse(e.data));
+  es.addEventListener("done", finish);
+  es.onerror = async () => {
+    // EventSource reconnects on its own; only wrap up if the run is
+    // actually over -- a dropped connection is not a finished run.
+    try {
+      const c = await (await fetch("/api/config")).json();
+      if (c.state.run_id === runId && c.state.state === "running") return;
+    } catch (e) { return; }
+    finish();
+  };
 });
 
 function fail(msg) {
