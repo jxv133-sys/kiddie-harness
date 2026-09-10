@@ -6,3 +6,8 @@ venv/
 .pytest_cache/
 .ruff_cache/
 workspace/
+# stray artifacts a generated/test project may drop in the repo root
+*.db
+*.sqlite
+*.sqlite3
+tasks.json
