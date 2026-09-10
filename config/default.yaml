@@ -2,7 +2,9 @@
 # Any of these can be overridden with --model / --host / --max-retries CLI flags.
 
 ollama:
-  host: "http://192.168.50.142:11434"
+  # Ollama runs in a container on this box: 7869 on the host maps to
+  # 11434 inside the container, so the reachable address is :7869.
+  host: "http://192.168.50.142:7869"
   model: "qwen2.5-coder:7b"
   timeout_seconds: 300
 
