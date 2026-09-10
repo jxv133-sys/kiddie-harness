@@ -6,7 +6,7 @@ ollama:
   # 11434 inside the container, so the reachable address is :7869.
   host: "http://192.168.50.142:7869"
   model: "qwen2.5-coder:7b"
-  timeout_seconds: 300
+  timeout_seconds: 800
 
 # Extra backends for parallel multi-file generation. When present, the
 # multi-file loop runs one worker per endpoint and builds files whose
