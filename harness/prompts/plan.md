@@ -13,5 +13,7 @@ Rules:
 - Keep the list small: only files that are actually necessary for the goal.
 - Do not include a README, config files, or any non-Python files.
 - List files that other files depend on before the files that depend on them.
+- For each file give `depends_on`: the filenames earlier in the list that
+  it imports from (an empty list if it imports from none of them).
 
 Goal: {goal}

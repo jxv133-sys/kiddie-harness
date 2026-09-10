@@ -44,7 +44,7 @@ def test_plan_files_parses_schema_constrained_json():
 
     assert tasks == [
         FileTask(path="cli.py", purpose="Entry point"),
-        FileTask(path="core.py", purpose="Core logic"),
+        FileTask(path="core.py", purpose="Core logic", depends_on=("cli.py",)),
     ]
 
 
@@ -141,8 +141,56 @@ def test_plan_files_flattens_subdirectory_paths_to_bare_filenames():
 
     assert tasks == [
         FileTask(path="core.py", purpose="logic"),
-        FileTask(path="main.py", purpose="entry"),
+        FileTask(path="main.py", purpose="entry", depends_on=("core.py",)),
     ]
+
+
+def test_plan_files_default_depends_on_is_every_earlier_file():
+    payload = json.dumps(
+        {
+            "files": [
+                {"path": "a.py", "purpose": "leaf"},
+                {"path": "b.py", "purpose": "uses a"},
+                {"path": "c.py", "purpose": "uses a and b"},
+            ]
+        }
+    )
+    tasks = plan_files(FakeClient([payload]), "x", temperature=0.2, max_tokens=512)
+
+    assert tasks[0].depends_on == ()
+    assert tasks[1].depends_on == ("a.py",)
+    assert tasks[2].depends_on == ("a.py", "b.py")
+
+
+def test_plan_files_uses_an_explicit_depends_on_when_given():
+    payload = json.dumps(
+        {
+            "files": [
+                {"path": "config.py", "purpose": "constants"},
+                {"path": "core.py", "purpose": "logic"},
+                {"path": "main.py", "purpose": "entry", "depends_on": ["core.py"]},
+            ]
+        }
+    )
+    tasks = plan_files(FakeClient([payload]), "x", temperature=0.2, max_tokens=512)
+
+    assert tasks[2].depends_on == ("core.py",)  # not config.py
+
+
+def test_plan_files_drops_forward_and_unknown_depends_on_entries():
+    payload = json.dumps(
+        {
+            "files": [
+                {"path": "a.py", "purpose": "leaf", "depends_on": ["b.py", "nope.py"]},
+                {"path": "b.py", "purpose": "x", "depends_on": ["a.py"]},
+            ]
+        }
+    )
+    tasks = plan_files(FakeClient([payload]), "x", temperature=0.2, max_tokens=512)
+
+    # a.py: forward dep b.py and unknown nope.py both dropped -> fall back to () (no earlier files)
+    assert tasks[0].depends_on == ()
+    assert tasks[1].depends_on == ("a.py",)
 
 
 def test_plan_files_deduplicates_repeated_paths_keeping_the_first():
@@ -161,5 +209,5 @@ def test_plan_files_deduplicates_repeated_paths_keeping_the_first():
 
     assert tasks == [
         FileTask(path="main.py", purpose="entry point"),
-        FileTask(path="helper.py", purpose="helpers"),
+        FileTask(path="helper.py", purpose="helpers", depends_on=("main.py",)),
     ]

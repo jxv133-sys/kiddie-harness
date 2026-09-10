@@ -40,6 +40,7 @@ PLAN_SCHEMA = {
                 "properties": {
                     "path": {"type": "string"},
                     "purpose": {"type": "string"},
+                    "depends_on": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["path", "purpose"],
             },
@@ -57,6 +58,12 @@ class PlanError(RuntimeError):
 class FileTask:
     path: str
     purpose: str
+    # Bare filenames of the sibling modules this file imports from.
+    # Populated by `_tasks_from_plan`: the planner's own list (restricted
+    # to earlier files), or -- when it gives none -- every earlier file.
+    # The multi-file loop uses it both to order generation and to decide
+    # which sibling sources a file's codegen prompt gets.
+    depends_on: tuple[str, ...] = ()
 
 
 _PY_NAME_RE = re.compile(r"([A-Za-z_][\w-]*\.py)")
@@ -133,7 +140,7 @@ def _tasks_from_plan(data: dict) -> list[FileTask]:
     if not isinstance(files, list) or not files:
         raise PlanError(f"Planner returned no files: {data}")
 
-    tasks: list[FileTask] = []
+    entries: list[tuple[str, str, object]] = []
     seen: set[str] = set()
     for f in files:
         try:
@@ -144,10 +151,26 @@ def _tasks_from_plan(data: dict) -> list[FileTask]:
         if not name.endswith(".py") or name in seen:
             continue
         seen.add(name)
-        tasks.append(FileTask(path=name, purpose=purpose))
+        entries.append((name, purpose, f.get("depends_on")))
 
-    if not tasks:
+    if not entries:
         raise PlanError(f"Planner returned no Python files: {data}")
+
+    names = [name for name, _, _ in entries]
+    tasks: list[FileTask] = []
+    for i, (name, purpose, raw_deps) in enumerate(entries):
+        earlier = names[:i]
+        declared = raw_deps if isinstance(raw_deps, list) else []
+        # Only accept deps that name an *earlier* file: the planner's
+        # contract is "dependencies before dependents", and restricting to
+        # backward edges means the dependency graph can never have a cycle.
+        valid = [
+            posixpath.basename(str(d).strip().replace("\\", "/"))
+            for d in declared
+            if posixpath.basename(str(d).strip().replace("\\", "/")) in earlier
+        ]
+        deps = tuple(dict.fromkeys(valid)) if valid else tuple(earlier)
+        tasks.append(FileTask(path=name, purpose=purpose, depends_on=deps))
     return tasks
 
 

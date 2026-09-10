@@ -286,7 +286,7 @@ class MultiFileLoop:
                     f"Create the file `{task.path}`.\n"
                     f"Purpose: {task.purpose}\n\n"
                     f"Specification:\n{spec_text}"
-                    f"{self._sibling_context(file_results)}"
+                    f"{self._sibling_context(task, file_results)}"
                 )
                 is_test_file = Path(task.path).name.startswith("test_")
                 result, attempts = _generate_and_fix(
@@ -363,20 +363,24 @@ class MultiFileLoop:
 
     _SIBLING_CONTEXT_CHAR_CAP = 6000
 
-    def _sibling_context(self, file_results: list[FileRunResult]) -> str:
-        """The source of the modules already built this run, so codegen for
-        the next file imports from them by name instead of guessing (or
-        re-implementing what a sibling already provides)."""
+    def _sibling_context(self, task: FileTask, file_results: list[FileRunResult]) -> str:
+        """The source of the modules this file declares it depends on, so
+        its codegen imports from them by name instead of guessing (or
+        re-implementing what a dependency already provides). With no
+        explicit `depends_on`, `task.depends_on` is every earlier file --
+        the same as before this narrowing existed."""
+        wanted = set(task.depends_on)
         blocks: list[str] = []
         used = 0
         for f in file_results:
-            if not f.success or f.advisory or Path(f.path).name.startswith("test_"):
+            name = Path(f.path).name
+            if name not in wanted or not f.success or f.advisory or name.startswith("test_"):
                 continue
             source = Path(f.path).read_text()
             if used + len(source) > self._SIBLING_CONTEXT_CHAR_CAP:
                 break
             used += len(source)
-            blocks.append(f"### {Path(f.path).name}\n```python\n{source}\n```")
+            blocks.append(f"### {name}\n```python\n{source}\n```")
         if not blocks:
             return ""
         return (
