@@ -49,6 +49,11 @@ def test_format_event_fix():
     )
 
 
+def test_format_event_fix_noop():
+    line = format_event("fix_noop", {"path": "main.py", "attempt": 1, "stage": "compile"})
+    assert line == "[fix] main.py -> gave up (fix repeated the failing file verbatim)"
+
+
 def test_format_event_integration_verify():
     ok = format_event("integration_verify", {"stage": "pytest", "success": True, "output": ""})
     failed = format_event("integration_verify", {"stage": "run", "success": False, "output": "err"})

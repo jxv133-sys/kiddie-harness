@@ -38,6 +38,9 @@ def format_event(event: str, fields: dict) -> str | None:
         note = " (truncated)" if fields.get("truncated") else ""
         return f"[fix] {fields['path']} -> attempt {fields['attempt']}{note}"
 
+    if event == "fix_noop":
+        return f"[fix] {fields['path']} -> gave up (fix repeated the failing file verbatim)"
+
     if event == "integration_verify":
         status = "ok" if fields["success"] else "FAILED"
         return f"[integration:{fields['stage']}] -> {status}"

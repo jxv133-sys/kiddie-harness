@@ -38,14 +38,29 @@ def test_recovers_after_one_fix(tmp_path: Path):
 def test_gives_up_after_max_fix_attempts(tmp_path: Path):
     config = make_config(tmp_path, max_fix_attempts=2)
     session = Session.create(config.workspace_root)
-    broken = "def broken(:\n"
-    client = FakeClient([broken, broken, broken])  # 1 initial + 2 fixes, all still broken
+    # Each attempt is broken but distinct, so the no-op short-circuit does
+    # not fire and the loop runs the full fix budget.
+    client = FakeClient(["def broken(:\n", "def broke(:\n", "def brok(:\n"])
 
     result = SingleFileLoop(client, config, session).run("do something impossible")
 
     assert not result.success
     assert result.attempts == 2
     assert len(client.calls) == 3
+
+
+def test_stops_early_when_a_fix_repeats_the_failing_file_verbatim(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=3)
+    session = Session.create(config.workspace_root)
+    broken = "def broken(:\n"
+    client = FakeClient([broken, broken, broken, broken])
+
+    result = SingleFileLoop(client, config, session).run("do something impossible")
+
+    assert not result.success
+    # 1 initial generation + 1 fix call that echoed it back -> stop.
+    assert result.attempts == 1
+    assert len(client.calls) == 2
 
 
 def test_strips_markdown_fence_from_model_output(tmp_path: Path):

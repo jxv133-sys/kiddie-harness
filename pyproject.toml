@@ -19,3 +19,10 @@ harness = "harness.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["harness*"]
+
+[tool.pytest.ini_options]
+# Only ever collect the real test suite. Generated projects under workspace/
+# contain their own test_*.py files (with colliding basenames) that must never
+# be swept into this project's own pytest run.
+testpaths = ["tests"]
+norecursedirs = ["workspace", ".venv", ".git", "*.egg-info"]

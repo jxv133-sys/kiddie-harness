@@ -221,6 +221,45 @@ def test_fix_prompt_reflects_ruffs_autofix_when_a_second_issue_remains(tmp_path:
     assert "import os" not in fix_prompt
 
 
+def test_test_generation_prompt_includes_the_real_module_source(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
+            "- return None on bad input",  # spec
+            "def handle(x):\n    return None\n",  # codegen
+            "from main import handle\n\ndef test_handle():\n    assert handle(1) is None\n",
+        ]
+    )
+
+    MultiFileLoop(client, config, session).run("do a thing")
+
+    testgen_prompt = client.calls[3]  # plan, spec, codegen, testgen
+    assert "def handle(x):" in testgen_prompt
+    assert "return None" in testgen_prompt
+
+
+def test_test_fix_prompt_includes_the_real_module_source(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
+            "- a function f",  # spec
+            "def f():\n    return 1\n",  # codegen -- compiles, lints, imports
+            "from main import f\n\ndef test_f():\n    assert f() == 2\n",  # test: fails pytest
+            "from main import f\n\ndef test_f():\n    assert f() == 1\n",  # test fix: passes
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("a script")
+
+    assert result.success
+    test_fix_prompt = client.calls[4]  # plan, spec, codegen, testgen, test-fix
+    assert "def f():\n    return 1" in test_fix_prompt
+
+
 def test_integration_fix_writes_corrected_code_to_the_implicated_file(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)

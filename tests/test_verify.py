@@ -1,9 +1,11 @@
+import os
 from pathlib import Path
 
 from harness.steps.verify import (
     compile_check,
     import_check,
     lint_check,
+    main_guard_check,
     run_pytest,
     run_script,
     verify_python_file,
@@ -159,13 +161,65 @@ def test_verify_python_file_static_stops_at_lint_before_import_check(tmp_path: P
 
 def test_verify_python_file_static_runs_import_check_after_compile_and_lint(tmp_path: Path):
     # Compiles fine, lints clean (the import is used, so ruff has nothing
-    # to flag or auto-fix), but the import doesn't resolve -- proves
-    # import_check runs as a third stage, not instead of compile/lint.
+    # to flag or auto-fix), no unguarded top-level code, but the import
+    # doesn't resolve -- proves import_check runs as the last stage, not
+    # instead of the earlier ones.
     f = tmp_path / "main.py"
-    f.write_text("import definitely_not_a_real_module_xyz\n\nprint(definitely_not_a_real_module_xyz)\n")
+    f.write_text(
+        "import definitely_not_a_real_module_xyz\n\n"
+        "VALUE = definitely_not_a_real_module_xyz.thing\n"
+    )
     result = verify_python_file_static(f)
     assert not result.success
     assert result.stage == "import"
+
+
+def test_main_guard_check_passes_on_a_pure_module(tmp_path: Path):
+    f = tmp_path / "lib.py"
+    f.write_text('"""docs."""\nimport sys\n\nMAX = 10\n\ndef go(x):\n    return x + 1\n')
+    result = main_guard_check(f)
+    assert result.success
+    assert result.stage == "guard"
+
+
+def test_main_guard_check_passes_when_top_level_code_is_guarded(tmp_path: Path):
+    f = tmp_path / "main.py"
+    f.write_text(
+        "import sys\n\n"
+        "def main():\n    print(sys.argv)\n\n"
+        'if __name__ == "__main__":\n    main()\n'
+    )
+    assert main_guard_check(f).success
+
+
+def test_main_guard_check_flags_an_unguarded_entry_script(tmp_path: Path):
+    f = tmp_path / "main.py"
+    f.write_text(
+        "import sys\n\n"
+        "def add(a, b):\n    return a + b\n\n"
+        'if len(sys.argv) != 3:\n    print("usage")\n    sys.exit(1)\n\n'
+        "print(add(float(sys.argv[1]), float(sys.argv[2])))\n"
+    )
+    result = main_guard_check(f)
+    assert not result.success
+    assert result.stage == "guard"
+    assert "__main__" in result.output
+
+
+def test_verify_python_file_static_stops_at_guard_before_import_check(tmp_path: Path):
+    helper = tmp_path / "helper.py"
+    helper.write_text("def add(a, b):\n    return a + b\n")
+    f = tmp_path / "main.py"
+    f.write_text("from helper import add\n\ndef run():\n    return add(1, 2)\n\nprint(run())\n")
+    result = verify_python_file_static(f)
+    assert not result.success
+    assert result.stage == "guard"
+
+
+def test_main_guard_check_ignores_a_plain_script_with_no_defs(tmp_path: Path):
+    f = tmp_path / "script.py"
+    f.write_text("import sys\n\nif len(sys.argv) > 1:\n    print(sys.argv[1])\n")
+    assert main_guard_check(f).success
 
 
 def test_run_pytest_passes_on_passing_test(tmp_path: Path):
@@ -180,3 +234,29 @@ def test_run_pytest_fails_on_failing_test(tmp_path: Path):
     result = run_pytest(tmp_path)
     assert not result.success
     assert result.stage == "pytest"
+
+
+def test_run_pytest_sees_an_in_place_rewrite_of_the_same_size(tmp_path: Path, monkeypatch):
+    # The fix loop rewrites a test file and re-runs pytest. If the new
+    # version has the same byte length and a near-identical mtime, pytest's
+    # assertion-rewrite .pyc cache can serve the old bytecode. Force the
+    # mtime to be identical across both writes to make the collision
+    # deterministic, then prove run_pytest still reports the new result.
+    test_file = tmp_path / "test_sample.py"
+    module = tmp_path / "sample.py"
+    module.write_text("def value():\n    return 1\n")
+
+    original_write = Path.write_text
+
+    def frozen_mtime_write(self, data, *args, **kwargs):
+        result = original_write(self, data, *args, **kwargs)
+        os.utime(self, (1_000_000_000, 1_000_000_000))
+        return result
+
+    monkeypatch.setattr(Path, "write_text", frozen_mtime_write)
+
+    test_file.write_text("from sample import value\n\ndef test_v():\n    assert value() == 2\n")
+    assert not run_pytest(test_file).success
+
+    test_file.write_text("from sample import value\n\ndef test_v():\n    assert value() == 1\n")
+    assert run_pytest(test_file).success

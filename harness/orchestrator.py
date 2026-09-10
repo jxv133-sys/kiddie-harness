@@ -75,6 +75,7 @@ def _generate_and_fix(
     verify_fn: Callable[[Path], VerifyResult],
     *,
     generate_fn: Callable[..., codegen.GeneratedCode] = codegen.generate_file,
+    fix_context: str = "",
 ) -> tuple[VerifyResult, int]:
     """Shared bounded-retry loop: generate once, verify, fix on failure.
 
@@ -125,6 +126,7 @@ def _generate_and_fix(
         if gen.truncated:
             error = _TRUNCATION_NOTE + error
 
+        failed_code = code
         gen = codegen.fix_file(
             client,
             code=code,
@@ -132,12 +134,22 @@ def _generate_and_fix(
             stage=result.stage,
             temperature=config.temperature,
             max_tokens=max_tokens,
+            context=fix_context,
         )
         code = gen.code
         attempts += 1
         session.log("fix", path=str(file_path), attempt=attempts, code=code, truncated=gen.truncated)
         if gen.truncated:
             max_tokens = min(max_tokens * 2, config.max_tokens_ceiling)
+
+        if code == failed_code:
+            # The fix call returned the exact bytes we just verified as
+            # failing. Re-verifying them would burn the rest of the fix
+            # budget on a guaranteed-identical failure -- weak models at a
+            # low temperature routinely echo their last output verbatim.
+            # Stop now with the failure we already have.
+            session.log("fix_noop", path=str(file_path), attempt=attempts, stage=result.stage)
+            return result, attempts
 
 
 class SingleFileLoop:
@@ -181,7 +193,9 @@ class MultiFileLoop:
     one file's spec at a time, and the test writer is a separate call from
     implementation -- never combined, since a compound "write the code and
     its own test" instruction is exactly the kind of prompt small models
-    handle unreliably.
+    handle unreliably. The test writer does see the finished module's
+    source (read from disk, not the same call), so its tests match what
+    the code actually does rather than an independent reading of the spec.
     """
 
     def __init__(self, client: OllamaClient, config: Config, session: Session):
@@ -284,14 +298,31 @@ class MultiFileLoop:
         self, task: FileTask, spec_text: str, iterations: int
     ) -> tuple[FileRunResult, int]:
         module_name = Path(task.path).stem
+        module_path = self.session.run_dir / _safe_relative_path(task.path)
+        module_source = module_path.read_text()
         test_file_path = self.session.run_dir / _safe_relative_path(f"test_{module_name}.py")
 
+        # The test writer sees the module's *actual* generated source, not
+        # just the spec: a spec bullet like "handle errors gracefully" is
+        # ambiguous, and a test written from the spec alone routinely
+        # asserts a contract the implementation chose not to honour --
+        # a mismatch the test's own fix loop (which never sees the module)
+        # then can't resolve.
+        module_block = f"```python\n{module_source}\n```"
         instruction = (
             f"Write tests for the module `{module_name}` (file `{task.path}`).\n"
             f"Purpose: {task.purpose}\n\n"
             f"Specification of what it does:\n{spec_text}\n\n"
+            f"Actual current source of `{task.path}` -- test the behavior this "
+            f"code really has, not what the spec implies it might:\n{module_block}\n\n"
             f"Import it with `from {module_name} import ...` -- "
             f"the module file is in the same directory as the test."
+        )
+        fix_context = (
+            f"The module under test, `{task.path}`, has exactly this source. "
+            f"The test must match the behavior this code actually has; if the "
+            f"test expects something the module does not do, change the test:\n"
+            f"{module_block}"
         )
         result, attempts = _generate_and_fix(
             self.client,
@@ -301,6 +332,7 @@ class MultiFileLoop:
             instruction,
             verify.verify_test_file,
             generate_fn=testgen.generate_test_file,
+            fix_context=fix_context,
         )
         iterations += 1 + attempts
 
