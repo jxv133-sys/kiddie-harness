@@ -298,6 +298,9 @@ _INDEX_HTML = """<!doctype html>
   button { margin-top:20px; width:100%; padding:11px; border:0; border-radius:8px;
            background:var(--accent); color:#fff; font:inherit; font-weight:600; cursor:pointer; }
   button:disabled { opacity:.45; cursor:default; }
+  button.link { margin-top:8px; width:auto; padding:2px 0; background:none; color:var(--muted);
+                font-weight:400; font-size:12px; }
+  button.link:hover:not(:disabled) { color:var(--accent); }
   .stats { display:flex; flex-wrap:wrap; gap:6px 18px; margin:26px 0 10px;
            font-size:13px; color:var(--muted); min-height:20px; }
   .stats b { color:var(--fg); font-weight:600; }
@@ -325,6 +328,7 @@ _INDEX_HTML = """<!doctype html>
     <div><select id="model"></select></div>
     <div><input type="text" id="host" placeholder="http://localhost:11434"></div>
   </div>
+  <button type="button" id="refresh" class="link">&#8635; re-fetch models</button>
 
   <label for="goal">Goal</label>
   <textarea id="goal" placeholder="a command-line to-do list with add / list / done subcommands"></textarea>
@@ -346,24 +350,35 @@ _INDEX_HTML = """<!doctype html>
 const $ = s => document.querySelector(s);
 const logEl = $("#log"), statsEl = $("#stats"), goBtn = $("#go"), errEl = $("#err");
 let started = 0, calls = 0, fixes = 0, filesDone = 0, filesTotal = 0, tick = null, es = null;
+let defaultModel = "";
 
 async function loadConfig() {
   const c = await (await fetch("/api/config")).json();
   $("#host").value = c.host;
-  await loadModels(c.model);
-  $("#host").addEventListener("change", () => loadModels($("#model").value));
+  defaultModel = c.model;
+  await loadModels();
+  $("#host").addEventListener("change", loadModels);
+  $("#refresh").addEventListener("click", loadModels);
 }
-async function loadModels(selected) {
+async function loadModels() {
   const host = $("#host").value.trim();
-  const { models } = await (await fetch("/api/models?host=" + encodeURIComponent(host))).json();
   const sel = $("#model");
+  const want = sel.value || defaultModel;
+  const btn = $("#refresh");
+  sel.disabled = true; btn.disabled = true; btn.textContent = "\\u21bb fetching\\u2026";
+  let models = [];
+  try {
+    ({ models } = await (await fetch("/api/models?host=" + encodeURIComponent(host))).json());
+  } catch (e) { /* leave empty; UI falls back to the wanted model */ }
   sel.innerHTML = "";
-  (models.length ? models : [selected]).forEach(m => {
+  const list = models.length ? models : (want ? [want] : []);
+  list.forEach(m => {
     const o = document.createElement("option");
     o.value = o.textContent = m;
-    if (m === selected) o.selected = true;
+    if (m === want) o.selected = true;
     sel.appendChild(o);
   });
+  sel.disabled = false; btn.disabled = false; btn.textContent = "\\u21bb re-fetch models";
 }
 
 function fmtElapsed(s) {

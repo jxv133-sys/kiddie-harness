@@ -2,8 +2,8 @@
 # Any of these can be overridden with --model / --host / --max-retries CLI flags.
 
 ollama:
-  host: "http://localhost:11434"
-  model: "deepseek-coder:8b"
+  host: "http://192.168.50.142:11434"
+  model: "qwen2.5-coder:7b"
   timeout_seconds: 300
 
 generation:
