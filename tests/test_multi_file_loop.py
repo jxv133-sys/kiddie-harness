@@ -49,6 +49,32 @@ def test_succeeds_across_files_with_integration_check(tmp_path: Path):
     assert (session.run_dir / "helper.py").read_text() == "def add(a, b):\n    return a + b"
 
 
+def test_codegen_instruction_carries_the_sibling_modules_already_built(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            _PLAN_TWO_FILES,
+            "- add two numbers",  # spec for helper.py
+            "def add(a, b):\n    return a + b\n",  # codegen for helper.py
+            "- call add and print it",  # spec for main.py
+            (
+                "from helper import add\n\n"
+                "def main():\n    print(add(2, 3))\n\n"
+                'if __name__ == "__main__":\n    main()\n'
+            ),  # codegen for main.py
+        ]
+    )
+
+    MultiFileLoop(client, config, session).run("a script that adds two numbers")
+
+    # calls: plan(0), spec-helper(1), codegen-helper(2), spec-main(3), codegen-main(4)
+    assert "def add(a, b):" in client.calls[4]
+    assert "helper.py" in client.calls[4]
+    # the first file's codegen had no siblings yet
+    assert "def add(a, b):" not in client.calls[2]
+
+
 def test_catches_and_fixes_a_bad_cross_file_import_during_its_own_generation(tmp_path: Path):
     # Mirrors a real failure: a file imports a sibling module under the
     # wrong name. The bug must be caught (and fixed) during that file's

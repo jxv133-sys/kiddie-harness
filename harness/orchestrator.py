@@ -286,6 +286,7 @@ class MultiFileLoop:
                     f"Create the file `{task.path}`.\n"
                     f"Purpose: {task.purpose}\n\n"
                     f"Specification:\n{spec_text}"
+                    f"{self._sibling_context(file_results)}"
                 )
                 is_test_file = Path(task.path).name.startswith("test_")
                 result, attempts = _generate_and_fix(
@@ -358,6 +359,30 @@ class MultiFileLoop:
             stopped_early=stopped_early,
             aborted=abort_reason is not None,
             abort_reason=abort_reason or "",
+        )
+
+    _SIBLING_CONTEXT_CHAR_CAP = 6000
+
+    def _sibling_context(self, file_results: list[FileRunResult]) -> str:
+        """The source of the modules already built this run, so codegen for
+        the next file imports from them by name instead of guessing (or
+        re-implementing what a sibling already provides)."""
+        blocks: list[str] = []
+        used = 0
+        for f in file_results:
+            if not f.success or f.advisory or Path(f.path).name.startswith("test_"):
+                continue
+            source = Path(f.path).read_text()
+            if used + len(source) > self._SIBLING_CONTEXT_CHAR_CAP:
+                break
+            used += len(source)
+            blocks.append(f"### {Path(f.path).name}\n```python\n{source}\n```")
+        if not blocks:
+            return ""
+        return (
+            "\n\nModules already created in this project -- import what you "
+            "need from them by module name (the filename without `.py`); do "
+            "not re-implement what they already provide:\n" + "\n\n".join(blocks)
         )
 
     def _run_integration_with_fixes(

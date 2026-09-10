@@ -6,6 +6,9 @@ Rules:
 - List only Python (.py) files.
 - Put every file in one flat directory: bare filenames like `core.py`, no
   slashes, no subpackages.
+- Do not name a file after a standard-library module (`statistics.py`,
+  `json.py`, `types.py`, `string.py`, ...): it shadows the real one and
+  confuses imports.
 - Give each file a short one-sentence purpose.
 - Keep the list small: only files that are actually necessary for the goal.
 - Do not include a README, config files, or any non-Python files.

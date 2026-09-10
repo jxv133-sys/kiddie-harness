@@ -22,9 +22,11 @@ exists to route around that failure mode:
 - Every LLM output is verified with **real tooling** (`py_compile`,
   `ruff`, `pytest`, actual import resolution) — never another LLM's
   opinion of whether the code is right.
-- Context per call stays narrow: code generation only ever sees that
-  file's own spec (+ its own prior content and error on a retry), never
-  the whole growing project transcript.
+- Context per call stays narrow: code generation sees that file's own
+  spec, the source of the sibling modules already built this run (capped;
+  so its imports resolve instead of guessing), and — on a retry — its own
+  prior content and the exact error. Never the whole growing transcript,
+  never another file's spec.
 
 If you're extending this project, preserve these properties. A change
 that makes one LLM call do two things at once, or that lets the model

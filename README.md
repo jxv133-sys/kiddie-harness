@@ -52,8 +52,10 @@ file is built like any other, and if the model can't get it green it is
 fatal.
 
 Every step is still a single, narrow LLM call: the planner never writes
-code, the spec writer never writes code, code generation for one file
-never sees any other file's contents.
+code, the spec writer never writes code. Code generation for one file
+sees the *source of the sibling modules already built this run* (so its
+imports resolve to the right module instead of a guess), but never a
+spec or a plan it wasn't given — one file, one output.
 
 **Phase 4 (this commit):** hardening and observability, on top of the
 same loop shape -- no changes to what the model is asked to do:
