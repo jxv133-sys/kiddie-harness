@@ -33,7 +33,7 @@ def test_main_reports_clean_error_when_ollama_unreachable(tmp_path, monkeypatch,
 
     assert exit_code == 2
     out = capsys.readouterr().out
-    assert "ERROR" in out
+    assert "ABORTED" in out
     assert "could not connect" in out
 
 

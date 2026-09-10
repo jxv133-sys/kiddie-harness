@@ -41,6 +41,10 @@ class RunSummary:
     # False when the log has no terminal event -- the process was killed
     # (Ctrl-C, OOM, timeout) before the run reached a verdict.
     finished: bool = True
+    # True when the run stopped because the model became unreachable
+    # partway through, rather than on the code.
+    aborted: bool = False
+    abort_reason: str = ""
 
 
 def load_run_summary(log_path: Path) -> RunSummary:
@@ -53,6 +57,8 @@ def load_run_summary(log_path: Path) -> RunSummary:
     saw_giving_up = False
     run_result: bool | None = None
     finished = False
+    aborted = False
+    abort_reason = ""
 
     for line in log_path.read_text().splitlines():
         if not line.strip():
@@ -83,6 +89,10 @@ def load_run_summary(log_path: Path) -> RunSummary:
         elif event == "giving_up":
             saw_giving_up = True
             finished = True
+        elif event == "run_aborted":
+            aborted = True
+            abort_reason = record.get("reason", "")
+            finished = True
         elif event == "run_result":
             run_result = record["success"]
             finished = True
@@ -110,6 +120,8 @@ def load_run_summary(log_path: Path) -> RunSummary:
         stopped_early=stopped_early,
         succeeded=succeeded,
         finished=finished,
+        aborted=aborted,
+        abort_reason=abort_reason,
     )
 
 
@@ -133,7 +145,10 @@ def render_table(summary: RunSummary) -> str:
         status = "ok" if summary.integration.success else "FAILED"
         lines.append(f"  [{status}] integration check ({summary.integration.stage})")
 
-    if not summary.finished:
+    if summary.aborted:
+        detail = f" ({summary.abort_reason})" if summary.abort_reason else ""
+        result = f"ABORTED: the model became unreachable mid-run{detail}"
+    elif not summary.finished:
         result = "INCOMPLETE: the run did not finish (log has no terminal event)"
     elif summary.succeeded:
         result = "SUCCESS"

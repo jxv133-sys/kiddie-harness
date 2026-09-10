@@ -13,7 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .config import Config
-from .llm_client import OllamaClient
+from .llm_client import OllamaClient, OllamaError
 from .session import Session
 from .steps import codegen, plan, spec, testgen, verify
 from .steps.plan import FileTask
@@ -26,6 +26,10 @@ class RunResult:
     file_path: str
     attempts: int
     last_output: str
+    # Set when the model became unreachable mid-run: the run stopped
+    # without ever reaching a verdict on the code.
+    aborted: bool = False
+    abort_reason: str = ""
 
 
 @dataclasses.dataclass
@@ -50,6 +54,10 @@ class MultiFileRunResult:
     integration: VerifyResult | None
     total_iterations: int
     stopped_early: bool
+    # Set when the model became unreachable partway through; whatever
+    # files completed before the outage are kept in `files`.
+    aborted: bool = False
+    abort_reason: str = ""
 
 
 def _safe_relative_path(raw: str) -> Path:
@@ -198,9 +206,21 @@ class SingleFileLoop:
         self.session.log("goal", goal=goal)
         file_path = self.session.run_dir / filename
 
-        result, attempts = _generate_and_fix(
-            self.client, self.config, self.session, file_path, goal, verify.verify_python_file
-        )
+        try:
+            result, attempts = _generate_and_fix(
+                self.client, self.config, self.session, file_path, goal, verify.verify_python_file
+            )
+        except OllamaError as exc:
+            self.session.log("run_aborted", reason=str(exc))
+            self.session.log("run_result", success=False)
+            return RunResult(
+                success=False,
+                file_path=str(file_path),
+                attempts=0,
+                last_output=str(exc),
+                aborted=True,
+                abort_reason=str(exc),
+            )
 
         if not result.success:
             self.session.log("giving_up", attempts=attempts)
@@ -244,84 +264,101 @@ class MultiFileLoop:
         iterations = 1  # the planning call itself
         file_results: list[FileRunResult] = []
         stopped_early = False
+        integration: VerifyResult | None = None
+        abort_reason: str | None = None
 
-        for task in tasks:
-            if iterations >= self.config.max_total_iterations:
-                self.session.log("budget_exhausted", before=task.path, iterations=iterations)
-                stopped_early = True
-                break
+        try:
+            for task in tasks:
+                if iterations >= self.config.max_total_iterations:
+                    self.session.log("budget_exhausted", before=task.path, iterations=iterations)
+                    stopped_early = True
+                    break
 
-            spec_text = spec.write_spec(
-                self.client,
-                goal,
-                task,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-            )
-            iterations += 1
-            self.session.log("spec", path=task.path, spec=spec_text)
-
-            file_path = self.session.run_dir / _safe_relative_path(task.path)
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-
-            instruction = (
-                f"Create the file `{task.path}`.\n"
-                f"Purpose: {task.purpose}\n\n"
-                f"Specification:\n{spec_text}"
-            )
-            result, attempts = _generate_and_fix(
-                self.client,
-                self.config,
-                self.session,
-                file_path,
-                instruction,
-                verify.verify_python_file_static,
-            )
-            iterations += 1 + attempts
-
-            is_test_file = Path(task.path).name.startswith("test_")
-            planner_test_advisory = is_test_file and not result.success
-            if planner_test_advisory:
-                self.session.log("advisory_test", path=str(file_path), last_error=result.output)
-
-            file_results.append(
-                FileRunResult(
-                    path=str(file_path),
-                    purpose=task.purpose,
-                    success=result.success,
-                    attempts=attempts,
-                    last_output=result.output,
-                    advisory=planner_test_advisory,
+                spec_text = spec.write_spec(
+                    self.client,
+                    goal,
+                    task,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
                 )
-            )
+                iterations += 1
+                self.session.log("spec", path=task.path, spec=spec_text)
 
-            if result.success and not is_test_file and iterations < self.config.max_total_iterations:
-                test_result, iterations = self._generate_test_for(task, spec_text, iterations)
-                file_results.append(test_result)
+                file_path = self.session.run_dir / _safe_relative_path(task.path)
+                file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        integration = None
-        advisory_paths = [Path(f.path) for f in file_results if f.advisory]
-        # A run's success rides on its non-advisory files: the
-        # implementation, and any test that actually passed.
+                instruction = (
+                    f"Create the file `{task.path}`.\n"
+                    f"Purpose: {task.purpose}\n\n"
+                    f"Specification:\n{spec_text}"
+                )
+                result, attempts = _generate_and_fix(
+                    self.client,
+                    self.config,
+                    self.session,
+                    file_path,
+                    instruction,
+                    verify.verify_python_file_static,
+                )
+                iterations += 1 + attempts
+
+                is_test_file = Path(task.path).name.startswith("test_")
+                planner_test_advisory = is_test_file and not result.success
+                if planner_test_advisory:
+                    self.session.log("advisory_test", path=str(file_path), last_error=result.output)
+
+                file_results.append(
+                    FileRunResult(
+                        path=str(file_path),
+                        purpose=task.purpose,
+                        success=result.success,
+                        attempts=attempts,
+                        last_output=result.output,
+                        advisory=planner_test_advisory,
+                    )
+                )
+
+                if (
+                    result.success
+                    and not is_test_file
+                    and iterations < self.config.max_total_iterations
+                ):
+                    test_result, iterations = self._generate_test_for(task, spec_text, iterations)
+                    file_results.append(test_result)
+
+            advisory_paths = [Path(f.path) for f in file_results if f.advisory]
+            # A run's success rides on its non-advisory files: the
+            # implementation, and any test that actually passed.
+            required = [f for f in file_results if not f.advisory]
+            all_required_ok = bool(required) and all(f.success for f in required)
+            if all_required_ok and not stopped_early:
+                # A passing test_*.py file -- planner-provided or generated
+                # by _generate_test_for -- means pytest is the right
+                # integration check; otherwise fall back to an entry file.
+                has_tests = any(
+                    Path(f.path).name.startswith("test_") and f.success for f in file_results
+                )
+                generated_paths = [Path(f.path) for f in required]
+                integration, iterations = self._run_integration_with_fixes(
+                    tasks, generated_paths, has_tests, iterations, ignore_paths=advisory_paths
+                )
+        except OllamaError as exc:
+            # The model went unreachable partway through. Keep every file
+            # that finished; report the run as aborted, not failed.
+            abort_reason = str(exc)
+
         required = [f for f in file_results if not f.advisory]
         all_required_ok = bool(required) and all(f.success for f in required)
-        if all_required_ok and not stopped_early:
-            # A passing test_*.py file -- planner-provided or generated by
-            # _generate_test_for -- means pytest is the right integration
-            # check; otherwise fall back to running an entry file.
-            has_tests = any(
-                Path(f.path).name.startswith("test_") and f.success for f in file_results
-            )
-            generated_paths = [Path(f.path) for f in required]
-            integration, iterations = self._run_integration_with_fixes(
-                tasks, generated_paths, has_tests, iterations, ignore_paths=advisory_paths
-            )
-
         overall_success = (
-            all_required_ok and not stopped_early and (integration is None or integration.success)
+            abort_reason is None
+            and all_required_ok
+            and not stopped_early
+            and (integration is None or integration.success)
         )
 
-        if not overall_success:
+        if abort_reason is not None:
+            self.session.log("run_aborted", reason=abort_reason)
+        elif not overall_success:
             self.session.log("giving_up", iterations=iterations, stopped_early=stopped_early)
         self.session.log("run_result", success=overall_success)
 
@@ -332,6 +369,8 @@ class MultiFileLoop:
             integration=integration,
             total_iterations=iterations,
             stopped_early=stopped_early,
+            aborted=abort_reason is not None,
+            abort_reason=abort_reason or "",
         )
 
     def _generate_test_for(

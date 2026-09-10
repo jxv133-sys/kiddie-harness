@@ -26,9 +26,10 @@ class FakeResponse:
 class FakeClient:
     """Returns queued responses in order, one per `generate` call.
 
-    Each queued item is either a plain `str` (done_reason=None) or a
-    `(text, done_reason)` tuple, so tests can simulate a truncated
-    response (`done_reason="length"`) without touching real network code.
+    Each queued item is either a plain `str` (done_reason=None), a
+    `(text, done_reason)` tuple (to simulate a truncated response), or an
+    `Exception` instance, which is raised on that call -- lets a test
+    simulate the model becoming unreachable partway through a run.
     """
 
     def __init__(self, responses: list[str | tuple[str, str]]):
@@ -44,6 +45,8 @@ class FakeClient:
         if not self._responses:
             raise AssertionError("FakeClient ran out of queued responses")
         item = self._responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
         if isinstance(item, tuple):
             text, done_reason = item
             return FakeResponse(text, done_reason=done_reason)

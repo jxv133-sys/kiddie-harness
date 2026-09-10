@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from harness.llm_client import OllamaError
 from harness.orchestrator import MultiFileLoop
 from harness.session import Session
 from harness.steps.plan import FileTask
@@ -308,6 +309,31 @@ def test_advisory_test_is_left_out_of_the_integration_pytest_run(tmp_path: Path)
     # integration has nothing left to fail on, so the run still succeeds.
     assert result.success
     assert [Path(f.path).name for f in result.files if f.advisory] == ["test_calc.py"]
+
+
+def test_run_aborts_gracefully_when_the_model_becomes_unreachable(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            _PLAN_TWO_FILES,
+            "- add two numbers",  # spec for helper.py
+            "def add(a, b):\n    return a + b\n",  # helper.py codegen
+            "from helper import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",  # test
+            OllamaError("Read timed out"),  # spec for main.py -- host gone
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("a script that adds two numbers")
+
+    assert not result.success
+    assert result.aborted
+    assert "timed out" in result.abort_reason
+    # the work that completed before the outage is kept
+    assert [Path(f.path).name for f in result.files] == ["helper.py", "test_helper.py"]
+    events = [json.loads(line)["event"] for line in session.log_path.read_text().splitlines()]
+    assert "run_aborted" in events
+    assert events[-1] == "run_result"
 
 
 def test_find_implicated_file_does_not_match_a_name_inside_another_name(tmp_path: Path):

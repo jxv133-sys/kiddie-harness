@@ -107,6 +107,36 @@ def test_load_run_summary_flags_a_run_that_never_finished(tmp_path: Path):
     assert "INCOMPLETE" in render_table(summary)
 
 
+def test_load_run_summary_reports_an_aborted_run(tmp_path: Path):
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "codegen", "path": "a.py", "code": "x=1", "truncated": False},
+            {
+                "event": "verify",
+                "path": "a.py",
+                "attempt": 0,
+                "stage": "import",
+                "success": True,
+                "output": "",
+            },
+            {"event": "run_aborted", "reason": "Could not reach Ollama: Read timed out"},
+            {"event": "run_result", "success": False},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert summary.finished
+    assert summary.aborted
+    assert not summary.succeeded
+    table = render_table(summary)
+    assert "ABORTED" in table
+    assert "timed out" in table
+    # the file that completed before the outage is still listed
+    assert [f.path for f in summary.files] == ["a.py"]
+
+
 def test_run_result_event_is_authoritative_over_the_giving_up_heuristic(tmp_path: Path):
     log_path = _write_log(
         tmp_path,

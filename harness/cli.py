@@ -63,6 +63,8 @@ def _run_single_file(client: OllamaClient, config: Config, session: Session, arg
         print("Last error:")
         print(result.last_output)
     print(f"Full transcript: {session.log_path}")
+    if result.aborted:
+        return 2
     return 0 if result.success else 1
 
 
@@ -95,6 +97,8 @@ def _run_multi_file(client: OllamaClient, config: Config, session: Session, args
             )
 
     print(f"Full transcript: {session.log_path}")
+    if result.aborted:
+        return 2
     return 0 if result.success else 1
 
 
