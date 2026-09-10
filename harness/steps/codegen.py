@@ -39,18 +39,8 @@ def fix_file(
     stage: str,
     temperature: float,
     max_tokens: int,
-    context: str = "",
 ) -> GeneratedCode:
-    """Current file + exact error -> corrected full file.
-
-    `context`, when given, is prepended verbatim -- used only for test
-    files, whose fix is impossible without seeing the module they test
-    (the error alone can't say whether the test or the module is wrong).
-    An implementation file's fix still gets nothing but its own code and
-    the error.
-    """
+    """Current file + exact error -> corrected full file. Nothing else in context."""
     prompt = _FIX_TEMPLATE.format(code=code, error=error, stage=stage)
-    if context:
-        prompt = f"{context}\n\n{prompt}"
     response = client.generate(prompt, temperature=temperature, max_tokens=max_tokens)
     return GeneratedCode(code=strip_code_fences(response.text), truncated=response.truncated)

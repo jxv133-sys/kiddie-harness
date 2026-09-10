@@ -182,8 +182,8 @@ _CONTROL_FLOW_NODES = (
 def main_guard_check(path: Path) -> VerifyResult:
     """Fail if a module that defines reusable code also runs code at import.
 
-    A multi-file project's files are imported for real by `import_check`,
-    by their companion test, and at the integration step. A file that
+    A multi-file project's files are imported for real by `import_check`
+    and at the integration step. A file that
     defines functions/classes (so it *will* be imported) but also parses
     `sys.argv` or calls its entry point at module level -- with no
     `if __name__ == "__main__":` guard -- executes, and often `sys.exit`s,
@@ -288,10 +288,12 @@ def run_pytest(
 
 
 def verify_test_file(path: Path, timeout_seconds: int = 30) -> VerifyResult:
-    """Compile-check a single test file, then run just that file with pytest.
+    """Compile-check a `test_*.py` file, then run just that file with pytest.
 
-    Scoped to one file: the module it imports already exists on disk by the
-    time this runs (its own generate/verify/fix loop already succeeded).
+    Used for a test file the planner asked for: unlike an implementation
+    file (compile/lint/guard/import), a test only counts as passing if it
+    actually runs green, so a wrong assertion is caught here and the file
+    can be treated as advisory rather than sinking the integration run.
     """
     compiled = compile_check(path)
     if not compiled.success:

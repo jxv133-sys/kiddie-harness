@@ -15,7 +15,7 @@ from pathlib import Path
 from .config import Config
 from .llm_client import OllamaClient, OllamaError
 from .session import Session
-from .steps import codegen, plan, spec, testgen, verify
+from .steps import codegen, plan, spec, verify
 from .steps.plan import FileTask
 from .steps.verify import VerifyResult
 
@@ -101,19 +101,13 @@ def _generate_and_fix(
     file_path: Path,
     instruction: str,
     verify_fn: Callable[[Path], VerifyResult],
-    *,
-    generate_fn: Callable[..., codegen.GeneratedCode] = codegen.generate_file,
-    fix_context: str = "",
 ) -> tuple[VerifyResult, int]:
     """Shared bounded-retry loop: generate once, verify, fix on failure.
 
-    Used by the single-file loop and by each implementation/test file of
-    the multi-file loop, so the "atomic prompt + deterministic verify +
-    bounded retry" pattern only has one implementation. generate_fn swaps
-    in testgen.generate_test_file for test files; fixing always reuses
-    codegen.fix_file since a fix only ever needs the current code and the
-    exact error, regardless of what kind of file it is. Returns the final
-    VerifyResult and how many fix attempts were used.
+    Used by the single-file loop and by every file of the multi-file
+    loop, so the "atomic prompt + deterministic verify + bounded retry"
+    pattern only has one implementation. Returns the final VerifyResult
+    and how many fix attempts were used.
 
     Tracks a per-file max_tokens that doubles (capped at
     config.max_tokens_ceiling) whenever a generation was truncated -- a
@@ -121,7 +115,9 @@ def _generate_and_fix(
     just a generic "here's the error" retry.
     """
     max_tokens = config.max_tokens
-    gen = generate_fn(client, instruction, temperature=config.temperature, max_tokens=max_tokens)
+    gen = codegen.generate_file(
+        client, instruction, temperature=config.temperature, max_tokens=max_tokens
+    )
     code = gen.code
     session.log("codegen", path=str(file_path), code=code, truncated=gen.truncated)
     if gen.truncated:
@@ -134,9 +130,8 @@ def _generate_and_fix(
             result = verify_fn(file_path)
         else:
             # An empty file compiles and imports fine -- it would sail
-            # through verification as a "success" and leave a blank module
-            # for its companion test to import. Treat it as a failure the
-            # fix loop can act on instead.
+            # through verification as a "success". Treat it as a failure
+            # the fix loop can act on instead.
             result = VerifyResult(
                 success=False,
                 stage="generate",
@@ -173,7 +168,6 @@ def _generate_and_fix(
             stage=result.stage,
             temperature=_retry_temperature(config.temperature, attempts + 1),
             max_tokens=max_tokens,
-            context=fix_context,
         )
         code = gen.code
         attempts += 1
@@ -235,17 +229,18 @@ class SingleFileLoop:
 
 
 class MultiFileLoop:
-    """Phase 2/3: goal -> planned file list -> per-file spec + codegen + fix
-    (each followed by a dedicated test-writing step) -> integration verify.
+    """Phase 2: goal -> planned file list -> per-file spec + codegen + fix
+    -> integration verify.
 
     Every stage is a fixed, narrow prompt: the planner never writes code,
     the spec writer never writes code, the code generator only ever sees
-    one file's spec at a time, and the test writer is a separate call from
-    implementation -- never combined, since a compound "write the code and
-    its own test" instruction is exactly the kind of prompt small models
-    handle unreliably. The test writer does see the finished module's
-    source (read from disk, not the same call), so its tests match what
-    the code actually does rather than an independent reading of the spec.
+    one file's spec at a time. The small model is not asked to write
+    tests -- that was a reliable source of unfixable "advisory" failures
+    for weak models and added an LLM call per file for no gate. Tests
+    exist in a generated project only if the goal (and so the planner)
+    calls for a `test_*.py` file explicitly; such a file is built like
+    any other and, if the model can't get it green, it is advisory
+    rather than fatal.
     """
 
     def __init__(self, client: OllamaClient, config: Config, session: Session):
@@ -292,17 +287,17 @@ class MultiFileLoop:
                     f"Purpose: {task.purpose}\n\n"
                     f"Specification:\n{spec_text}"
                 )
+                is_test_file = Path(task.path).name.startswith("test_")
                 result, attempts = _generate_and_fix(
                     self.client,
                     self.config,
                     self.session,
                     file_path,
                     instruction,
-                    verify.verify_python_file_static,
+                    verify.verify_test_file if is_test_file else verify.verify_python_file_static,
                 )
                 iterations += 1 + attempts
 
-                is_test_file = Path(task.path).name.startswith("test_")
                 planner_test_advisory = is_test_file and not result.success
                 if planner_test_advisory:
                     self.session.log("advisory_test", path=str(file_path), last_error=result.output)
@@ -318,23 +313,15 @@ class MultiFileLoop:
                     )
                 )
 
-                if (
-                    result.success
-                    and not is_test_file
-                    and iterations < self.config.max_total_iterations
-                ):
-                    test_result, iterations = self._generate_test_for(task, spec_text, iterations)
-                    file_results.append(test_result)
-
             advisory_paths = [Path(f.path) for f in file_results if f.advisory]
             # A run's success rides on its non-advisory files: the
             # implementation, and any test that actually passed.
             required = [f for f in file_results if not f.advisory]
             all_required_ok = bool(required) and all(f.success for f in required)
             if all_required_ok and not stopped_early:
-                # A passing test_*.py file -- planner-provided or generated
-                # by _generate_test_for -- means pytest is the right
-                # integration check; otherwise fall back to an entry file.
+                # A passing test_*.py file (one the planner asked for)
+                # means pytest is the right integration check; otherwise
+                # fall back to running an entry file.
                 has_tests = any(
                     Path(f.path).name.startswith("test_") and f.success for f in file_results
                 )
@@ -371,65 +358,6 @@ class MultiFileLoop:
             stopped_early=stopped_early,
             aborted=abort_reason is not None,
             abort_reason=abort_reason or "",
-        )
-
-    def _generate_test_for(
-        self, task: FileTask, spec_text: str, iterations: int
-    ) -> tuple[FileRunResult, int]:
-        module_name = Path(task.path).stem
-        module_path = self.session.run_dir / _safe_relative_path(task.path)
-        module_source = module_path.read_text()
-        test_file_path = self.session.run_dir / _safe_relative_path(f"test_{module_name}.py")
-
-        # The test writer sees the module's *actual* generated source, not
-        # just the spec: a spec bullet like "handle errors gracefully" is
-        # ambiguous, and a test written from the spec alone routinely
-        # asserts a contract the implementation chose not to honour --
-        # a mismatch the test's own fix loop (which never sees the module)
-        # then can't resolve.
-        module_block = f"```python\n{module_source}\n```"
-        instruction = (
-            f"Write tests for the module `{module_name}` (file `{task.path}`).\n"
-            f"Purpose: {task.purpose}\n\n"
-            f"Specification of what it does:\n{spec_text}\n\n"
-            f"Actual current source of `{task.path}` -- test the behavior this "
-            f"code really has, not what the spec implies it might:\n{module_block}\n\n"
-            f"Import it with `from {module_name} import ...` -- "
-            f"the module file is in the same directory as the test."
-        )
-        fix_context = (
-            f"The module under test, `{task.path}`, has exactly this source. "
-            f"The test must match the behavior this code actually has; if the "
-            f"test expects something the module does not do, change the test:\n"
-            f"{module_block}"
-        )
-        result, attempts = _generate_and_fix(
-            self.client,
-            self.config,
-            self.session,
-            test_file_path,
-            instruction,
-            verify.verify_test_file,
-            generate_fn=testgen.generate_test_file,
-            fix_context=fix_context,
-        )
-        iterations += 1 + attempts
-
-        if not result.success:
-            self.session.log(
-                "advisory_test", path=str(test_file_path), last_error=result.output
-            )
-
-        return (
-            FileRunResult(
-                path=str(test_file_path),
-                purpose=f"tests for {task.path}",
-                success=result.success,
-                attempts=attempts,
-                last_output=result.output,
-                advisory=not result.success,
-            ),
-            iterations,
         )
 
     def _run_integration_with_fixes(

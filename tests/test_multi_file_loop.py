@@ -18,7 +18,7 @@ _PLAN_TWO_FILES = json.dumps(
 )
 
 
-def test_succeeds_across_files_with_tests_and_integration_check(tmp_path: Path):
+def test_succeeds_across_files_with_integration_check(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
     client = FakeClient(
@@ -26,14 +26,12 @@ def test_succeeds_across_files_with_tests_and_integration_check(tmp_path: Path):
             _PLAN_TWO_FILES,
             "- add two numbers",  # spec for helper.py
             "def add(a, b):\n    return a + b\n",  # codegen for helper.py
-            "from helper import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",  # test for helper.py
             "- expose a main() that adds two numbers and print it when run",  # spec for main.py
             (
                 "from helper import add\n\n\n"
-                "def main():\n    return add(2, 3)\n\n\n"
-                'if __name__ == "__main__":\n    print(main())\n'
+                "def main():\n    print(add(2, 3))\n\n\n"
+                'if __name__ == "__main__":\n    main()\n'
             ),  # codegen for main.py
-            "from main import main\n\ndef test_main():\n    assert main() == 5\n",  # test for main.py
         ]
     )
 
@@ -43,21 +41,18 @@ def test_succeeds_across_files_with_tests_and_integration_check(tmp_path: Path):
     assert not result.stopped_early
     assert [f.path for f in result.files] == [
         str(session.run_dir / "helper.py"),
-        str(session.run_dir / "test_helper.py"),
         str(session.run_dir / "main.py"),
-        str(session.run_dir / "test_main.py"),
     ]
     assert all(f.success for f in result.files)
     assert result.integration is not None
     assert result.integration.success
-    assert result.integration.stage == "pytest"
     assert (session.run_dir / "helper.py").read_text() == "def add(a, b):\n    return a + b"
 
 
 def test_catches_and_fixes_a_bad_cross_file_import_during_its_own_generation(tmp_path: Path):
     # Mirrors a real failure: a file imports a sibling module under the
     # wrong name. The bug must be caught (and fixed) during that file's
-    # own generation, not misattributed to its later companion test file.
+    # own generation.
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
     client = FakeClient(
@@ -65,11 +60,9 @@ def test_catches_and_fixes_a_bad_cross_file_import_during_its_own_generation(tmp
             _PLAN_TWO_FILES,
             "- add two numbers",  # spec for helper.py
             "def add(a, b):\n    return a + b\n",  # codegen for helper.py
-            "from helper import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",  # test for helper.py
             "- expose a main() that adds two numbers and print it when run",  # spec for main.py
             "from helpr import add\n\ndef main():\n    return add(2, 3)\n",  # codegen: wrong module name
             "from helper import add\n\ndef main():\n    return add(2, 3)\n",  # fix: corrected import
-            "from main import main\n\ndef test_main():\n    assert main() == 5\n",  # test for main.py
         ]
     )
 
@@ -78,8 +71,6 @@ def test_catches_and_fixes_a_bad_cross_file_import_during_its_own_generation(tmp
     assert result.success
     main_file = next(f for f in result.files if Path(f.path).name == "main.py")
     assert main_file.attempts == 1
-    test_files = [f for f in result.files if Path(f.path).name.startswith("test_")]
-    assert len(test_files) == 2  # test generation for main.py still happened after the fix
 
 
 def test_auto_fixes_a_per_file_lint_issue_without_calling_the_llm(tmp_path: Path):
@@ -90,16 +81,15 @@ def test_auto_fixes_a_per_file_lint_issue_without_calling_the_llm(tmp_path: Path
             json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
             "- print hello",  # spec
             "import os\nprint('hello')\n",  # codegen: unused import -- ruff auto-fixes this itself
-            "def test_placeholder():\n    assert True\n",  # test for main.py
         ]
     )
 
     result = MultiFileLoop(client, config, session).run("print hello")
 
     assert result.success
-    assert len(result.files) == 2
+    assert len(result.files) == 1
     assert result.files[0].attempts == 0
-    assert len(client.calls) == 4  # no LLM fix call was needed
+    assert len(client.calls) == 3  # plan, spec, codegen -- no LLM fix call was needed
 
 
 def test_recovers_from_an_unfixable_per_file_lint_issue(tmp_path: Path):
@@ -111,14 +101,13 @@ def test_recovers_from_an_unfixable_per_file_lint_issue(tmp_path: Path):
             "- print hello",  # spec
             "print(undefined_name)\n",  # codegen: undefined name -- ruff can't fix this itself
             "print('hello')\n",  # fix: clean
-            "def test_placeholder():\n    assert True\n",  # test for main.py
         ]
     )
 
     result = MultiFileLoop(client, config, session).run("print hello")
 
     assert result.success
-    assert len(result.files) == 2
+    assert len(result.files) == 1
     assert result.files[0].attempts == 1
 
 
@@ -223,68 +212,34 @@ def test_fix_prompt_reflects_ruffs_autofix_when_a_second_issue_remains(tmp_path:
     assert "import os" not in fix_prompt
 
 
-def test_test_generation_prompt_includes_the_real_module_source(tmp_path: Path):
-    config = make_config(tmp_path)
-    session = Session.create(config.workspace_root)
-    client = FakeClient(
-        [
-            json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
-            "- return None on bad input",  # spec
-            "def handle(x):\n    return None\n",  # codegen
-            "from main import handle\n\ndef test_handle():\n    assert handle(1) is None\n",
-        ]
-    )
-
-    MultiFileLoop(client, config, session).run("do a thing")
-
-    testgen_prompt = client.calls[3]  # plan, spec, codegen, testgen
-    assert "def handle(x):" in testgen_prompt
-    assert "return None" in testgen_prompt
-
-
-def test_test_fix_prompt_includes_the_real_module_source(tmp_path: Path):
-    config = make_config(tmp_path)
-    session = Session.create(config.workspace_root)
-    client = FakeClient(
-        [
-            json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
-            "- a function f",  # spec
-            "def f():\n    return 1\n",  # codegen -- compiles, lints, imports
-            "from main import f\n\ndef test_f():\n    assert f() == 2\n",  # test: fails pytest
-            "from main import f\n\ndef test_f():\n    assert f() == 1\n",  # test fix: passes
-        ]
-    )
-
-    result = MultiFileLoop(client, config, session).run("a script")
-
-    assert result.success
-    test_fix_prompt = client.calls[4]  # plan, spec, codegen, testgen, test-fix
-    assert "def f():\n    return 1" in test_fix_prompt
-
-
-def test_a_companion_test_that_never_passes_is_advisory_not_fatal(tmp_path: Path):
+def test_a_planner_listed_test_that_never_passes_is_advisory_not_fatal(tmp_path: Path):
     config = make_config(tmp_path, max_fix_attempts=3)
     session = Session.create(config.workspace_root)
-    bad_test = 'from main import greet\n\ndef test_greet():\n    assert greet() == "bye"\n'
+    bad_test = 'from greeter import greet\n\ndef test_greet():\n    assert greet() == "bye"\n'
     client = FakeClient(
         [
-            json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
-            "- expose greet()",  # spec
-            (
-                'def greet():\n    return "hi"\n\n\n'
-                'if __name__ == "__main__":\n    print(greet())\n'
-            ),  # codegen -- runs clean, imports clean
-            bad_test,  # companion test: fails
-            bad_test,  # fix 1: still fails
+            json.dumps(
+                {
+                    "files": [
+                        {"path": "greeter.py", "purpose": "greet"},
+                        {"path": "test_greeter.py", "purpose": "tests for greeter"},
+                    ]
+                }
+            ),
+            "- expose greet()",  # spec for greeter.py
+            'def greet():\n    return "hi"\n',  # codegen -- imports clean
+            "- test greet()",  # spec for test_greeter.py
+            bad_test,  # test_greeter.py: fails
+            bad_test,  # fix 1
             bad_test,  # fix 2
             bad_test,  # fix 3
         ]
     )
 
-    result = MultiFileLoop(client, config, session).run("a greeter")
+    result = MultiFileLoop(client, config, session).run("a greeter with tests")
 
-    assert result.success  # the deliverable works, so the run succeeds
-    test_result = next(f for f in result.files if Path(f.path).name == "test_main.py")
+    assert result.success  # greeter.py is fine, so the run succeeds
+    test_result = next(f for f in result.files if Path(f.path).name == "test_greeter.py")
     assert not test_result.success
     assert test_result.advisory
     assert result.integration is not None and result.integration.success
@@ -325,20 +280,30 @@ def test_entry_script_that_needs_argv_still_passes_integration_via_import_check(
 def test_advisory_test_is_left_out_of_the_integration_pytest_run(tmp_path: Path):
     config = make_config(tmp_path, max_fix_attempts=1)
     session = Session.create(config.workspace_root)
+    wrong = "from calc import add\n\ndef test_add():\n    assert add(1, 1) == 3\n"
     client = FakeClient(
         [
-            json.dumps({"files": [{"path": "calc.py", "purpose": "adder"}]}),
+            json.dumps(
+                {
+                    "files": [
+                        {"path": "calc.py", "purpose": "adder"},
+                        {"path": "test_calc.py", "purpose": "tests"},
+                    ]
+                }
+            ),
             "- expose add()",
             "def add(a, b):\n    return a + b\n",
-            "from calc import add\n\ndef test_add():\n    assert add(1, 1) == 3\n",  # wrong
-            "from calc import add\n\ndef test_add():\n    assert add(1, 1) == 3\n",  # fix: still wrong
+            "- test add()",
+            wrong,
+            wrong,  # fix: still wrong -> advisory
         ]
     )
 
-    result = MultiFileLoop(client, config, session).run("an adder")
+    result = MultiFileLoop(client, config, session).run("an adder with tests")
 
-    # calc.py has no runnable entry and its only test is advisory-failed;
-    # integration has nothing left to fail on, so the run still succeeds.
+    # test_calc.py is advisory-failed and left out of the pytest run;
+    # calc.py has no runnable entry, so integration has nothing to fail
+    # on and the run still succeeds.
     assert result.success
     assert [Path(f.path).name for f in result.files if f.advisory] == ["test_calc.py"]
 
@@ -351,7 +316,6 @@ def test_run_aborts_gracefully_when_the_model_becomes_unreachable(tmp_path: Path
             _PLAN_TWO_FILES,
             "- add two numbers",  # spec for helper.py
             "def add(a, b):\n    return a + b\n",  # helper.py codegen
-            "from helper import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",  # test
             OllamaError("Read timed out"),  # spec for main.py -- host gone
         ]
     )
@@ -362,7 +326,7 @@ def test_run_aborts_gracefully_when_the_model_becomes_unreachable(tmp_path: Path
     assert result.aborted
     assert "timed out" in result.abort_reason
     # the work that completed before the outage is kept
-    assert [Path(f.path).name for f in result.files] == ["helper.py", "test_helper.py"]
+    assert [Path(f.path).name for f in result.files] == ["helper.py"]
     events = [json.loads(line)["event"] for line in session.log_path.read_text().splitlines()]
     assert "run_aborted" in events
     assert events[-1] == "run_result"

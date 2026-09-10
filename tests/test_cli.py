@@ -150,15 +150,19 @@ def test_main_multi_file_notes_advisory_tests_on_an_otherwise_successful_run(
     tmp_path, monkeypatch, capsys
 ):
     _patch_config(monkeypatch, tmp_path, max_fix_attempts=1)
-    bad_test = 'from main import greet\n\ndef test_greet():\n    assert greet() == "bye"\n'
+    bad_test = 'from greeter import greet\n\ndef test_greet():\n    assert greet() == "bye"\n'
     monkeypatch.setattr(
         cli,
         "OllamaClient",
         lambda *a, **k: FakeClient(
             [
-                '{"files": [{"path": "main.py", "purpose": "x"}]}',
+                (
+                    '{"files": [{"path": "greeter.py", "purpose": "greet"},'
+                    ' {"path": "test_greeter.py", "purpose": "tests"}]}'
+                ),
                 "- expose greet",
-                'def greet():\n    return "hi"\n\n\nif __name__ == "__main__":\n    print(greet())\n',
+                'def greet():\n    return "hi"\n',
+                "- test greet",
                 bad_test,
                 bad_test,
             ]

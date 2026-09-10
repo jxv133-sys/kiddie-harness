@@ -32,24 +32,28 @@ goal -> plan (JSON-schema constrained list of files)
        -> on failure, feed the exact error back for a scoped fix (bounded retries)
 ```
 
-**Phase 3:** a dedicated test-writing step, added after each implementation
-file:
-
 ```
-  -> for each implementation file that passed: write a test file for it
-       (its own call, its own prompt -- never combined with implementation)
-       -> verify (compile, then run just that test), fix on failure the same way
-  -> once every implementation file passes (a test that never passes is advisory,
-     not fatal): integration check -- pytest over the passing tests if any, else
-     run the entry file
+  -> once every file passes its own verify: integration check -- run the
+     entry file (falling back to import-checking it if a blind run without
+     args exits non-zero), or pytest if the goal itself asked for a
+     test_*.py file
        -> on failure, find which generated file the error names and fix just that file
           (bounded rounds, and a global iteration budget across the whole run)
 ```
 
-Every step above is still a single, narrow LLM call: the planner never
-writes code, the spec writer never writes code, code generation for one
-file never sees any other file's contents, and the test writer is always
-a separate call from the implementation it's testing.
+The small model is **not** asked to write tests. An earlier version had
+it generate a `test_*.py` for every implementation file; weak models
+produced tests that asserted contracts the code didn't have or shared
+module-global state between test functions, and those failures were
+unfixable — pure noise. A generated project gets tests only when the
+goal (and so the planner) explicitly calls for a `test_*.py` file; that
+file is built like any other, and if the model can't get it green it is
+*advisory* (reported, left out of the integration run) rather than
+fatal.
+
+Every step is still a single, narrow LLM call: the planner never writes
+code, the spec writer never writes code, code generation for one file
+never sees any other file's contents.
 
 **Phase 4 (this commit):** hardening and observability, on top of the
 same loop shape -- no changes to what the model is asked to do:
@@ -118,15 +122,15 @@ orchestrator and prompts are otherwise unchanged in spirit:
   unchanged -- only the decoding randomness). Default `--max-retries` is
   `5`.
 - **Import-time side effects.** An entry script that parses `sys.argv` at
-  module level `sys.exit`s the moment `import_check` (or its companion
-  test) imports it. A new AST `main_guard_check` stage flags a module
-  that defines functions/classes but also runs code at module level,
-  with an instruction the fixer can act on; codegen is asked for a
-  `main()` + `if __name__ == "__main__":` up front.
-- **Tests match the code, not the spec.** The test writer and test fixer
-  see the finished module's actual source, so a test can't assert a
-  contract the implementation didn't implement from an ambiguous spec.
-- **Advisory tests.** A generated test that still won't pass after the
+  module level `sys.exit`s the moment `import_check` imports it. A new
+  AST `main_guard_check` stage flags a module that defines
+  functions/classes but also runs code at module level, with an
+  instruction the fixer can act on; codegen is asked for a `main()` +
+  `if __name__ == "__main__":` up front.
+- **No small-model test-writing.** Removed the step that had the model
+  write a `test_*.py` for every implementation file — a reliable source
+  of unfixable failures. Tests exist only when the goal calls for them.
+- **Advisory tests.** A planner-requested test that still won't pass after the
   full retry budget is reported `[advisory]`, left out of the integration
   run, and does not fail the project -- an unverifiable test means
   "unverified", not "broken code". Only implementation files and the

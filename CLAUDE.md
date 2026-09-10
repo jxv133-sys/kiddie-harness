@@ -34,28 +34,24 @@ core design, not just style.
 ## Repo map
 
 - `harness/orchestrator.py` — the state machine. `SingleFileLoop` (one
-  file, no planning) and `MultiFileLoop` (plan → per-file spec/codegen/
-  test → integration check) both build on a shared `_generate_and_fix`
+  file, no planning) and `MultiFileLoop` (plan → per-file spec/codegen →
+  integration check) both build on a shared `_generate_and_fix`
   bounded-retry loop. Each retry samples a little hotter than the last
   (`_retry_temperature`) — the prompt never changes, only the decoding
   randomness, which is what gives a stuck small model a real chance
   across `max_fix_attempts` tries instead of echoing itself; a verbatim
-  repeat is logged (`fix_noop`) but no longer aborts. `MultiFileLoop`'s
-  test-writing step passes the finished module's on-disk source into both
-  the generate and the fix prompt (`fix_context`), so a test matches what
-  the code does, not an independent reading of the spec. A generated
-  `test_*.py` that never passes is **advisory**: recorded, excluded from
-  the integration pytest run (`run_pytest(ignore=…)`), and not counted
-  against `overall_success` — only non-test files and the integration
-  check gate a run.
+  repeat is logged (`fix_noop`) but no longer aborts. The small model is
+  **not asked to write tests** (see Status). A `test_*.py` the planner
+  itself listed is built like any other file but verified with pytest
+  (`verify_test_file`); if it never passes it is **advisory** — recorded,
+  excluded from the integration pytest run (`run_pytest(ignore=…)`), not
+  counted against `overall_success`.
 - `harness/steps/` — one atomic LLM call per concern: `plan.py`
   (schema-constrained file list, bounded retry, a final schema-free
   attempt parsed by `_parse_free_form`; also flattens to bare filenames,
   drops non-`.py`, dedups), `spec.py` (per-file bullet spec, reasoning
-  stripped), `codegen.py` (generate/fix a file; `fix_file` takes an
-  optional `context` prepended verbatim, used only for test files),
-  `testgen.py` (generate a test file, always a separate call from
-  implementation).
+  stripped), `codegen.py` (`generate_file` / `fix_file` — a file body in,
+  a file body out, nothing else).
 - `harness/steps/verify.py` — deterministic checks only, **no LLM calls
   anywhere in this file**. `compile_check`, `lint_check` (runs `ruff
   check --fix`, so trivial nits get fixed for free instead of costing a
@@ -96,9 +92,22 @@ core design, not just style.
 
 ## Status
 
-Phases 0-4 (single-file loop → multi-file planning → dedicated
-test-writing step → hardening/observability) are complete. Earlier fixes
-from real runs against `qwen2.5-coder:7b`:
+Single-file loop → multi-file planning → hardening/observability are
+complete.
+
+**The small model no longer writes tests.** An earlier phase had
+`MultiFileLoop` generate a `test_*.py` for every implementation file
+(from the module's real source, its own call). In practice a 7B model
+wrote tests that asserted contracts the code didn't have, shared
+module-global state between test functions, or imported names that
+weren't exported — and those failures were structurally unfixable, so
+they landed "advisory" every run: pure noise and an extra LLM call per
+file. Removed (`testgen.py`, `testgen.md`, `verify_test_file`'s
+companion-test role, `_generate_test_for`, the `fix_context` plumbing).
+A generated project gets tests only when the goal/planner asks for a
+`test_*.py` explicitly.
+
+Earlier fixes from real runs against `qwen2.5-coder:7b`:
 
 - Auto-fix trivial lint issues (`ruff check --fix`) instead of burning
   LLM fix attempts on formatting noise.
@@ -129,24 +138,22 @@ models `Ornith-1.5-9B` / `DeepSeek-V4` locally):
   the fix loop rewrites a test file in place, and two versions with the
   same size + near-identical mtime made pytest serve the stale
   assertion-rewrite `.pyc` — phantom pass/fail.
-- The test-writer and test-fixer now get the module's **actual generated
-  source**, not just the spec. A spec bullet like "handle errors
-  gracefully" was being read one way by the impl call and another by the
-  test call, producing a test whose contract the impl never met — and
-  the test's own fix loop (which only sees the test + pytest output)
-  could not reconcile it.
+- (The test-writing step this list refers to was later removed entirely —
+  see the top of Status. The `run_pytest` `__pycache__`/mtime fix above
+  still matters: a planner-listed `test_*.py` is rewritten in place by
+  its fix loop just the same.)
 - New `verify.main_guard_check` (a stage between lint and import): a file
   that defines functions/classes but also runs `sys.argv` parsing or an
   entry call at module level with no `if __name__ == "__main__":` guard
   gets `sys.exit`'d the moment `import_check` imports it. Now flagged with
   an actionable message; `codegen.md` also asks for the guard up front.
 
-Advisory tests (decision: a broken *generated* test must not sink an
-otherwise-working project):
+Advisory tests (decision: a broken test the planner asked for must not
+sink an otherwise-working project):
 
-- A `test_*.py` file that never passes its own verify loop — companion or
-  planner-listed — is marked `advisory` on its `FileRunResult`, logged as
-  `advisory_test`, and rendered `[advisory]` rather than `[FAILED]`.
+- A planner-listed `test_*.py` that never passes pytest is marked
+  `advisory` on its `FileRunResult`, logged as `advisory_test`, and
+  rendered `[advisory]` rather than `[FAILED]`.
 - `MultiFileLoop.run` gates `overall_success` on the non-advisory files
   plus the integration check only. The integration `run_pytest` is given
   `ignore=<advisory paths>` so a failing test is left out; `has_tests`
@@ -159,9 +166,8 @@ otherwise-working project):
 More hardening from continued real runs:
 
 - `plan_files` forces a flat file layout (`posixpath.basename` every
-  entry) — a planned `pkg/core.py` broke both its import-check (wrong
-  cwd) and its companion test (wrong import path). `plan.md` asks for it
-  too.
+  entry) — a planned `pkg/core.py` broke its import-check (wrong cwd) and
+  any sibling importing it by bare name. `plan.md` asks for it too.
 - Both loops log a terminal `run_result` event; a log without one renders
   `INCOMPLETE` (the process was killed) instead of the old "no giving_up
   == success" guess, and `harness inspect` exits non-zero for it.
@@ -193,30 +199,25 @@ slow model that thinks in `<think>` blocks and fights the JSON grammar):
   back to `import_check` — "we can't invoke it, but it and its cross-file
   imports load". A real cross-file break still fails `import_check`.
 
-End-to-end reality check (`qwen2.5-coder:7b`), all SUCCESS:
+End-to-end reality check (`qwen2.5-coder:7b`), all SUCCESS — these
+predate the test-writing removal, so the advisory notes are historical;
+the implementation files and integration checks all passed:
 
 - **1 file** (fib / count): 1 call, 0 fixes.
 - **2 files** (calculator: arithmetic + argv main): correct `arithmetic.py`,
-  guarded `main.py`, integration pytest green; whichever test the 7B model
-  fumbles that run lands advisory.
+  guarded `main.py`, integration green.
 - **3 files** (to-do: Task + store + argv CLI): all three implementation
-  files clean, `test_task.py` passes, `test_store.py` / `test_main.py`
-  advisory, integration green. ~20 LLM calls.
-- Variance is high: a second text-stats run had both companion tests
-  land advisory one time and all four files green the next. Both paths
-  end in `Result: SUCCESS` with a working deliverable.
+  files clean, integration green, ~20 LLM calls (fewer now without the
+  per-file test call).
 
 `deepseek-r1:7b`: the planner's free-form fallback recovers the file
 list; individual codegen calls then blow the 300s timeout and the run
 aborts gracefully. Runnable with `--timeout 900`, just slowly.
 
-The consistent residual is the 7B model's test-writing: it asserts
-contracts the code doesn't have (a string return vs `pytest.raises`),
-shares module-global state across test functions, imports names that
-aren't exported. The harness does the right thing every time — escalating
-retries, then advisory, then a green run on the real deliverable. A
-stronger code model is the lever that turns those advisory tests green;
-nothing in the harness blocks on them.
+**Re-verify a fresh multi-file run against a real model** after this
+change — the removal touched the core `MultiFileLoop` and every
+per-file test in the suite was rewritten. Unit tests pass; that has
+never been sufficient here.
 
 ## The pattern worth repeating
 

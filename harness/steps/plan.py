@@ -125,8 +125,7 @@ def _tasks_from_plan(data: dict) -> list[FileTask]:
        harness only generates and verifies Python;
      - flatten any subdirectory path to a bare filename -- every file
        lives in one flat run directory, and a `pkg/core.py` would break
-       both its import-check (wrong cwd) and its companion test (wrong
-       import path);
+       its import-check (wrong cwd) and any sibling that imports it;
      - keep only the first mention of each name -- a repeat would just
        have the second generation overwrite the first and burn budget.
     """
