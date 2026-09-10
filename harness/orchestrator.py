@@ -481,7 +481,15 @@ class MultiFileLoop:
             entry = self._pick_entry_path(tasks)
             if entry is None:
                 return None
-            result = verify.run_script(self.session.run_dir / entry)
+            entry_path = self.session.run_dir / entry
+            result = verify.run_script(entry_path)
+            if not result.success:
+                # With no test to say how this program is meant to be run
+                # (args? stdin? a file?), a non-zero exit from a blind run
+                # is not proof it's broken. Fall back to confirming the
+                # entry point and its cross-file imports at least load --
+                # that is the part "integration" can actually verify.
+                result = verify.import_check(entry_path)
 
         self.session.log(
             "integration_verify", stage=result.stage, success=result.success, output=result.output

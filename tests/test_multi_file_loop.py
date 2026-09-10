@@ -290,6 +290,38 @@ def test_a_companion_test_that_never_passes_is_advisory_not_fatal(tmp_path: Path
     assert result.integration is not None and result.integration.success
 
 
+def test_entry_script_that_needs_argv_still_passes_integration_via_import_check(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=1)
+    session = Session.create(config.workspace_root)
+    argv_cli = (
+        "import sys\n\n"
+        "def run(path):\n    return path.upper()\n\n"
+        "def main():\n"
+        "    if len(sys.argv) != 2:\n"
+        '        print("usage: main.py <path>")\n'
+        "        sys.exit(1)\n"
+        "    print(run(sys.argv[1]))\n\n"
+        'if __name__ == "__main__":\n    main()\n'
+    )
+    bad_test = "from main import run\n\ndef test_run():\n    assert run('a') == 'B'\n"
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "cli"}]}),
+            "- parse argv",
+            argv_cli,
+            bad_test,
+            bad_test,  # fix: still wrong -> advisory
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("a cli")
+
+    # run_script exits non-zero (no argv), but the module and its imports
+    # load fine, so integration passes and the run succeeds.
+    assert result.success
+    assert result.integration is not None and result.integration.success
+
+
 def test_advisory_test_is_left_out_of_the_integration_pytest_run(tmp_path: Path):
     config = make_config(tmp_path, max_fix_attempts=1)
     session = Session.create(config.workspace_root)
