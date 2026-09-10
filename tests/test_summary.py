@@ -277,6 +277,57 @@ def test_render_table_shows_an_advisory_test_without_failing_the_run():
     assert "1 advisory test" in table
 
 
+def test_load_run_summary_keeps_the_failing_verifier_output(tmp_path: Path):
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "codegen", "path": "main.py", "code": "def broken(:", "truncated": False},
+            {
+                "event": "verify",
+                "path": "main.py",
+                "attempt": 0,
+                "stage": "compile",
+                "success": False,
+                "output": "SyntaxError: invalid syntax",
+            },
+            {"event": "giving_up", "attempts": 0},
+            {"event": "run_result", "success": False},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert summary.files[0].last_error == "SyntaxError: invalid syntax"
+
+
+def test_load_run_summary_keeps_the_integration_error_and_skips(tmp_path: Path):
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "codegen", "path": "core.py", "code": "x=1", "truncated": False},
+            {
+                "event": "verify",
+                "path": "core.py",
+                "attempt": 0,
+                "stage": "import",
+                "success": True,
+                "output": "",
+            },
+            {"event": "skipped", "path": "main.py", "reason": "a dependency did not build"},
+            {"event": "integration_verify", "stage": "pytest", "success": False, "output": "1 failed"},
+            {"event": "giving_up", "attempts": 0},
+            {"event": "run_result", "success": False},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert summary.integration is not None and summary.integration.output == "1 failed"
+    skipped = next(f for f in summary.files if f.path == "main.py")
+    assert skipped.last_error.startswith("skipped:")
+    assert not skipped.success
+
+
 def test_render_table_formats_stopped_early():
     summary = RunSummary(
         run_id="r3",

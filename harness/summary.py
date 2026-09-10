@@ -22,12 +22,16 @@ class FileSummary:
     attempts: int
     truncated: bool
     advisory: bool = False
+    # The last verifier output for this file (the error, when it failed;
+    # or "skipped: ..." when a dependency didn't build).
+    last_error: str = ""
 
 
 @dataclasses.dataclass
 class IntegrationSummary:
     stage: str
     success: bool
+    output: str = ""
 
 
 @dataclasses.dataclass
@@ -70,18 +74,37 @@ def load_run_summary(log_path: Path) -> RunSummary:
             total_llm_calls += 1
 
         if event in ("codegen", "fix"):
-            entry = files.setdefault(record["path"], {"attempts": 0, "truncated": False, "success": False})
+            entry = files.setdefault(
+                record["path"], {"attempts": 0, "truncated": False, "success": False, "last_error": ""}
+            )
             if event == "fix":
                 entry["attempts"] += 1
             if record.get("truncated"):
                 entry["truncated"] = True
         elif event == "verify":
-            entry = files.setdefault(record["path"], {"attempts": 0, "truncated": False, "success": False})
+            entry = files.setdefault(
+                record["path"], {"attempts": 0, "truncated": False, "success": False, "last_error": ""}
+            )
             entry["success"] = record["success"]
+            entry["last_error"] = "" if record["success"] else record.get("output", "")
+        elif event == "skipped":
+            files.setdefault(
+                record["path"],
+                {
+                    "attempts": 0,
+                    "truncated": False,
+                    "success": False,
+                    "last_error": f"skipped: {record.get('reason', 'a dependency did not build')}",
+                },
+            )
         elif event == "advisory_test":
             advisory_paths.add(record["path"])
         elif event == "integration_verify":
-            integration = IntegrationSummary(stage=record["stage"], success=record["success"])
+            integration = IntegrationSummary(
+                stage=record["stage"],
+                success=record["success"],
+                output="" if record["success"] else record.get("output", ""),
+            )
             finished = True
         elif event == "budget_exhausted":
             stopped_early = True
@@ -108,6 +131,7 @@ def load_run_summary(log_path: Path) -> RunSummary:
             attempts=data["attempts"],
             truncated=data["truncated"],
             advisory=path in advisory_paths,
+            last_error=data.get("last_error", ""),
         )
         for path, data in files.items()
     ]

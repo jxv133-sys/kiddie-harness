@@ -343,6 +343,10 @@ _INDEX_HTML = """<!doctype html>
   td { padding:5px 8px; border-top:1px solid var(--line); }
   td.s-ok { color:var(--ok); } td.s-bad { color:var(--bad); } td.s-adv { color:var(--warn); }
   .err { color:var(--bad); font-size:13px; margin-top:10px; }
+  pre.reason { margin:12px 0 0; padding:12px 14px; border:1px solid var(--bad);
+               border-radius:8px; background:color-mix(in srgb, var(--bad) 8%, transparent);
+               color:var(--fg); font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+               white-space:pre-wrap; word-break:break-word; max-height:280px; overflow:auto; }
 </style>
 </head>
 <body>
@@ -449,6 +453,29 @@ function onEvent(d) {
   renderStats(false);
 }
 
+function esc(s) {
+  return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+function whyFailed(s) {
+  if (s.aborted) {
+    return "The endpoint became unreachable mid-run"
+      + (s.abort_reason ? ":\\n" + s.abort_reason : ".");
+  }
+  if (!s.finished) return "The run was killed before it reached a verdict.";
+  if (s.succeeded) return "";
+  if (s.stopped_early) return "Hit the iteration budget before every file was built.";
+  const bad = (s.files || []).find(f => !f.success && !f.advisory);
+  if (bad && bad.last_error) {
+    return bad.path.split("/").pop() + " never passed verification:\\n" + bad.last_error;
+  }
+  if (s.integration && !s.integration.success) {
+    return "Integration check (" + s.integration.stage + ") failed:\\n"
+      + (s.integration.output || "(no output)");
+  }
+  return "One or more files could not be built.";
+}
+
 async function showSummary(runId) {
   const s = await (await fetch("/api/summary/" + runId)).json();
   let verdict = { cls: "ok", text: "SUCCESS" };
@@ -462,13 +489,15 @@ async function showSummary(runId) {
     const cls = f.success ? "s-ok" : (f.advisory ? "s-adv" : "s-bad");
     const tag = f.success ? "ok" : (f.advisory ? "advisory" : "FAILED");
     const name = f.path.split("/").pop();
-    return `<tr><td class="${cls}">${tag}</td><td>${name}</td><td>${f.attempts} fix${f.attempts === 1 ? "" : "es"}</td></tr>`;
+    return `<tr><td class="${cls}">${tag}</td><td>${esc(name)}</td><td>${f.attempts} fix${f.attempts === 1 ? "" : "es"}</td></tr>`;
   }).join("");
   if (s.integration) {
     const ic = s.integration.success ? "s-ok" : "s-bad";
-    rows += `<tr><td class="${ic}">${s.integration.success ? "ok" : "FAILED"}</td><td>integration (${s.integration.stage})</td><td></td></tr>`;
+    rows += `<tr><td class="${ic}">${s.integration.success ? "ok" : "FAILED"}</td><td>integration (${esc(s.integration.stage)})</td><td></td></tr>`;
   }
-  $("#summary").innerHTML = rows ? `<table>${rows}</table>` : "";
+  const why = whyFailed(s);
+  const reason = why ? `<pre class="reason">${esc(why)}</pre>` : "";
+  $("#summary").innerHTML = (rows ? `<table>${rows}</table>` : "") + reason;
 }
 
 $("#go").addEventListener("click", async () => {

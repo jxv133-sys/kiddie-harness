@@ -352,11 +352,14 @@ class MultiFileLoop:
                 task = pending[i]
                 if any(d in hard_failed for d in task.depends_on):
                     pending.pop(i)
-                    self.session.log("skipped", path=task.path, reason="a dependency did not build")
+                    skipped_path = str(self.session.run_dir / _safe_relative_path(task.path))
+                    self.session.log(
+                        "skipped", path=skipped_path, reason="a dependency did not build"
+                    )
                     record(
                         task,
                         FileRunResult(
-                            path=str(self.session.run_dir / _safe_relative_path(task.path)),
+                            path=skipped_path,
                             purpose=task.purpose,
                             success=False,
                             attempts=0,
