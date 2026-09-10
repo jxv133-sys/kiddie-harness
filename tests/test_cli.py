@@ -39,7 +39,8 @@ def test_main_reports_clean_error_when_ollama_unreachable(tmp_path, monkeypatch,
 
 def test_main_reports_clean_error_on_bad_planner_json(tmp_path, monkeypatch, capsys):
     _patch_config(monkeypatch, tmp_path)
-    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: FakeClient(["not json"]))
+    # planner never produces usable JSON, across all its retries
+    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: FakeClient(["not json"] * 5))
 
     exit_code = cli.main(["run", "--multi-file", "--goal", "anything"])
 
