@@ -152,13 +152,39 @@ otherwise-working project):
   `N advisory test(s) never passed` note to stderr and the summary line
   carries the count. `harness inspect` shows the same from the log.
 
-End-to-end reality check (calculator: arithmetic module + argv main
-script, `qwen2.5-coder:7b`): produces a correct `arithmetic.py`, a
-correct guarded `main.py`, a passing `test_arithmetic.py`, and — when the
-7B model can't get `test_main.py` green (it writes tests that call
-`main()` without importing it) — that test lands as advisory and the run
-still succeeds on the working deliverable + integration check. A stronger
-model closes the last gap; the harness no longer blocks on it.
+More hardening from continued real runs:
+
+- `plan_files` forces a flat file layout (`posixpath.basename` every
+  entry) — a planned `pkg/core.py` broke both its import-check (wrong
+  cwd) and its companion test (wrong import path). `plan.md` asks for it
+  too.
+- Both loops log a terminal `run_result` event; a log without one renders
+  `INCOMPLETE` (the process was killed) instead of the old "no giving_up
+  == success" guess, and `harness inspect` exits non-zero for it.
+- A blank / whitespace-only generation is treated as a failure and
+  retried — an empty file compiles and imports fine and was passing as a
+  "success".
+- `codegen.md` asks for no module-level mutable state (a store keeping
+  its list in a module global made every generated test share it). This
+  one is guidance a 7B model often ignores; a stronger model honours it.
+
+End-to-end reality check (`qwen2.5-coder:7b`), all SUCCESS:
+
+- **1 file** (fib / count): 1 call, 0 fixes.
+- **2 files** (calculator: arithmetic + argv main): correct `arithmetic.py`,
+  guarded `main.py`, integration pytest green; whichever test the 7B model
+  fumbles that run lands advisory.
+- **3 files** (to-do: Task + store + argv CLI): all three implementation
+  files clean, `test_task.py` passes, `test_store.py` / `test_main.py`
+  advisory, integration green. ~20 LLM calls.
+
+The consistent residual is the 7B model's test-writing: it asserts
+contracts the code doesn't have (a string return vs `pytest.raises`),
+shares module-global state across test functions, imports names that
+aren't exported. The harness does the right thing every time — escalating
+retries, then advisory, then a green run on the real deliverable. A
+stronger code model is the lever that turns those advisory tests green;
+nothing in the harness blocks on them.
 
 ## The pattern worth repeating
 
