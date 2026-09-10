@@ -48,11 +48,14 @@ core design, not just style.
   the integration pytest run (`run_pytest(ignore=…)`), and not counted
   against `overall_success` — only non-test files and the integration
   check gate a run.
-- `harness/steps/` — one atomic LLM call per concern: `plan.py` (JSON-
-  schema-constrained file list), `spec.py` (per-file bullet spec),
-  `codegen.py` (generate/fix a file; `fix_file` takes an optional
-  `context` prepended verbatim, used only for test files), `testgen.py`
-  (generate a test file, always a separate call from implementation).
+- `harness/steps/` — one atomic LLM call per concern: `plan.py`
+  (schema-constrained file list, bounded retry, a final schema-free
+  attempt parsed by `_parse_free_form`; also flattens to bare filenames,
+  drops non-`.py`, dedups), `spec.py` (per-file bullet spec, reasoning
+  stripped), `codegen.py` (generate/fix a file; `fix_file` takes an
+  optional `context` prepended verbatim, used only for test files),
+  `testgen.py` (generate a test file, always a separate call from
+  implementation).
 - `harness/steps/verify.py` — deterministic checks only, **no LLM calls
   anywhere in this file**. `compile_check`, `lint_check` (runs `ruff
   check --fix`, so trivial nits get fixed for free instead of costing a
@@ -84,7 +87,8 @@ core design, not just style.
   one is reported `INCOMPLETE` (the process was killed) rather than
   guessed at, and `harness inspect` exits non-zero for it.
 - `harness/cli.py` — `harness run [--multi-file] [--quiet] --goal "..."`
-  and `harness inspect --run-id <id>`.
+  (`--model` / `--host` / `--max-retries` / `--timeout` override the
+  config) and `harness inspect --run-id <id>`. An aborted run exits 2.
 - `config/default.yaml` — model, host, temperature (the *base*; retries
   step up from it), token limits/ceiling, retry budgets, timeout.
 - `tests/fakes.py` — shared `FakeClient`/`FakeResponse`/`make_config` test
@@ -168,6 +172,27 @@ More hardening from continued real runs:
   its list in a module global made every generated test share it). This
   one is guidance a 7B model often ignores; a stronger model honours it.
 
+Reasoning-model + resilience pass (found running `deepseek-r1:7b`, a
+slow model that thinks in `<think>` blocks and fights the JSON grammar):
+
+- `plan_files` now retries (3 attempts). Attempts 0..N-2 stay
+  schema-constrained and just escalate temperature + a blunt "an empty
+  list is not acceptable" line; the **last** attempt drops the schema so
+  the model can think first, and `_parse_free_form` reads whatever comes
+  back — JSON, or a numbered/markdown `*.py` list. Before this the
+  planner had no retry at all and a single `{"files": []}` killed the
+  whole run.
+- Both loops catch `OllamaError` around the entire build: the model going
+  unreachable mid-run (a 300s read timeout on one slow call) now logs
+  `run_aborted`, keeps every completed file, and reports
+  `Result: ABORTED …` + exit 2 — not a bare traceback and total loss.
+- `--timeout <seconds>` CLI flag (and `Config.with_overrides`) so a slow
+  reasoning model can be given more headroom without editing the yaml.
+- `_run_integration`: when there are no passing tests and the entry
+  script is run blind, a non-zero exit (a CLI that wanted argv) falls
+  back to `import_check` — "we can't invoke it, but it and its cross-file
+  imports load". A real cross-file break still fails `import_check`.
+
 End-to-end reality check (`qwen2.5-coder:7b`), all SUCCESS:
 
 - **1 file** (fib / count): 1 call, 0 fixes.
@@ -177,6 +202,13 @@ End-to-end reality check (`qwen2.5-coder:7b`), all SUCCESS:
 - **3 files** (to-do: Task + store + argv CLI): all three implementation
   files clean, `test_task.py` passes, `test_store.py` / `test_main.py`
   advisory, integration green. ~20 LLM calls.
+- Variance is high: a second text-stats run had both companion tests
+  land advisory one time and all four files green the next. Both paths
+  end in `Result: SUCCESS` with a working deliverable.
+
+`deepseek-r1:7b`: the planner's free-form fallback recovers the file
+list; individual codegen calls then blow the 300s timeout and the run
+aborts gracefully. Runnable with `--timeout 900`, just slowly.
 
 The consistent residual is the 7B model's test-writing: it asserts
 contracts the code doesn't have (a string return vs `pytest.raises`),
