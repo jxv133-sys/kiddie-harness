@@ -6,10 +6,11 @@ Rules:
 - Do not use markdown code fences.
 - Do not add any explanation, commentary, or text before or after the code.
 - The file must be runnable on its own with `python <file>`.
-- Keep functions, classes, imports and constants at module level, but put
-  every executable statement (argument parsing, calls, prints, the
-  program's actual work) inside an `if __name__ == "__main__":` block, so
-  the file can also be imported without running or exiting.
+- Put the program's work in named functions. If the file is an entry
+  point, give it a `main()` function that does the work and end the file
+  with `if __name__ == "__main__":` then `main()` -- nothing else runs at
+  module level, so the file can be imported (and its functions tested)
+  without running or exiting.
 - Write the whole file from the first line to the last; never omit or
   abbreviate any part of it.
 

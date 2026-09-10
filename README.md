@@ -28,7 +28,7 @@ goal -> generate one Python file -> verify (compile, then run)
 
 ```
 goal -> plan (JSON-schema constrained list of files)
-  -> for each file: write a short spec -> generate -> verify (compile, then lint, then import-check)
+  -> for each file: write a short spec -> generate -> verify (compile, then lint, then main-guard, then import-check)
        -> on failure, feed the exact error back for a scoped fix (bounded retries)
 ```
 
@@ -39,8 +39,9 @@ file:
   -> for each implementation file that passed: write a test file for it
        (its own call, its own prompt -- never combined with implementation)
        -> verify (compile, then run just that test), fix on failure the same way
-  -> once every file (and its test) passes: integration check
-       (run the whole test suite with pytest if any test succeeded, else run the entry file)
+  -> once every implementation file passes (a test that never passes is advisory,
+     not fatal): integration check -- pytest over the passing tests if any, else
+     run the entry file
        -> on failure, find which generated file the error names and fix just that file
           (bounded rounds, and a global iteration budget across the whole run)
 ```
@@ -100,6 +101,44 @@ means this class of bug gets caught, correctly attributed, and fixed
 during the file's own generation instead of wasting retries somewhere
 else.
 
+**Phase 5: what real runs against small models actually needed.** Every
+item here was a real failure observed running the harness end to end
+against a local Ollama model, not something `pytest` caught -- the
+orchestrator and prompts are otherwise unchanged in spirit:
+
+- **Reasoning-model output.** A model that emits a `<think>...</think>`
+  chain-of-thought (or an orphan `</think>` when Ollama consumes the open
+  tag) had that prose written straight to the file. `postprocess` now
+  strips the reasoning block and, if a fenced code block is buried in
+  surrounding prose, extracts it -- deterministically, never inventing
+  code.
+- **Escalating retries.** At the configured low temperature a stuck model
+  returns byte-identical output every retry, so extra attempts explored
+  nothing. Each retry now samples a little hotter (the prompt is
+  unchanged -- only the decoding randomness). Default `--max-retries` is
+  `5`.
+- **Import-time side effects.** An entry script that parses `sys.argv` at
+  module level `sys.exit`s the moment `import_check` (or its companion
+  test) imports it. A new AST `main_guard_check` stage flags a module
+  that defines functions/classes but also runs code at module level,
+  with an instruction the fixer can act on; codegen is asked for a
+  `main()` + `if __name__ == "__main__":` up front.
+- **Tests match the code, not the spec.** The test writer and test fixer
+  see the finished module's actual source, so a test can't assert a
+  contract the implementation didn't implement from an ambiguous spec.
+- **Advisory tests.** A generated test that still won't pass after the
+  full retry budget is reported `[advisory]`, left out of the integration
+  run, and does not fail the project -- an unverifiable test means
+  "unverified", not "broken code". Only implementation files and the
+  integration check gate a run.
+- **pytest cache & collection.** `run_pytest` clears `__pycache__` and
+  sets `PYTHONDONTWRITEBYTECODE` (an in-place test rewrite of the same
+  size was hitting a stale assertion-rewrite `.pyc`); `pyproject.toml`
+  pins `testpaths` so this repo's own `pytest` ignores generated
+  `workspace/` projects.
+- **Planner hygiene.** Non-`.py` entries (a README, a `requirements.txt`)
+  and duplicate paths are dropped from the plan.
+
 Multi-language support is a later phase (see the architecture doc) and
 not implemented yet.
 
@@ -133,7 +172,7 @@ Options:
 
 - `--model` — override the model from `config/default.yaml` (default `deepseek-coder:8b`)
 - `--host` — override the Ollama host (default `http://localhost:11434`)
-- `--max-retries` — override the bounded fix-loop attempt count per file (default `3`)
+- `--max-retries` — override the bounded fix-loop attempt count per file (default `5`; each retry samples a little hotter)
 - `--filename` — output filename, single-file mode only (default `main.py`)
 - `--multi-file` — plan and generate a multi-file project instead of one script
 - `--quiet` — suppress live per-step progress lines; print only the final summary
@@ -163,4 +202,8 @@ Defaults live in `config/default.yaml`: model name, generation temperature
 (kept low — small models drift more at higher temperature and every step
 here needs one predictable output, not creative variety), token limits
 (including `max_tokens_ceiling`, the cap on adaptive growth after a
-truncated response), and retry budgets.
+truncated response), and retry budgets. The temperature is the *base*:
+each fix retry samples a step hotter than the last (see
+`orchestrator._retry_temperature`), so extra attempts are real second
+chances rather than identical calls, while the first attempt at every
+step stays at the low base.
