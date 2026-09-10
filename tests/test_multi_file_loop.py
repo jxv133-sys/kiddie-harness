@@ -260,6 +260,69 @@ def test_test_fix_prompt_includes_the_real_module_source(tmp_path: Path):
     assert "def f():\n    return 1" in test_fix_prompt
 
 
+def test_a_companion_test_that_never_passes_is_advisory_not_fatal(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=3)
+    session = Session.create(config.workspace_root)
+    bad_test = 'from main import greet\n\ndef test_greet():\n    assert greet() == "bye"\n'
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "entry point"}]}),
+            "- expose greet()",  # spec
+            (
+                'def greet():\n    return "hi"\n\n\n'
+                'if __name__ == "__main__":\n    print(greet())\n'
+            ),  # codegen -- runs clean, imports clean
+            bad_test,  # companion test: fails
+            bad_test,  # fix 1: still fails
+            bad_test,  # fix 2
+            bad_test,  # fix 3
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("a greeter")
+
+    assert result.success  # the deliverable works, so the run succeeds
+    test_result = next(f for f in result.files if Path(f.path).name == "test_main.py")
+    assert not test_result.success
+    assert test_result.advisory
+    assert result.integration is not None and result.integration.success
+
+
+def test_advisory_test_is_left_out_of_the_integration_pytest_run(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=1)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "calc.py", "purpose": "adder"}]}),
+            "- expose add()",
+            "def add(a, b):\n    return a + b\n",
+            "from calc import add\n\ndef test_add():\n    assert add(1, 1) == 3\n",  # wrong
+            "from calc import add\n\ndef test_add():\n    assert add(1, 1) == 3\n",  # fix: still wrong
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("an adder")
+
+    # calc.py has no runnable entry and its only test is advisory-failed;
+    # integration has nothing left to fail on, so the run still succeeds.
+    assert result.success
+    assert [Path(f.path).name for f in result.files if f.advisory] == ["test_calc.py"]
+
+
+def test_find_implicated_file_does_not_match_a_name_inside_another_name(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    loop = MultiFileLoop(FakeClient([]), config, session)
+
+    domain = session.run_dir / "domain.py"
+    main = session.run_dir / "main.py"
+    error = f'File "{domain}", line 3, in <module>\n    boom\nNameError: boom'
+
+    implicated = loop._find_implicated_file(error, [main, domain])
+
+    assert implicated == domain
+
+
 def test_integration_fix_writes_corrected_code_to_the_implicated_file(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
@@ -275,3 +338,21 @@ def test_integration_fix_writes_corrected_code_to_the_implicated_file(tmp_path: 
 
     assert test_path.read_text() == "def test_thing():\n    assert True"
     assert result.success
+
+
+def test_integration_fix_rounds_sample_at_a_rising_temperature(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=3)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(["def test_thing():\n    assert False\n"] * 4)
+    loop = MultiFileLoop(client, config, session)
+
+    test_path = session.run_dir / "test_thing.py"
+    test_path.write_text("def test_thing():\n    assert False\n")
+
+    loop._run_integration_with_fixes(
+        [FileTask(path="thing.py", purpose="x")], [test_path], has_tests=True, iterations=1
+    )
+
+    assert len(client.temperature_calls) == 3
+    assert client.temperature_calls == sorted(client.temperature_calls)
+    assert client.temperature_calls[0] > config.temperature

@@ -49,18 +49,23 @@ def test_gives_up_after_max_fix_attempts(tmp_path: Path):
     assert len(client.calls) == 3
 
 
-def test_stops_early_when_a_fix_repeats_the_failing_file_verbatim(tmp_path: Path):
+def test_retries_run_at_a_rising_temperature_when_a_fix_repeats_itself(tmp_path: Path):
     config = make_config(tmp_path, max_fix_attempts=3)
     session = Session.create(config.workspace_root)
     broken = "def broken(:\n"
-    client = FakeClient([broken, broken, broken, broken])
+    client = FakeClient([broken] * 5)
 
     result = SingleFileLoop(client, config, session).run("do something impossible")
 
     assert not result.success
-    # 1 initial generation + 1 fix call that echoed it back -> stop.
-    assert result.attempts == 1
-    assert len(client.calls) == 2
+    # An identical repeat no longer aborts the loop: it uses the whole
+    # fix budget, raising the sampling temperature each attempt so the
+    # model has a real chance to produce something different.
+    assert result.attempts == 3
+    assert len(client.calls) == 4
+    assert client.temperature_calls[0] == config.temperature
+    assert client.temperature_calls == sorted(client.temperature_calls)
+    assert client.temperature_calls[-1] > client.temperature_calls[0]
 
 
 def test_strips_markdown_fence_from_model_output(tmp_path: Path):

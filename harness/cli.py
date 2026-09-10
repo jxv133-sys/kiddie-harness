@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from . import progress, summary
 from .config import Config
@@ -74,14 +75,25 @@ def _run_multi_file(client: OllamaClient, config: Config, session: Session, args
         return 2
 
     print(summary.render_table(summary.load_run_summary(session.log_path)))
-    if (
-        not result.success
-        and not result.stopped_early
-        and result.integration is not None
-        and not result.integration.success
-    ):
-        print("Last integration error:")
-        print(result.integration.output)
+
+    if not result.success and not result.stopped_early:
+        for f in result.files:
+            if not f.success and not f.advisory:
+                print(f"Last error in {Path(f.path).name}:")
+                print(f.last_output)
+        if result.integration is not None and not result.integration.success:
+            print("Last integration error:")
+            print(result.integration.output)
+    elif result.success:
+        advisory = [f for f in result.files if f.advisory]
+        if advisory:
+            names = ", ".join(Path(f.path).name for f in advisory)
+            print(
+                f"Note: {len(advisory)} advisory test(s) never passed and were left out "
+                f"of the integration check: {names}",
+                file=sys.stderr,
+            )
+
     print(f"Full transcript: {session.log_path}")
     return 0 if result.success else 1
 

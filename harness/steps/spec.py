@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..llm_client import OllamaClient
+from ..postprocess import strip_reasoning
 from .plan import FileTask
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -27,4 +28,4 @@ def write_spec(
     """Goal + one file's purpose -> a short bullet-point spec for that file only."""
     prompt = _SPEC_TEMPLATE.format(goal=goal, path=file_task.path, purpose=file_task.purpose)
     response = client.generate(prompt, temperature=temperature, max_tokens=max_tokens)
-    return response.text.strip()
+    return strip_reasoning(response.text)

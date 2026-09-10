@@ -243,8 +243,14 @@ def verify_python_file_static(path: Path) -> VerifyResult:
     return import_check(path)
 
 
-def run_pytest(target: Path, timeout_seconds: int = 60) -> VerifyResult:
+def run_pytest(
+    target: Path, timeout_seconds: int = 60, *, ignore: list[Path] | None = None
+) -> VerifyResult:
     """Run pytest against a directory (full suite) or a single test file.
+
+    `ignore` drops specific test files from the run -- used at the
+    integration step to leave out an advisory test that never passed, so
+    one unverifiable test doesn't sink an otherwise-working project.
 
     The fix loop rewrites a test file in place and re-runs pytest against
     it. Two successive versions of that file can have the same size and an
@@ -258,9 +264,12 @@ def run_pytest(target: Path, timeout_seconds: int = 60) -> VerifyResult:
     """
     _clear_pycache(target)
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    command = [sys.executable, "-m", "pytest", str(target), "-q", "-p", "no:cacheprovider"]
+    for path in ignore or []:
+        command += ["--ignore", str(path)]
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", str(target), "-q", "-p", "no:cacheprovider"],
+            command,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,

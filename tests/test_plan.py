@@ -38,3 +38,48 @@ def test_plan_files_raises_on_empty_file_list():
 
     with pytest.raises(PlanError):
         plan_files(client, "build a todo app", temperature=0.2, max_tokens=512)
+
+
+def test_plan_files_drops_non_python_entries():
+    payload = json.dumps(
+        {
+            "files": [
+                {"path": "requirements.txt", "purpose": "deps"},
+                {"path": "core.py", "purpose": "logic"},
+                {"path": "README.md", "purpose": "docs"},
+            ]
+        }
+    )
+    client = FakeClient([payload])
+
+    tasks = plan_files(client, "x", temperature=0.2, max_tokens=512)
+
+    assert tasks == [FileTask(path="core.py", purpose="logic")]
+
+
+def test_plan_files_raises_when_no_python_files_remain():
+    payload = json.dumps({"files": [{"path": "setup.cfg", "purpose": "config"}]})
+    client = FakeClient([payload])
+
+    with pytest.raises(PlanError):
+        plan_files(client, "x", temperature=0.2, max_tokens=512)
+
+
+def test_plan_files_deduplicates_repeated_paths_keeping_the_first():
+    payload = json.dumps(
+        {
+            "files": [
+                {"path": "main.py", "purpose": "entry point"},
+                {"path": "helper.py", "purpose": "helpers"},
+                {"path": "main.py", "purpose": "entry point again"},
+            ]
+        }
+    )
+    client = FakeClient([payload])
+
+    tasks = plan_files(client, "x", temperature=0.2, max_tokens=512)
+
+    assert tasks == [
+        FileTask(path="main.py", purpose="entry point"),
+        FileTask(path="helper.py", purpose="helpers"),
+    ]

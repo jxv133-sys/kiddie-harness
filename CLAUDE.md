@@ -36,11 +36,18 @@ core design, not just style.
 - `harness/orchestrator.py` — the state machine. `SingleFileLoop` (one
   file, no planning) and `MultiFileLoop` (plan → per-file spec/codegen/
   test → integration check) both build on a shared `_generate_and_fix`
-  bounded-retry loop, which also short-circuits (`fix_noop`) when a fix
-  call returns the exact bytes that just failed. `MultiFileLoop`'s
+  bounded-retry loop. Each retry samples a little hotter than the last
+  (`_retry_temperature`) — the prompt never changes, only the decoding
+  randomness, which is what gives a stuck small model a real chance
+  across `max_fix_attempts` tries instead of echoing itself; a verbatim
+  repeat is logged (`fix_noop`) but no longer aborts. `MultiFileLoop`'s
   test-writing step passes the finished module's on-disk source into both
   the generate and the fix prompt (`fix_context`), so a test matches what
-  the code does, not an independent reading of the spec.
+  the code does, not an independent reading of the spec. A generated
+  `test_*.py` that never passes is **advisory**: recorded, excluded from
+  the integration pytest run (`run_pytest(ignore=…)`), and not counted
+  against `overall_success` — only non-test files and the integration
+  check gate a run.
 - `harness/steps/` — one atomic LLM call per concern: `plan.py` (JSON-
   schema-constrained file list), `spec.py` (per-file bullet spec),
   `codegen.py` (generate/fix a file; `fix_file` takes an optional
@@ -55,7 +62,8 @@ core design, not just style.
   `import_check` (actually resolves a file's imports via `runpy.run_path`,
   without executing `if __name__ == "__main__":` blocks), `run_pytest`
   (clears `__pycache__` + `PYTHONDONTWRITEBYTECODE` so an in-place test
-  rewrite can't hit a stale assertion-rewrite `.pyc`). Composed into
+  rewrite can't hit a stale assertion-rewrite `.pyc`; `ignore=` drops
+  advisory tests from an integration run). Composed into
   `verify_python_file` (single-file loop: compile then run),
   `verify_python_file_static` (multi-file implementation files: compile →
   lint → main-guard → import-check, in that order, stopping at the first
@@ -75,8 +83,8 @@ core design, not just style.
   run is in progress.
 - `harness/cli.py` — `harness run [--multi-file] [--quiet] --goal "..."`
   and `harness inspect --run-id <id>`.
-- `config/default.yaml` — model, host, temperature, token limits/ceiling,
-  retry budgets, timeout.
+- `config/default.yaml` — model, host, temperature (the *base*; retries
+  step up from it), token limits/ceiling, retry budgets, timeout.
 - `tests/fakes.py` — shared `FakeClient`/`FakeResponse`/`make_config` test
   doubles used by every test file. No test needs a live Ollama server.
 
@@ -105,9 +113,12 @@ models `Ornith-1.5-9B` / `DeepSeek-V4` locally):
   blocks and pulls the last fenced block out of surrounding prose. Before
   this, a reasoning model's chain-of-thought was written straight to the
   file and never compiled.
-- `_generate_and_fix` stops early when a fix attempt returns byte-for-byte
-  what already failed verification (`fix_noop` event) instead of spending
-  the whole retry budget on identical calls — weak models echo verbatim.
+- `_generate_and_fix` raises the sampling temperature on each retry
+  (`_retry_temperature`) so a stuck model gets real extra attempts rather
+  than echoing itself; `max_fix_attempts` 3→5, `max_total_iterations`
+  25→40. A verbatim repeat is logged (`fix_noop`) but no longer aborts.
+  The prompt is byte-identical across retries — only the decoding
+  randomness changes.
 - `run_pytest` clears `__pycache__` and sets `PYTHONDONTWRITEBYTECODE`:
   the fix loop rewrites a test file in place, and two versions with the
   same size + near-identical mtime made pytest serve the stale
@@ -124,16 +135,28 @@ models `Ornith-1.5-9B` / `DeepSeek-V4` locally):
   gets `sys.exit`'d the moment `import_check` imports it. Now flagged with
   an actionable message; `codegen.md` also asks for the guard up front.
 
+Advisory tests (decision: a broken *generated* test must not sink an
+otherwise-working project):
+
+- A `test_*.py` file that never passes its own verify loop — companion or
+  planner-listed — is marked `advisory` on its `FileRunResult`, logged as
+  `advisory_test`, and rendered `[advisory]` rather than `[FAILED]`.
+- `MultiFileLoop.run` gates `overall_success` on the non-advisory files
+  plus the integration check only. The integration `run_pytest` is given
+  `ignore=<advisory paths>` so a failing test is left out; `has_tests`
+  counts only *passing* tests, so an all-advisory project falls back to
+  running its entry script.
+- Exit code stays 0 on an otherwise-successful run; the CLI prints a
+  `N advisory test(s) never passed` note to stderr and the summary line
+  carries the count. `harness inspect` shows the same from the log.
+
 End-to-end reality check (calculator: arithmetic module + argv main
-script, `qwen2.5-coder:7b`): the harness reliably produces a correct
-`arithmetic.py`, a correct guarded `main.py`, and a passing
-`test_arithmetic.py`. The remaining failure mode is `test_main.py` — the
-7B model still writes tests that call `main()` without importing it, or
-assert a normal return where the code `sys.exit`s. The errors it gets are
-clear and the loop behaves correctly (bounded retry, clean give-up); this
-is model capability, not a harness defect. Worth retrying with a stronger
-model, and worth deciding whether a broken *generated test* should fail
-the whole run when the implementation itself is sound.
+script, `qwen2.5-coder:7b`): produces a correct `arithmetic.py`, a
+correct guarded `main.py`, a passing `test_arithmetic.py`, and — when the
+7B model can't get `test_main.py` green (it writes tests that call
+`main()` without importing it) — that test lands as advisory and the run
+still succeeds on the working deliverable + integration check. A stronger
+model closes the last gap; the harness no longer blocks on it.
 
 ## The pattern worth repeating
 

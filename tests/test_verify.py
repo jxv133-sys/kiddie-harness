@@ -236,6 +236,15 @@ def test_run_pytest_fails_on_failing_test(tmp_path: Path):
     assert result.stage == "pytest"
 
 
+def test_run_pytest_ignores_the_paths_it_is_told_to(tmp_path: Path):
+    (tmp_path / "test_good.py").write_text("def test_ok():\n    assert True\n")
+    bad = tmp_path / "test_bad.py"
+    bad.write_text("def test_bad():\n    assert False\n")
+
+    assert not run_pytest(tmp_path).success
+    assert run_pytest(tmp_path, ignore=[bad]).success
+
+
 def test_run_pytest_sees_an_in_place_rewrite_of_the_same_size(tmp_path: Path, monkeypatch):
     # The fix loop rewrites a test file and re-runs pytest. If the new
     # version has the same byte length and a near-identical mtime, pytest's

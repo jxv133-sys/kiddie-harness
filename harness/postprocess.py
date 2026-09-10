@@ -1,16 +1,17 @@
-"""Deterministic cleanup of raw LLM code output.
+"""Deterministic cleanup of raw LLM output.
 
-Small models are asked to return *only* source code, but they routinely
-ignore that: they wrap the answer in a markdown fence, add a stray
-sentence before or after it, or -- for reasoning models -- emit a whole
-chain-of-thought before the code. Rather than trusting the prompt to
-prevent that, we strip it in code so a cosmetic slip never counts as a
-failure on its own. If the cleaned result still doesn't compile, that's a
-normal verifier failure and goes through the regular fix loop.
+Small models are asked to return *only* the thing (source code, or a
+bullet spec), but they routinely ignore that: they wrap the answer in a
+markdown fence, add a stray sentence around it, or -- for reasoning
+models -- emit a whole chain-of-thought first. Rather than trusting the
+prompt to prevent that, we strip it in code so a cosmetic slip never
+counts as a failure on its own. If the cleaned result still doesn't
+compile, that's a normal verifier failure and goes through the fix loop.
 
-The one thing we will not do is invent code: every transformation here
-either drops a delimited wrapper (a ``<think>`` block, a markdown fence)
-or picks one already-delimited fenced block out of surrounding prose.
+The one thing we will not do is invent content: every transformation
+here either drops a delimited wrapper (a ``<think>`` block, a markdown
+fence) or picks one already-delimited fenced block out of surrounding
+prose.
 """
 
 from __future__ import annotations
@@ -37,6 +38,17 @@ _ANY_FENCE_RE = re.compile(
 _THINK_RE = re.compile(r"(?is)^.*?</think\s*>")
 
 
+def strip_reasoning(text: str) -> str:
+    """Drop a leading chain-of-thought: a ``<think>...</think>`` pair, or
+    an orphan trailing ``</think>`` when the opening tag was consumed
+    upstream. Returns the remainder, trimmed."""
+    stripped = text.strip()
+    match = _THINK_RE.match(stripped)
+    if match:
+        return stripped[match.end() :].strip()
+    return stripped
+
+
 def strip_code_fences(text: str) -> str:
     """Reduce a raw model response to just the file body it was meant to be.
 
@@ -48,11 +60,7 @@ def strip_code_fences(text: str) -> str:
        (a model that "reconsiders" puts its final answer last).
     4. Otherwise return the trimmed text and let the verifier judge it.
     """
-    stripped = text.strip()
-
-    think_match = _THINK_RE.match(stripped)
-    if think_match:
-        stripped = stripped[think_match.end() :].strip()
+    stripped = strip_reasoning(text)
 
     whole = _WHOLE_FENCE_RE.match(stripped)
     if whole:

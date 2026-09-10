@@ -50,8 +50,13 @@ def test_format_event_fix():
 
 
 def test_format_event_fix_noop():
-    line = format_event("fix_noop", {"path": "main.py", "attempt": 1, "stage": "compile"})
-    assert line == "[fix] main.py -> gave up (fix repeated the failing file verbatim)"
+    line = format_event("fix_noop", {"path": "main.py", "attempt": 2, "stage": "compile"})
+    assert line == "[fix] main.py -> attempt 2 repeated its previous output (raising temperature)"
+
+
+def test_format_event_advisory_test():
+    line = format_event("advisory_test", {"path": "test_main.py", "last_error": "boom"})
+    assert line == "[advisory] test_main.py -> generated test never passed (not blocking the run)"
 
 
 def test_format_event_integration_verify():

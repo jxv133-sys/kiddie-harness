@@ -140,6 +140,64 @@ def test_render_table_formats_failure_with_truncation_note():
     assert "Result: FAILED (5 LLM call(s) total)" in table
 
 
+def test_load_run_summary_marks_an_advisory_test_and_still_succeeds(tmp_path: Path):
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "codegen", "path": "main.py", "code": "x = 1", "truncated": False},
+            {
+                "event": "verify",
+                "path": "main.py",
+                "attempt": 0,
+                "stage": "import",
+                "success": True,
+                "output": "",
+            },
+            {"event": "codegen", "path": "test_main.py", "code": "...", "truncated": False},
+            {
+                "event": "verify",
+                "path": "test_main.py",
+                "attempt": 0,
+                "stage": "pytest",
+                "success": False,
+                "output": "boom",
+            },
+            {"event": "advisory_test", "path": "test_main.py", "last_error": "boom"},
+            {"event": "integration_verify", "stage": "run", "success": True, "output": ""},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert summary.succeeded
+    test_file = next(f for f in summary.files if f.path == "test_main.py")
+    assert test_file.advisory
+    assert not test_file.success
+
+
+def test_render_table_shows_an_advisory_test_without_failing_the_run():
+    summary = RunSummary(
+        run_id="r",
+        files=[
+            FileSummary(path="main.py", success=True, attempts=0, truncated=False),
+            FileSummary(
+                path="test_main.py", success=False, attempts=5, truncated=False, advisory=True
+            ),
+        ],
+        integration=IntegrationSummary(stage="run", success=True),
+        total_llm_calls=9,
+        stopped_early=False,
+        succeeded=True,
+    )
+
+    table = render_table(summary)
+
+    assert "[advisory] test_main.py" in table
+    assert "[FAILED]" not in table
+    assert "Result: SUCCESS" in table
+    assert "1 advisory test" in table
+
+
 def test_render_table_formats_stopped_early():
     summary = RunSummary(
         run_id="r3",

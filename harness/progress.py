@@ -39,7 +39,16 @@ def format_event(event: str, fields: dict) -> str | None:
         return f"[fix] {fields['path']} -> attempt {fields['attempt']}{note}"
 
     if event == "fix_noop":
-        return f"[fix] {fields['path']} -> gave up (fix repeated the failing file verbatim)"
+        return (
+            f"[fix] {fields['path']} -> attempt {fields['attempt']} "
+            f"repeated its previous output (raising temperature)"
+        )
+
+    if event == "advisory_test":
+        return (
+            f"[advisory] {fields['path']} -> generated test never passed "
+            f"(not blocking the run)"
+        )
 
     if event == "integration_verify":
         status = "ok" if fields["success"] else "FAILED"

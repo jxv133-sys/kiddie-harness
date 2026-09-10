@@ -108,6 +108,56 @@ def test_main_run_quiet_suppresses_live_progress(tmp_path, monkeypatch, capsys):
     assert "Result: SUCCESS" in out
 
 
+def test_main_multi_file_prints_the_failing_file_error(tmp_path, monkeypatch, capsys):
+    _patch_config(monkeypatch, tmp_path, max_fix_attempts=1)
+    monkeypatch.setattr(
+        cli,
+        "OllamaClient",
+        lambda *a, **k: FakeClient(
+            [
+                '{"files": [{"path": "bad.py", "purpose": "x"}]}',
+                "- do a thing",
+                "def broken(:\n",
+                "def broken(:\n",
+            ]
+        ),
+    )
+
+    exit_code = cli.main(["run", "--multi-file", "--goal", "x"])
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "bad.py" in out
+    assert "SyntaxError" in out
+
+
+def test_main_multi_file_notes_advisory_tests_on_an_otherwise_successful_run(
+    tmp_path, monkeypatch, capsys
+):
+    _patch_config(monkeypatch, tmp_path, max_fix_attempts=1)
+    bad_test = 'from main import greet\n\ndef test_greet():\n    assert greet() == "bye"\n'
+    monkeypatch.setattr(
+        cli,
+        "OllamaClient",
+        lambda *a, **k: FakeClient(
+            [
+                '{"files": [{"path": "main.py", "purpose": "x"}]}',
+                "- expose greet",
+                'def greet():\n    return "hi"\n\n\nif __name__ == "__main__":\n    print(greet())\n',
+                bad_test,
+                bad_test,
+            ]
+        ),
+    )
+
+    exit_code = cli.main(["run", "--multi-file", "--goal", "x"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Result: SUCCESS" in captured.out
+    assert "advisory" in (captured.out + captured.err).lower()
+
+
 def test_main_multi_file_prints_plan_and_spec_progress(tmp_path, monkeypatch, capsys):
     _patch_config(monkeypatch, tmp_path)
     plan_json = '{"files": [{"path": "main.py", "purpose": "entry point"}]}'

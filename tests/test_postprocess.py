@@ -1,4 +1,16 @@
-from harness.postprocess import strip_code_fences
+from harness.postprocess import strip_code_fences, strip_reasoning
+
+
+def test_strip_reasoning_removes_a_paired_think_block():
+    assert strip_reasoning("<think>\nplan it\n</think>\n- a bullet") == "- a bullet"
+
+
+def test_strip_reasoning_removes_an_orphan_closing_tag():
+    assert strip_reasoning("thinking out loud\n</think>\n- a bullet") == "- a bullet"
+
+
+def test_strip_reasoning_leaves_plain_text_untouched():
+    assert strip_reasoning("  - a bullet\n- another  ") == "- a bullet\n- another"
 
 
 def test_strips_fenced_block_with_language_tag():

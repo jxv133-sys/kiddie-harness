@@ -65,4 +65,24 @@ def plan_files(
     if not isinstance(files, list) or not files:
         raise PlanError(f"Planner returned no files: {data}")
 
-    return [FileTask(path=f["path"], purpose=f["purpose"]) for f in files]
+    # Weak planners slip in a README, a requirements.txt, a setup.cfg --
+    # this harness only generates and verifies Python, so drop anything
+    # else here rather than letting codegen try to write Python into it.
+    # Repeated paths (also common) would just have the second generation
+    # overwrite the first and waste the iteration budget, so keep the
+    # first mention of each.
+    tasks: list[FileTask] = []
+    seen: set[str] = set()
+    for f in files:
+        path = str(f["path"]).strip()
+        if not path.endswith(".py"):
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        tasks.append(FileTask(path=path, purpose=f["purpose"]))
+
+    if not tasks:
+        raise PlanError(f"Planner returned no Python files: {data}")
+
+    return tasks

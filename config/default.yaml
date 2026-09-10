@@ -18,10 +18,13 @@ generation:
   max_tokens_ceiling: 8192
 
 retries:
-  # Bounded retries per single-file fix loop (Phase 1).
-  max_fix_attempts: 3
+  # Bounded retries per file's fix loop. Each retry samples a little
+  # hotter than the last (see orchestrator._retry_temperature), so these
+  # are real extra chances, not identical calls -- a stuck small model
+  # gets several shots at breaking a rut before the loop gives up.
+  max_fix_attempts: 5
   # Bounded total LLM calls across an entire multi-file run (Phase 2+).
-  max_total_iterations: 25
+  max_total_iterations: 40
 
 workspace:
   root: "workspace"

@@ -21,6 +21,7 @@ class FileSummary:
     success: bool
     attempts: int
     truncated: bool
+    advisory: bool = False
 
 
 @dataclasses.dataclass
@@ -42,6 +43,7 @@ class RunSummary:
 def load_run_summary(log_path: Path) -> RunSummary:
     """Reconstruct a RunSummary from a run's log.jsonl."""
     files: dict[str, dict] = {}
+    advisory_paths: set[str] = set()
     integration: IntegrationSummary | None = None
     total_llm_calls = 0
     stopped_early = False
@@ -65,6 +67,8 @@ def load_run_summary(log_path: Path) -> RunSummary:
         elif event == "verify":
             entry = files.setdefault(record["path"], {"attempts": 0, "truncated": False, "success": False})
             entry["success"] = record["success"]
+        elif event == "advisory_test":
+            advisory_paths.add(record["path"])
         elif event == "integration_verify":
             integration = IntegrationSummary(stage=record["stage"], success=record["success"])
         elif event == "budget_exhausted":
@@ -73,7 +77,13 @@ def load_run_summary(log_path: Path) -> RunSummary:
             succeeded = False
 
     file_summaries = [
-        FileSummary(path=path, success=data["success"], attempts=data["attempts"], truncated=data["truncated"])
+        FileSummary(
+            path=path,
+            success=data["success"],
+            attempts=data["attempts"],
+            truncated=data["truncated"],
+            advisory=path in advisory_paths,
+        )
         for path, data in files.items()
     ]
 
@@ -92,8 +102,15 @@ def render_table(summary: RunSummary) -> str:
     lines = [f"Run {summary.run_id}"]
 
     for f in summary.files:
-        status = "ok" if f.success else "FAILED"
+        if f.success:
+            status = "ok"
+        elif f.advisory:
+            status = "advisory"
+        else:
+            status = "FAILED"
         note = " (truncated at least once)" if f.truncated else ""
+        if f.advisory:
+            note += " -- generated test never passed; not blocking the run"
         lines.append(f"  [{status}] {f.path} ({f.attempts} fix attempt(s)){note}")
 
     if summary.integration is not None:
@@ -106,6 +123,13 @@ def render_table(summary: RunSummary) -> str:
         result = "STOPPED: iteration budget exhausted"
     else:
         result = "FAILED"
-    lines.append(f"Result: {result} ({summary.total_llm_calls} LLM call(s) total)")
+
+    advisory_count = sum(1 for f in summary.files if f.advisory)
+    advisory_note = ""
+    if advisory_count:
+        advisory_note = f", {advisory_count} advisory test(s) not passing"
+    lines.append(
+        f"Result: {result} ({summary.total_llm_calls} LLM call(s) total{advisory_note})"
+    )
 
     return "\n".join(lines)

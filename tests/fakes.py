@@ -35,10 +35,12 @@ class FakeClient:
         self._responses = list(responses)
         self.calls: list[str] = []
         self.max_tokens_calls: list[int] = []
+        self.temperature_calls: list[float] = []
 
     def generate(self, prompt: str, *, system=None, json_schema=None, temperature=0.2, max_tokens=2048):
         self.calls.append(prompt)
         self.max_tokens_calls.append(max_tokens)
+        self.temperature_calls.append(temperature)
         if not self._responses:
             raise AssertionError("FakeClient ran out of queued responses")
         item = self._responses.pop(0)
