@@ -15,6 +15,11 @@ Rules:
   level. Hold it in a class the caller instantiates, or pass it in and
   out of functions, so importing the module twice or calling it many
   times starts clean each time.
+- When the task lists other project modules, get everything you need from
+  them with `from <module> import <name>`. Never re-implement what a
+  project module already provides, and never import that behaviour from
+  the standard library instead (use the project's own `mean`, not
+  `statistics.mean`).
 - Write the whole file from the first line to the last; never omit or
   abbreviate any part of it.
 
