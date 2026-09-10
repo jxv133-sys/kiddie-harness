@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -234,19 +235,33 @@ class MultiFileLoop:
 
     Every stage is a fixed, narrow prompt: the planner never writes code,
     the spec writer never writes code, the code generator only ever sees
-    one file's spec at a time. The small model is not asked to write
-    tests -- that was a reliable source of unfixable "advisory" failures
-    for weak models and added an LLM call per file for no gate. Tests
-    exist in a generated project only if the goal (and so the planner)
-    calls for a `test_*.py` file explicitly; such a file is built like
-    any other and, if the model can't get it green, it is advisory
-    rather than fatal.
+    one file's spec (plus the source of its declared dependencies). The
+    small model is not asked to write tests -- that was a reliable source
+    of unfixable "advisory" failures for weak models and added an LLM call
+    per file for no gate. Tests exist in a generated project only if the
+    goal (and so the planner) calls for a `test_*.py` file explicitly;
+    such a file is built like any other and, if the model can't get it
+    green, it is advisory rather than fatal.
+
+    Per-file work is dispatched over one worker per configured endpoint:
+    a file is claimed once every file in its `depends_on` has been built,
+    so with a single endpoint this is the same serial walk as before, and
+    with two it builds independent files concurrently. `plan` and the
+    integration check always run on the primary client.
     """
 
-    def __init__(self, client: OllamaClient, config: Config, session: Session):
+    def __init__(
+        self,
+        client: OllamaClient,
+        config: Config,
+        session: Session,
+        *,
+        pool_clients: list[OllamaClient] | None = None,
+    ):
         self.client = client
         self.config = config
         self.session = session
+        self._pool = list(pool_clients) if pool_clients else [client]
 
     def run(self, goal: str) -> MultiFileRunResult:
         self.session.log("goal", goal=goal)
@@ -256,87 +271,29 @@ class MultiFileLoop:
         )
         self.session.log("plan", files=[dataclasses.asdict(t) for t in tasks])
 
-        iterations = 1  # the planning call itself
-        file_results: list[FileRunResult] = []
-        stopped_early = False
+        file_results, stopped_early, abort_reason, iterations = self._generate_files(goal, tasks)
+
         integration: VerifyResult | None = None
-        abort_reason: str | None = None
-
-        try:
-            for task in tasks:
-                if iterations >= self.config.max_total_iterations:
-                    self.session.log("budget_exhausted", before=task.path, iterations=iterations)
-                    stopped_early = True
-                    break
-
-                spec_text = spec.write_spec(
-                    self.client,
-                    goal,
-                    task,
-                    temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
-                )
-                iterations += 1
-                self.session.log("spec", path=task.path, spec=spec_text)
-
-                file_path = self.session.run_dir / _safe_relative_path(task.path)
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-
-                instruction = (
-                    f"Create the file `{task.path}`.\n"
-                    f"Purpose: {task.purpose}\n\n"
-                    f"Specification:\n{spec_text}"
-                    f"{self._sibling_context(task, file_results)}"
-                )
-                is_test_file = Path(task.path).name.startswith("test_")
-                result, attempts = _generate_and_fix(
-                    self.client,
-                    self.config,
-                    self.session,
-                    file_path,
-                    instruction,
-                    verify.verify_test_file if is_test_file else verify.verify_python_file_static,
-                )
-                iterations += 1 + attempts
-
-                planner_test_advisory = is_test_file and not result.success
-                if planner_test_advisory:
-                    self.session.log("advisory_test", path=str(file_path), last_error=result.output)
-
-                file_results.append(
-                    FileRunResult(
-                        path=str(file_path),
-                        purpose=task.purpose,
-                        success=result.success,
-                        attempts=attempts,
-                        last_output=result.output,
-                        advisory=planner_test_advisory,
-                    )
-                )
-
-            advisory_paths = [Path(f.path) for f in file_results if f.advisory]
-            # A run's success rides on its non-advisory files: the
-            # implementation, and any test that actually passed.
-            required = [f for f in file_results if not f.advisory]
-            all_required_ok = bool(required) and all(f.success for f in required)
-            if all_required_ok and not stopped_early:
-                # A passing test_*.py file (one the planner asked for)
-                # means pytest is the right integration check; otherwise
-                # fall back to running an entry file.
-                has_tests = any(
-                    Path(f.path).name.startswith("test_") and f.success for f in file_results
-                )
-                generated_paths = [Path(f.path) for f in required]
+        advisory_paths = [Path(f.path) for f in file_results if f.advisory]
+        # A run's success rides on its non-advisory files: the
+        # implementation, and any test that actually passed.
+        required = [f for f in file_results if not f.advisory]
+        all_required_ok = bool(required) and all(f.success for f in required)
+        if all_required_ok and not stopped_early and abort_reason is None:
+            # A passing test_*.py file (one the planner asked for) means
+            # pytest is the right integration check; otherwise fall back
+            # to running an entry file.
+            has_tests = any(
+                Path(f.path).name.startswith("test_") and f.success for f in file_results
+            )
+            generated_paths = [Path(f.path) for f in required]
+            try:
                 integration, iterations = self._run_integration_with_fixes(
                     tasks, generated_paths, has_tests, iterations, ignore_paths=advisory_paths
                 )
-        except OllamaError as exc:
-            # The model went unreachable partway through. Keep every file
-            # that finished; report the run as aborted, not failed.
-            abort_reason = str(exc)
+            except OllamaError as exc:
+                abort_reason = str(exc)
 
-        required = [f for f in file_results if not f.advisory]
-        all_required_ok = bool(required) and all(f.success for f in required)
         overall_success = (
             abort_reason is None
             and all_required_ok
@@ -359,6 +316,158 @@ class MultiFileLoop:
             stopped_early=stopped_early,
             aborted=abort_reason is not None,
             abort_reason=abort_reason or "",
+        )
+
+    def _generate_files(
+        self, goal: str, tasks: list[FileTask]
+    ) -> tuple[list[FileRunResult], bool, str | None, int]:
+        """Dispatch every file over the endpoint pool, honouring
+        `depends_on`. Returns the per-file results (in completion order),
+        whether the iteration budget was hit, an abort reason if the pool
+        ran out of working endpoints, and the total LLM-call count."""
+        cv = threading.Condition()
+        pending = list(tasks)
+        results: dict[str, FileRunResult] = {}
+        order: list[str] = []
+        done: set[str] = set()  # bare names a dependent can be satisfied by
+        hard_failed: set[str] = set()  # bare names whose file gave up
+        iterations = [1]  # the planning call
+        stopped_early = [False]
+        last_error: list[str | None] = [None]
+        abort_reason: list[str | None] = [None]
+        active = [len(self._pool)]
+
+        def record(task: FileTask, result: FileRunResult) -> None:
+            results[result.path] = result
+            order.append(result.path)
+            name = Path(task.path).name
+            if result.success or result.advisory:
+                done.add(name)
+            else:
+                hard_failed.add(name)
+
+        def claim() -> FileTask | None:
+            i = 0
+            while i < len(pending):
+                task = pending[i]
+                if any(d in hard_failed for d in task.depends_on):
+                    pending.pop(i)
+                    self.session.log("skipped", path=task.path, reason="a dependency did not build")
+                    record(
+                        task,
+                        FileRunResult(
+                            path=str(self.session.run_dir / _safe_relative_path(task.path)),
+                            purpose=task.purpose,
+                            success=False,
+                            attempts=0,
+                            last_output="skipped: a dependency did not build",
+                            advisory=False,
+                        ),
+                    )
+                    continue
+                if all(d in done for d in task.depends_on):
+                    if iterations[0] >= self.config.max_total_iterations:
+                        self.session.log(
+                            "budget_exhausted", before=task.path, iterations=iterations[0]
+                        )
+                        stopped_early[0] = True
+                        return None
+                    return pending.pop(i)
+                i += 1
+            return None
+
+        def worker(client: OllamaClient) -> None:
+            try:
+                while True:
+                    with cv:
+                        while True:
+                            if abort_reason[0] is not None:
+                                return
+                            task = claim()
+                            if task is not None:
+                                break
+                            if stopped_early[0] or not pending:
+                                return
+                            if active[0] <= 1:
+                                abort_reason[0] = (
+                                    last_error[0]
+                                    or "no endpoint could build the remaining files"
+                                )
+                                cv.notify_all()
+                                return
+                            cv.wait(timeout=0.5)
+                        snapshot = list(results.values())
+                    try:
+                        result, used = self._build_one_file(client, goal, task, snapshot)
+                    except OllamaError as exc:
+                        with cv:
+                            last_error[0] = str(exc)
+                            pending.insert(0, task)  # another endpoint may manage it
+                            cv.notify_all()
+                        return
+                    with cv:
+                        iterations[0] += used
+                        record(task, result)
+                        cv.notify_all()
+            finally:
+                with cv:
+                    active[0] -= 1
+                    cv.notify_all()
+
+        threads = [threading.Thread(target=worker, args=(c,), daemon=True) for c in self._pool]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        if abort_reason[0] is None and pending and not stopped_early[0]:
+            abort_reason[0] = last_error[0] or "the model became unreachable mid-run"
+
+        return [results[p] for p in order], stopped_early[0], abort_reason[0], iterations[0]
+
+    def _build_one_file(
+        self, client: OllamaClient, goal: str, task: FileTask, built_so_far: list[FileRunResult]
+    ) -> tuple[FileRunResult, int]:
+        spec_text = spec.write_spec(
+            client,
+            goal,
+            task,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+        )
+        self.session.log("spec", path=task.path, spec=spec_text)
+
+        file_path = self.session.run_dir / _safe_relative_path(task.path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        instruction = (
+            f"Create the file `{task.path}`.\n"
+            f"Purpose: {task.purpose}\n\n"
+            f"Specification:\n{spec_text}"
+            f"{self._sibling_context(task, built_so_far)}"
+        )
+        is_test_file = Path(task.path).name.startswith("test_")
+        result, attempts = _generate_and_fix(
+            client,
+            self.config,
+            self.session,
+            file_path,
+            instruction,
+            verify.verify_test_file if is_test_file else verify.verify_python_file_static,
+        )
+        advisory = is_test_file and not result.success
+        if advisory:
+            self.session.log("advisory_test", path=str(file_path), last_error=result.output)
+
+        return (
+            FileRunResult(
+                path=str(file_path),
+                purpose=task.purpose,
+                success=result.success,
+                attempts=attempts,
+                last_output=result.output,
+                advisory=advisory,
+            ),
+            2 + attempts,  # spec + codegen + fixes
         )
 
     _SIBLING_CONTEXT_CHAR_CAP = 6000

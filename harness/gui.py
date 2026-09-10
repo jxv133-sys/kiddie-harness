@@ -57,17 +57,26 @@ class RunManager:
     def status(self) -> dict:
         return {"state": self._state, "run_id": self._run_id}
 
-    def start(self, *, goal: str, model: str, host: str, multi_file: bool) -> str:
+    def start(
+        self,
+        *,
+        goal: str,
+        model: str,
+        host: str,
+        multi_file: bool,
+        endpoints: list[dict] | None = None,
+    ) -> str:
         with self._lock:
             if self._state == "running":
                 raise RuntimeError("a run is already in progress")
             config = self._config.with_overrides(model=model, host=host)
+            eps = endpoints or [{"host": host, "model": model}]
             session = Session.create(config.workspace_root)
             self._run_id = session.run_id
             self._state = "running"
             self._thread = threading.Thread(
                 target=self._run,
-                args=(config, session, goal, multi_file),
+                args=(config, session, goal, multi_file, eps),
                 daemon=True,
             )
             self._thread.start()
@@ -80,13 +89,25 @@ class RunManager:
         if self._thread is not None:
             self._thread.join(timeout)
 
-    def _run(self, config: Config, session: Session, goal: str, multi_file: bool) -> None:
+    def _run(
+        self,
+        config: Config,
+        session: Session,
+        goal: str,
+        multi_file: bool,
+        endpoints: list[dict],
+    ) -> None:
         try:
-            client = self._client_factory(
-                config.ollama_host, config.model, config.timeout_seconds
-            )
-            loop_cls = MultiFileLoop if multi_file else SingleFileLoop
-            loop_cls(client, config, session).run(goal)
+            pool = [
+                self._client_factory(
+                    e["host"], e.get("model") or config.model, config.timeout_seconds
+                )
+                for e in endpoints
+            ]
+            if multi_file:
+                MultiFileLoop(pool[0], config, session, pool_clients=pool).run(goal)
+            else:
+                SingleFileLoop(pool[0], config, session).run(goal)
         except Exception as exc:  # noqa: BLE001 -- a GUI run must never crash silently
             try:
                 session.log("run_aborted", reason=f"{type(exc).__name__}: {exc}")
@@ -219,12 +240,16 @@ class _Handler(BaseHTTPRequestHandler):
         if not goal:
             self._send_json({"error": "goal is required"}, status=400)
             return
+        endpoints = body.get("endpoints") or None
+        if isinstance(endpoints, list):
+            endpoints = [e for e in endpoints if isinstance(e, dict) and e.get("host")]
         try:
             run_id = self._runs.start(
                 goal=goal,
                 model=body.get("model") or self._config.model,
                 host=body.get("host") or self._config.ollama_host,
                 multi_file=bool(body.get("multi_file", True)),
+                endpoints=endpoints or None,
             )
         except RuntimeError as exc:
             self._send_json({"error": str(exc)}, status=409)
@@ -280,6 +305,7 @@ _INDEX_HTML = """<!doctype html>
             --accent:#6f9bff; --ok:#57c97f; --bad:#ff6b60; --warn:#e0a24a; }
   }
   * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
   body { margin:0; background:var(--bg); color:var(--fg);
          font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
   main { max-width:640px; margin:0 auto; padding:44px 20px 80px; }
@@ -298,8 +324,8 @@ _INDEX_HTML = """<!doctype html>
   button { margin-top:20px; width:100%; padding:11px; border:0; border-radius:8px;
            background:var(--accent); color:#fff; font:inherit; font-weight:600; cursor:pointer; }
   button:disabled { opacity:.45; cursor:default; }
-  button.link { margin-top:8px; width:auto; padding:2px 0; background:none; color:var(--muted);
-                font-weight:400; font-size:12px; }
+  button.link { display:block; margin-top:8px; width:auto; padding:2px 0; background:none;
+                color:var(--muted); font-weight:400; font-size:12px; text-align:left; }
   button.link:hover:not(:disabled) { color:var(--accent); }
   .stats { display:flex; flex-wrap:wrap; gap:6px 18px; margin:26px 0 10px;
            font-size:13px; color:var(--muted); min-height:20px; }
@@ -330,6 +356,16 @@ _INDEX_HTML = """<!doctype html>
   </div>
   <button type="button" id="refresh" class="link">&#8635; re-fetch models</button>
 
+  <div id="ep2" hidden>
+    <label for="model2">Second endpoint <span style="text-transform:none;letter-spacing:0">(parallel, multi-file only)</span></label>
+    <div class="row">
+      <div><select id="model2"></select></div>
+      <div><input type="text" id="host2" placeholder="http://localhost:11434"></div>
+    </div>
+    <button type="button" id="refresh2" class="link">&#8635; re-fetch models</button>
+  </div>
+  <button type="button" id="add-ep" class="link">+ second endpoint</button>
+
   <label for="goal">Goal</label>
   <textarea id="goal" placeholder="a command-line to-do list with add / list / done subcommands"></textarea>
 
@@ -356,15 +392,23 @@ async function loadConfig() {
   const c = await (await fetch("/api/config")).json();
   $("#host").value = c.host;
   defaultModel = c.model;
-  await loadModels();
-  $("#host").addEventListener("change", loadModels);
-  $("#refresh").addEventListener("click", loadModels);
+  await refreshRow("");
+  $("#host").addEventListener("change", () => refreshRow(""));
+  $("#refresh").addEventListener("click", () => refreshRow(""));
+  $("#host2").addEventListener("change", () => refreshRow("2"));
+  $("#refresh2").addEventListener("click", () => refreshRow("2"));
+  $("#add-ep").addEventListener("click", () => {
+    $("#ep2").hidden = false;
+    $("#add-ep").hidden = true;
+    if (!$("#host2").value) $("#host2").value = c.host;
+    refreshRow("2");
+  });
 }
-async function loadModels() {
-  const host = $("#host").value.trim();
-  const sel = $("#model");
+async function refreshRow(p) {
+  const host = $("#host" + p).value.trim();
+  const sel = $("#model" + p);
   const want = sel.value || defaultModel;
-  const btn = $("#refresh");
+  const btn = $("#refresh" + p);
   sel.disabled = true; btn.disabled = true; btn.textContent = "\\u21bb fetching\\u2026";
   let models = [];
   try {
@@ -437,11 +481,21 @@ $("#go").addEventListener("click", async () => {
   renderStats(false);
   tick = setInterval(() => renderStats(false), 1000);
 
+  const body = {
+    goal, model: $("#model").value, host: $("#host").value.trim(),
+    multi_file: $("#multi").checked,
+  };
+  if (!$("#ep2").hidden && $("#host2").value.trim()) {
+    body.endpoints = [
+      { host: body.host, model: body.model },
+      { host: $("#host2").value.trim(), model: $("#model2").value },
+    ];
+  }
   let res;
   try {
     res = await fetch("/api/run", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ goal, model: $("#model").value, host: $("#host").value.trim(), multi_file: $("#multi").checked }),
+      body: JSON.stringify(body),
     });
   } catch (e) { return fail("could not reach the server"); }
   const data = await res.json();

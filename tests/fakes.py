@@ -7,6 +7,8 @@ Ollama-backed run would use.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 from harness.config import Config
@@ -32,13 +34,27 @@ class FakeClient:
     simulate the model becoming unreachable partway through a run.
     """
 
-    def __init__(self, responses: list[str | tuple[str, str]]):
+    def __init__(
+        self,
+        responses: list[str | tuple[str, str]],
+        *,
+        delay: float = 0.0,
+        first_call_barrier: threading.Barrier | None = None,
+    ):
         self._responses = list(responses)
+        self._delay = delay
+        self._barrier = first_call_barrier
+        self._seen_first = False
         self.calls: list[str] = []
         self.max_tokens_calls: list[int] = []
         self.temperature_calls: list[float] = []
 
     def generate(self, prompt: str, *, system=None, json_schema=None, temperature=0.2, max_tokens=2048):
+        if self._barrier is not None and not self._seen_first:
+            self._seen_first = True
+            self._barrier.wait()
+        if self._delay:
+            time.sleep(self._delay)
         self.calls.append(prompt)
         self.max_tokens_calls.append(max_tokens)
         self.temperature_calls.append(temperature)

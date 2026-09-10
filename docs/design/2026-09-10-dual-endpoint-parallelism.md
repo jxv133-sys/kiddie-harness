@@ -1,6 +1,6 @@
 # Dual-endpoint parallelism ("double the power")
 
-Status: **spec / not implemented**
+Status: **implemented** (2026-09-10) — see the "What shipped" note at the end.
 Date: 2026-09-10
 
 ## Goal
@@ -155,3 +155,34 @@ regardless of interleaving.
   the previous) gets no parallelism — the win scales with how "wide" the
   planner's DAG is. Typical 3-5 file projects have 2-3 independent leaves,
   so ~1.5-2x in practice, not a clean 2x.
+
+## What shipped
+
+All three phases, TDD, no live run yet.
+
+- **`FileTask.depends_on`** — `plan.md` + `PLAN_SCHEMA` ask for it; the
+  planner's list is restricted to *earlier* files (acyclic by
+  construction); a missing list falls back to "every earlier file" (the
+  prior behaviour). `_sibling_context` now feeds a file only its declared
+  dependencies' source.
+- **`Session._lock`** guards each log write + `on_event` callback.
+- **`Config.endpoints` / `Endpoint` / `resolved_endpoints()`** — an
+  optional `endpoints:` list in the yaml; `--endpoint HOST,MODEL`
+  (repeatable) on the CLI; `resolved_endpoints()` returns the list or the
+  single `ollama.host`/`model`.
+- **`MultiFileLoop._generate_files`** — the dispatcher: a
+  `threading.Condition`, one worker thread per client in `pool_clients`
+  (defaults to `[client]` = the old serial walk), `claim()` hands out a
+  file once its `depends_on` are all done, skips a file whose dependency
+  hard-failed, stops seeding at the iteration budget. A worker that hits
+  `OllamaError` requeues its file and retires; the run only aborts when
+  no worker can make progress. `plan` and integration stay on the primary
+  client.
+- **GUI** — `RunManager.start(endpoints=[...])` builds one client per
+  endpoint; a "+ second endpoint" row (host + model + its own re-fetch)
+  posts `endpoints` to `/api/run`.
+
+Tests: two workers provably overlap (a `Barrier`), a dependent waits for
+its dependency and gets its source, a failed dependency skips its
+dependents and fails the run, a dead endpoint doesn't sink a run another
+can finish, single-endpoint is byte-for-byte the old serial path.

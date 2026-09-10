@@ -194,6 +194,27 @@ crashed before finishing), use:
 harness inspect --run-id <run-id>
 ```
 
+## Parallel endpoints
+
+A multi-file run can be split across two (or more) Ollama backends. Each
+planned file declares `depends_on` (the earlier files it imports from);
+one worker per endpoint pulls a file whose dependencies are all built and
+runs its spec → codegen → verify → fix against that endpoint, so
+independent files are generated concurrently.
+
+```bash
+harness run --multi-file --goal "..." \
+  --endpoint http://192.168.50.142:7869,qwen2.5-coder:7b \
+  --endpoint http://localhost:11434,qwen2.5-coder:7b
+```
+
+or set an `endpoints:` list in `config/default.yaml`. With one endpoint
+this is the same serial walk as before. If an endpoint goes unreachable
+mid-run, its file is requeued to the other; the run only aborts when no
+endpoint can finish. `plan` and the integration check always run on the
+first endpoint. The realistic speed-up is ~1.5–2× — a file that depends
+on every earlier one gets no parallelism.
+
 ## GUI
 
 ```bash
@@ -201,12 +222,14 @@ harness gui          # opens a browser at http://127.0.0.1:8765
 ```
 
 A single minimalist page: pick a model (the list is pulled live from the
-Ollama host), point at a host, type a goal, hit **Generate**. The
-progress log streams in as it happens (`[plan]`, `[codegen]`,
-`[verify:*]`, `[fix]`, ...), a small strip tracks files / fix attempts /
-LLM calls / elapsed time, and the final verdict and per-file table drop
-in when the run finishes. One run at a time; stdlib `http.server`, no new
-dependencies, binds to localhost only. `--port` and `--no-browser` are
+Ollama host; **↻ re-fetch models** after you pull one), point at a host,
+type a goal, hit **Generate**. **+ second endpoint** adds a parallel
+backend. The progress log streams in as it happens (`[plan]`,
+`[codegen]`, `[verify:*]`, `[fix]`, ...), a small strip tracks files /
+fix attempts / LLM calls / elapsed time, and the final verdict and
+per-file table drop in when the run finishes. One run at a time; stdlib
+`http.server`, no new dependencies, binds to localhost only. `--port`
+and `--no-browser` are
 available.
 
 ```bash

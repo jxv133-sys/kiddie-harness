@@ -38,7 +38,14 @@ core design, not just style.
 - `harness/orchestrator.py` — the state machine. `SingleFileLoop` (one
   file, no planning) and `MultiFileLoop` (plan → per-file spec/codegen →
   integration check) both build on a shared `_generate_and_fix`
-  bounded-retry loop. Each retry samples a little hotter than the last
+  bounded-retry loop. `MultiFileLoop._generate_files` is a dispatcher:
+  one worker thread per client in `pool_clients` (defaults to the one
+  positional client = the old serial walk), each claims a file once every
+  entry in its `depends_on` is built. `plan` and integration run on the
+  positional client. A worker that hits `OllamaError` requeues its file
+  and retires; the run aborts only when no worker can progress; a file
+  whose dependency hard-failed is `skipped`. Each retry samples a little
+  hotter than the last
   (`_retry_temperature`) — the prompt never changes, only the decoding
   randomness, which is what gives a stuck small model a real chance
   across `max_fix_attempts` tries instead of echoing itself; a verbatim
@@ -76,7 +83,9 @@ core design, not just style.
   an ordinary syntax error.
 - `harness/session.py` — per-run JSONL transcript (`log.jsonl`), plus an
   optional `on_event` callback fired right after each write (used for
-  live progress output; never lets a broken callback break a run).
+  live progress output; never lets a broken callback break a run). A
+  `threading.Lock` makes each write + callback atomic for the parallel
+  dispatcher.
 - `harness/summary.py` / `harness/progress.py` — two views of the same
   event stream: `summary.py` parses a `log.jsonl` into a status table
   (used by `harness inspect` and at the end of every run); `progress.py`
@@ -85,8 +94,9 @@ core design, not just style.
   one is reported `INCOMPLETE` (the process was killed) rather than
   guessed at, and `harness inspect` exits non-zero for it.
 - `harness/cli.py` — `harness run [--multi-file] [--quiet] --goal "..."`
-  (`--model` / `--host` / `--max-retries` / `--timeout` override the
-  config), `harness inspect --run-id <id>`, `harness gui`. An aborted run
+  (`--model` / `--host` / `--max-retries` / `--timeout` / repeatable
+  `--endpoint HOST,MODEL` override the config), `harness inspect --run-id
+  <id>`, `harness gui`. An aborted run
   exits 2.
 - `harness/gui.py` — a stdlib `http.server` GUI (`harness gui`). Pure
   core is testable: `available_models(host)`, `RunManager` (one run at a
@@ -95,14 +105,18 @@ core design, not just style.
   `progress.format_event`). The page is one embedded HTML string. No new
   deps; it reuses `progress` + `summary` and changes nothing elsewhere.
 - `config/default.yaml` — model, host, temperature (the *base*; retries
-  step up from it), token limits/ceiling, retry budgets, timeout.
+  step up from it), token limits/ceiling, retry budgets, timeout, and an
+  optional `endpoints:` list (`Config.Endpoint` / `resolved_endpoints()`)
+  for the parallel dispatcher.
 - `tests/fakes.py` — shared `FakeClient`/`FakeResponse`/`make_config` test
   doubles used by every test file. No test needs a live Ollama server.
 
 ## Status
 
-Single-file loop → multi-file planning → hardening/observability are
-complete.
+Single-file loop → multi-file planning → hardening/observability →
+minimal web GUI → parallel dual-endpoint dispatch are complete. The
+dual-endpoint work is unit-tested but **not yet exercised against two
+live models** — see `docs/design/2026-09-10-dual-endpoint-parallelism.md`.
 
 **The small model no longer writes tests.** An earlier phase had
 `MultiFileLoop` generate a `test_*.py` for every implementation file

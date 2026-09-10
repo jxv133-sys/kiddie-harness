@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import json
+import threading
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +28,11 @@ class Session:
     run_dir: Path
     log_path: Path
     on_event: Callable[[str, dict], None] | None = None
+    # The multi-file loop can drive several endpoints in parallel threads;
+    # one lock keeps each event's file write + on_event callback atomic.
+    _lock: threading.Lock = dataclasses.field(
+        default_factory=threading.Lock, compare=False, repr=False
+    )
 
     @classmethod
     def create(
@@ -47,11 +53,12 @@ class Session:
             "event": event,
             **fields,
         }
-        with self.log_path.open("a") as f:
-            f.write(json.dumps(record) + "\n")
-
-        if self.on_event is not None:
-            try:
-                self.on_event(event, fields)
-            except Exception:  # noqa: S110, BLE001 -- a broken reporter must never take down a run
-                pass
+        line = json.dumps(record) + "\n"
+        with self._lock:
+            with self.log_path.open("a") as f:
+                f.write(line)
+            if self.on_event is not None:
+                try:
+                    self.on_event(event, fields)
+                except Exception:  # noqa: S110, BLE001 -- a broken reporter must never take down a run
+                    pass

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from . import progress, summary
-from .config import Config
+from .config import Config, Endpoint
 from .llm_client import OllamaClient, OllamaError
 from .orchestrator import MultiFileLoop, SingleFileLoop
 from .session import Session
@@ -33,6 +33,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override the per-call Ollama timeout in seconds (raise it for slow reasoning models)",
+    )
+    run.add_argument(
+        "--endpoint",
+        action="append",
+        metavar="HOST,MODEL",
+        help="Extra Ollama backend for parallel multi-file generation (repeatable). "
+        "First --endpoint replaces the default primary; use it twice for two.",
     )
     run.add_argument(
         "--filename",
@@ -78,9 +85,15 @@ def _run_single_file(client: OllamaClient, config: Config, session: Session, arg
     return 0 if result.success else 1
 
 
-def _run_multi_file(client: OllamaClient, config: Config, session: Session, args) -> int:
+def _run_multi_file(
+    client: OllamaClient,
+    config: Config,
+    session: Session,
+    args,
+    pool_clients: list[OllamaClient] | None = None,
+) -> int:
     try:
-        loop = MultiFileLoop(client, config, session)
+        loop = MultiFileLoop(client, config, session, pool_clients=pool_clients)
         result = loop.run(args.goal)
     except (OllamaError, PlanError) as exc:
         print(f"ERROR: {exc}")
@@ -110,6 +123,16 @@ def _run_multi_file(client: OllamaClient, config: Config, session: Session, args
     if result.aborted:
         return 2
     return 0 if result.success else 1
+
+
+def _parse_endpoints(specs: list[str], *, config: Config) -> tuple[Endpoint, ...]:
+    endpoints = []
+    for spec in specs:
+        host, _, model = spec.partition(",")
+        endpoints.append(
+            Endpoint(host.strip(), model.strip() or config.model, config.timeout_seconds)
+        )
+    return tuple(endpoints)
 
 
 def _inspect(args) -> int:
@@ -143,16 +166,23 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             max_fix_attempts=args.max_retries,
             timeout_seconds=args.timeout,
+            endpoints=_parse_endpoints(args.endpoint, config=Config.load()) if args.endpoint else None,
         )
-        client = OllamaClient(config.ollama_host, config.model, config.timeout_seconds)
+        endpoints = config.resolved_endpoints()
+        pool_clients = [OllamaClient(e.host, e.model, e.timeout_seconds) for e in endpoints]
+        client = pool_clients[0]
         reporter = None if args.quiet else progress.console_reporter()
         session = Session.create(config.workspace_root, on_event=reporter)
 
         print(f"Run {session.run_id}: goal = {args.goal!r}", flush=True)
-        print(f"Model: {config.model} @ {config.ollama_host}", flush=True)
+        if len(endpoints) == 1:
+            print(f"Model: {endpoints[0].model} @ {endpoints[0].host}", flush=True)
+        else:
+            joined = ", ".join(f"{e.model}@{e.host}" for e in endpoints)
+            print(f"Endpoints: {joined}", flush=True)
 
         if args.multi_file:
-            return _run_multi_file(client, config, session, args)
+            return _run_multi_file(client, config, session, args, pool_clients=pool_clients)
         return _run_single_file(client, config, session, args)
 
     return 1

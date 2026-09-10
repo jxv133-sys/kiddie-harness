@@ -8,6 +8,16 @@ ollama:
   model: "qwen2.5-coder:7b"
   timeout_seconds: 300
 
+# Extra backends for parallel multi-file generation. When present, the
+# multi-file loop runs one worker per endpoint and builds files whose
+# dependencies are done concurrently. Omit (or leave empty) to use only
+# `ollama.host` above. `model` / `timeout_seconds` default to the values
+# under `ollama`. Also settable per run with repeated --endpoint HOST,MODEL.
+# endpoints:
+#   - host: "http://192.168.50.142:7869"
+#   - host: "http://localhost:11434"
+#     model: "qwen2.5-coder:7b"
+
 generation:
   # Kept low and stable on purpose: small models drift more at higher temperature,
   # and every step here needs a single predictable output, not creative variety.

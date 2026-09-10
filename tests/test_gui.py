@@ -56,6 +56,41 @@ def test_run_manager_runs_a_multi_file_job_to_completion(tmp_path: Path):
     assert summary.load_run_summary(log_path).succeeded
 
 
+def test_run_manager_builds_one_client_per_endpoint(tmp_path: Path):
+    config = make_config(tmp_path)
+    made: list[tuple[str, str]] = []
+
+    def factory(host, model, timeout):
+        made.append((host, model))
+        return FakeClient(
+            [
+                json.dumps(
+                    {
+                        "files": [
+                            {"path": "a.py", "purpose": "leaf", "depends_on": []},
+                            {"path": "b.py", "purpose": "leaf", "depends_on": []},
+                        ]
+                    }
+                ),
+                *(["- s", "def f():\n    return 1\n"] * 2),
+            ]
+        )
+
+    manager = gui.RunManager(config, client_factory=factory)
+    manager.start(
+        goal="x",
+        model="m",
+        host="h",
+        multi_file=True,
+        endpoints=[{"host": "http://a", "model": "m1"}, {"host": "http://b", "model": "m2"}],
+    )
+    manager.wait(timeout=10)
+
+    assert ("http://a", "m1") in made
+    assert ("http://b", "m2") in made
+    assert manager.status()["state"] == "done"
+
+
 def test_run_manager_rejects_a_second_run_while_one_is_active(tmp_path: Path):
     config = make_config(tmp_path)
     # a client that blocks forever on the first call keeps the run "active"

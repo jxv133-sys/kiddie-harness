@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 from harness.llm_client import OllamaError
@@ -7,6 +8,16 @@ from harness.session import Session
 from harness.steps.plan import FileTask
 
 from .fakes import FakeClient, make_config
+
+_LEAF_PAIR_PLAN = json.dumps(
+    {
+        "files": [
+            {"path": "a.py", "purpose": "leaf a", "depends_on": []},
+            {"path": "b.py", "purpose": "leaf b", "depends_on": []},
+        ]
+    }
+)
+_GENERIC = ["- do a thing", "def thing():\n    return 1\n"]
 
 _PLAN_TWO_FILES = json.dumps(
     {
@@ -332,6 +343,93 @@ def test_advisory_test_is_left_out_of_the_integration_pytest_run(tmp_path: Path)
     # on and the run still succeeds.
     assert result.success
     assert [Path(f.path).name for f in result.files if f.advisory] == ["test_calc.py"]
+
+
+def test_two_endpoints_build_independent_files_in_parallel(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    barrier = threading.Barrier(2, timeout=5)
+    x = FakeClient(list(_GENERIC), first_call_barrier=barrier)
+    y = FakeClient(list(_GENERIC), first_call_barrier=barrier)
+
+    result = MultiFileLoop(
+        FakeClient([_LEAF_PAIR_PLAN]), config, session, pool_clients=[x, y]
+    ).run("two leaves")
+
+    assert result.success
+    assert {Path(f.path).name for f in result.files} == {"a.py", "b.py"}
+    # the barrier only releases once BOTH endpoints have started a file
+    assert x.calls and y.calls
+
+
+def test_a_dependent_is_built_after_its_dependency_and_sees_its_source(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps(
+        {
+            "files": [
+                {"path": "core.py", "purpose": "logic", "depends_on": []},
+                {"path": "main.py", "purpose": "entry", "depends_on": ["core.py"]},
+            ]
+        }
+    )
+    x = FakeClient(["- spec", "def helper():\n    return 1\n"] * 2)
+    y = FakeClient(["- spec", "def helper():\n    return 1\n"] * 2)
+
+    result = MultiFileLoop(FakeClient([plan]), config, session, pool_clients=[x, y]).run("c+m")
+
+    assert result.success
+    events = [json.loads(line) for line in session.log_path.read_text().splitlines()]
+    core_ok = next(
+        i
+        for i, e in enumerate(events)
+        if e["event"] == "verify" and e["path"].endswith("core.py") and e["success"]
+    )
+    main_gen = next(
+        i for i, e in enumerate(events) if e["event"] == "codegen" and e["path"].endswith("main.py")
+    )
+    assert core_ok < main_gen
+    main_prompt = next(c for c in (x.calls + y.calls) if "Create the file `main.py`" in c)
+    assert "def helper():" in main_prompt  # core.py's source was in the prompt
+
+
+def test_a_file_whose_dependency_fails_is_skipped_and_the_run_fails(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=1)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps(
+        {
+            "files": [
+                {"path": "core.py", "purpose": "x", "depends_on": []},
+                {"path": "main.py", "purpose": "y", "depends_on": ["core.py"]},
+            ]
+        }
+    )
+    broken = "def broken(:\n"
+    client = FakeClient([plan, "- spec", broken, broken])
+
+    result = MultiFileLoop(client, config, session).run("x")
+
+    assert not result.success
+    assert {Path(f.path).name for f in result.files} == {"core.py", "main.py"}
+    main_res = next(f for f in result.files if Path(f.path).name == "main.py")
+    assert not main_res.success and not main_res.advisory
+    events = [json.loads(line)["event"] for line in session.log_path.read_text().splitlines()]
+    assert "skipped" in events
+
+
+def test_a_dead_endpoint_does_not_sink_a_run_another_endpoint_can_finish(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    good = FakeClient(["- spec", "def thing():\n    return 1\n"] * 2, delay=0.05)
+    dead = FakeClient([OllamaError("endpoint B is down")])
+
+    result = MultiFileLoop(
+        FakeClient([_LEAF_PAIR_PLAN]), config, session, pool_clients=[good, dead]
+    ).run("two leaves")
+
+    assert result.success
+    assert not result.aborted
+    assert {Path(f.path).name for f in result.files} == {"a.py", "b.py"}
 
 
 def test_run_aborts_gracefully_when_the_model_becomes_unreachable(tmp_path: Path):

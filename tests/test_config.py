@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from harness.config import Config
+from harness.cli import _parse_endpoints
+from harness.config import Config, Endpoint
 
 
 def _config(**kw) -> Config:
@@ -42,3 +43,28 @@ def test_config_load_reads_the_default_yaml():
     assert config.model
     assert config.max_fix_attempts >= 1
     assert config.timeout_seconds > 0
+
+
+def test_resolved_endpoints_is_the_single_host_when_none_configured():
+    config = _config(ollama_host="http://h", model="m", timeout_seconds=200)
+
+    assert config.resolved_endpoints() == [Endpoint("http://h", "m", 200)]
+
+
+def test_resolved_endpoints_uses_the_explicit_list_when_present():
+    eps = (Endpoint("http://a", "m1", 100), Endpoint("http://b", "m2", 100))
+    config = _config(endpoints=eps)
+
+    assert config.resolved_endpoints() == list(eps)
+
+
+def test_parse_endpoints_splits_host_and_model_and_defaults_the_model():
+    config = _config(model="fallback", timeout_seconds=300)
+    parsed = _parse_endpoints(
+        ["http://a:11434,qwen2.5-coder:7b", "http://b:11434"], config=config
+    )
+
+    assert parsed == (
+        Endpoint("http://a:11434", "qwen2.5-coder:7b", 300),
+        Endpoint("http://b:11434", "fallback", 300),
+    )

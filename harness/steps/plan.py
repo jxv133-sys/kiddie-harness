@@ -160,16 +160,22 @@ def _tasks_from_plan(data: dict) -> list[FileTask]:
     tasks: list[FileTask] = []
     for i, (name, purpose, raw_deps) in enumerate(entries):
         earlier = names[:i]
-        declared = raw_deps if isinstance(raw_deps, list) else []
-        # Only accept deps that name an *earlier* file: the planner's
-        # contract is "dependencies before dependents", and restricting to
-        # backward edges means the dependency graph can never have a cycle.
-        valid = [
-            posixpath.basename(str(d).strip().replace("\\", "/"))
-            for d in declared
-            if posixpath.basename(str(d).strip().replace("\\", "/")) in earlier
-        ]
-        deps = tuple(dict.fromkeys(valid)) if valid else tuple(earlier)
+        if isinstance(raw_deps, list):
+            # The planner said what this file depends on. Keep only names
+            # of *earlier* files (the planner's contract is "dependencies
+            # first", and restricting to backward edges means the graph
+            # can never contain a cycle). An explicit empty list stays
+            # empty -- a genuine leaf.
+            valid = [
+                posixpath.basename(str(d).strip().replace("\\", "/"))
+                for d in raw_deps
+                if posixpath.basename(str(d).strip().replace("\\", "/")) in earlier
+            ]
+            deps = tuple(dict.fromkeys(valid))
+        else:
+            # No `depends_on` from the planner -- fall back to "every
+            # earlier file", exactly the behaviour before this field.
+            deps = tuple(earlier)
         tasks.append(FileTask(path=name, purpose=purpose, depends_on=deps))
     return tasks
 
