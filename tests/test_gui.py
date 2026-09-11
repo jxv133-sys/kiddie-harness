@@ -382,22 +382,26 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
     run_dir = config.workspace_root / "20260101-000000-abcd1234"
     run_dir.mkdir(parents=True)
     (run_dir / "core.py").write_text("x = 1\n")
-    (run_dir / "log.jsonl").write_text(
-        json.dumps({"event": "verify", "path": str(run_dir / "core.py"), "attempt": 0,
-                    "stage": "compile", "success": True, "output": ""}) + "\n"
-    )
+    records = [
+        {"event": "plan", "files": [{"path": "core.py", "purpose": "x", "depends_on": []}]},
+        {"event": "spec", "path": "core.py", "spec": "- set x to 1"},
+        {"event": "verify", "path": str(run_dir / "core.py"), "attempt": 0,
+         "stage": "compile", "success": True, "output": ""},
+    ]
+    (run_dir / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
 
     server = gui.build_server(config, host="127.0.0.1", port=0)
     port = server.server_address[1]
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     try:
-        files = json.loads(
+        body = json.loads(
             urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/api/files/20260101-000000-abcd1234", timeout=5
             ).read()
-        )["files"]
-        assert files == [{"name": "core.py", "status": "ok", "size": 6}]
+        )
+        assert body["has_plan"] is True
+        assert body["files"] == [{"name": "core.py", "status": "ok", "size": 6, "has_spec": True}]
 
         content = json.loads(
             urllib.request.urlopen(
@@ -406,9 +410,39 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
         )
         assert content["content"] == "x = 1\n"
 
-        # a path that tries to escape the run directory is refused, not served
+        plan = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/plan/20260101-000000-abcd1234", timeout=5
+            ).read()
+        )
+        assert "core.py" in plan["content"]
+
+        spec = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/spec/20260101-000000-abcd1234/core.py", timeout=5
+            ).read()
+        )
+        assert spec["content"] == "- set x to 1"
+
         import urllib.error
 
+        # a single-file run has no plan and no per-file spec
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/plan/no-such-run", timeout=5
+            )
+            raise AssertionError("expected an error response")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/spec/20260101-000000-abcd1234/nope.py", timeout=5
+            )
+            raise AssertionError("expected an error response")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+
+        # a path that tries to escape the run directory is refused, not served
         try:
             urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/api/file/20260101-000000-abcd1234/../../secret",

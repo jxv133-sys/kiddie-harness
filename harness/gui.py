@@ -369,13 +369,27 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({k: getattr(c, k) for k in _SETTINGS_KEYS})
             elif path.startswith("/api/files/"):
                 run_id = path[len("/api/files/") :]
-                self._send_json({"files": self._file_statuses(run_id)})
+                self._send_json(self._files_response(run_id))
             elif path.startswith("/api/file/"):
                 content = self._read_run_file(path[len("/api/file/") :])
                 if content is None:
                     self._send_json({"error": "no such file"}, status=404)
                 else:
                     self._send_json({"content": content})
+            elif path.startswith("/api/plan/"):
+                run_id = path[len("/api/plan/") :]
+                text = self._read_plan_text(run_id)
+                if text is None:
+                    self._send_json({"error": "no plan for this run"}, status=404)
+                else:
+                    self._send_json({"content": text})
+            elif path.startswith("/api/spec/"):
+                run_id, _, filename = path[len("/api/spec/") :].partition("/")
+                text = self._read_spec_text(run_id, filename) if filename else None
+                if text is None:
+                    self._send_json({"error": "no spec for this file"}, status=404)
+                else:
+                    self._send_json({"content": text})
             elif path.startswith("/api/summary/"):
                 run_id = path.rsplit("/", 1)[-1]
                 log_path = self._runs.log_path(run_id)
@@ -461,14 +475,31 @@ class _Handler(BaseHTTPRequestHandler):
 
     _MAX_FILE_VIEW_BYTES = 200_000
 
-    def _file_statuses(self, run_id: str) -> list[dict]:
+    def _iter_log_events(self, run_id: str) -> Iterator[dict]:
+        log_path = self._runs.log_path(run_id)
+        if not log_path.exists():
+            return
+        for line in log_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+    def _files_response(self, run_id: str) -> dict:
         """The `.py` files on disk for a run, each tagged with its latest
         known verify outcome from the log (or "pending" while it hasn't
-        been verified yet, e.g. mid-generation)."""
+        been verified yet, e.g. mid-generation) and whether a spec was
+        written for it -- single-file runs never have one. `has_plan`
+        says whether the run went through the planner at all (multi-file
+        only), so the page knows whether to offer a Plan window."""
         run_dir = self._runs.log_path(run_id).parent
         if not run_dir.is_dir():
-            return []
+            return {"files": [], "has_plan": False}
         status_by_name: dict[str, str] = {}
+        spec_names: set[str] = set()
+        has_plan = False
         log_path = run_dir / "log.jsonl"
         if log_path.exists():
             for f in summary.load_run_summary(log_path).files:
@@ -477,6 +508,11 @@ class _Handler(BaseHTTPRequestHandler):
                     status_by_name[name] = "advisory"
                 else:
                     status_by_name[name] = "ok" if f.success else "failed"
+            for record in self._iter_log_events(run_id):
+                if record.get("event") == "plan":
+                    has_plan = True
+                elif record.get("event") == "spec":
+                    spec_names.add(Path(record.get("path", "")).name)
         files = []
         for p in sorted(run_dir.glob("*.py")):
             files.append(
@@ -484,9 +520,35 @@ class _Handler(BaseHTTPRequestHandler):
                     "name": p.name,
                     "status": status_by_name.get(p.name, "pending"),
                     "size": p.stat().st_size,
+                    "has_spec": p.name in spec_names,
                 }
             )
-        return files
+        return {"files": files, "has_plan": has_plan}
+
+    def _read_plan_text(self, run_id: str) -> str | None:
+        """The most recent `plan` event, rendered as plain text -- None
+        when this run never went through the planner (single-file)."""
+        plan_event = None
+        for record in self._iter_log_events(run_id):
+            if record.get("event") == "plan":
+                plan_event = record
+        if plan_event is None:
+            return None
+        lines = []
+        for f in plan_event.get("files", []):
+            deps = f.get("depends_on") or []
+            dep_note = f"  (depends on: {', '.join(deps)})" if deps else ""
+            lines.append(f"{f.get('path', '?')} -- {f.get('purpose', '')}{dep_note}")
+        return "\n".join(lines) if lines else "(empty plan)"
+
+    def _read_spec_text(self, run_id: str, filename: str) -> str | None:
+        """The most recent `spec` event for `filename` -- None when this
+        file never got one (single-file runs skip spec-writing)."""
+        spec_text = None
+        for record in self._iter_log_events(run_id):
+            if record.get("event") == "spec" and Path(record.get("path", "")).name == filename:
+                spec_text = record.get("spec", "")
+        return spec_text
 
     def _read_run_file(self, rest: str) -> str | None:
         """`rest` is `<run_id>/<filename>`. Confines the read to that
@@ -621,22 +683,32 @@ _INDEX_HTML = """<!doctype html>
   pre#log:empty { display:none; }
   .files-panel { margin-top:14px; }
   .files-panel > label { margin:0 0 6px; }
-  .files-row { display:flex; height:230px; border:1px solid var(--line); border-radius:8px;
-               overflow:hidden; }
-  .file-list { width:180px; flex:0 0 auto; overflow-y:auto; border-right:1px solid var(--line);
+  .file-list { border:1px solid var(--line); border-radius:8px; overflow:hidden;
                background:color-mix(in srgb, var(--fg) 3%, transparent); }
-  .file-list div { padding:6px 10px; font-size:12.5px; cursor:pointer; display:flex;
-                    align-items:center; gap:7px; white-space:nowrap; overflow:hidden;
-                    text-overflow:ellipsis; }
+  .file-list div { padding:8px 12px; font-size:13px; cursor:pointer; display:flex;
+                    align-items:center; gap:8px; border-top:1px solid var(--line); }
+  .file-list div:first-child { border-top:0; }
   .file-list div:hover { background:color-mix(in srgb, var(--fg) 7%, transparent); }
-  .file-list div.active { background:color-mix(in srgb, var(--accent) 16%, transparent); }
+  .file-list div .fname { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .file-list div .fsize { color:var(--muted); font-size:11px; flex:0 0 auto; }
   .file-dot { width:7px; height:7px; border-radius:50%; flex:0 0 auto; background:var(--muted); }
   .file-dot.ok { background:var(--ok); }
   .file-dot.failed { background:var(--bad); }
   .file-dot.advisory { background:var(--warn); }
-  .file-view { flex:1; margin:0; padding:10px 12px; overflow:auto; font-size:12px; line-height:1.5;
-               font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap;
-               word-break:break-word; color:var(--fg); }
+  .file-modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex;
+                align-items:center; justify-content:center; padding:30px; z-index:10; }
+  .file-modal-box { width:100%; max-width:700px; max-height:100%; display:flex;
+                     flex-direction:column; background:var(--bg); border:1px solid var(--line);
+                     border-radius:10px; box-shadow:0 20px 60px rgba(0,0,0,.35); overflow:hidden; }
+  .file-modal-head { display:flex; align-items:center; justify-content:space-between;
+                      padding:10px 14px; border-bottom:1px solid var(--line);
+                      font:600 13px ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .file-modal-head button { margin:0; width:auto; padding:2px 8px; background:none;
+                             color:var(--muted); font-size:18px; line-height:1; }
+  .file-modal-head button:hover { color:var(--bad); }
+  .file-modal-body { margin:0; padding:14px; overflow:auto; font-size:12px; line-height:1.5;
+                      font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap;
+                      word-break:break-word; color:var(--fg); }
   table { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
   td { padding:5px 8px; border-top:1px solid var(--line); }
   td.s-ok { color:var(--ok); } td.s-bad { color:var(--bad); } td.s-adv { color:var(--warn); }
@@ -705,13 +777,20 @@ _INDEX_HTML = """<!doctype html>
   <pre id="log"></pre>
   <div class="files-panel" id="files-panel" hidden>
     <label>Files</label>
-    <div class="files-row">
-      <div class="file-list" id="file-list"></div>
-      <pre class="file-view" id="file-view">select a file</pre>
-    </div>
+    <div class="file-list" id="file-list"></div>
   </div>
   <div id="summary"></div>
 </main>
+
+<div class="file-modal" id="file-modal" hidden>
+  <div class="file-modal-box">
+    <div class="file-modal-head">
+      <span id="file-modal-name"></span>
+      <button type="button" id="file-modal-close">&times;</button>
+    </div>
+    <pre class="file-modal-body" id="file-modal-body"></pre>
+  </div>
+</div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -719,7 +798,7 @@ const logEl = $("#log"), statsEl = $("#stats"), goBtn = $("#go"), errEl = $("#er
 const stopBtn = $("#stop");
 let started = 0, calls = 0, fixes = 0, filesDone = 0, filesTotal = 0, tick = null, es = null;
 let defaultModel = "";
-let currentRunId = null, selectedFile = null;
+let currentRunId = null;
 
 // Every request to the server carries a unique id in the URL (_r=...):
 // the server exposes what's currently in flight at /api/requests, and
@@ -867,37 +946,76 @@ async function pollActive() {
 
 async function refreshFiles(runId) {
   if (!runId) return;
-  let files = [];
+  let files = [], hasPlan = false;
   try {
     const { url } = tagUrl("/api/files/" + runId);
-    ({ files } = await (await fetch(url)).json());
+    ({ files, has_plan: hasPlan } = await (await fetch(url)).json());
   } catch (e) { return; }
   const panel = $("#files-panel"), list = $("#file-list");
-  if (!files.length) { panel.hidden = true; return; }
+  if (!files.length && !hasPlan) { panel.hidden = true; return; }
   panel.hidden = false;
-  list.innerHTML = files.map(f =>
-    `<div data-name="${esc(f.name)}" class="${f.name === selectedFile ? "active" : ""}">`
-    + `<span class="file-dot ${f.status}"></span>${esc(f.name)}</div>`
-  ).join("");
-  list.querySelectorAll("div[data-name]").forEach(el => {
-    el.addEventListener("click", () => selectFile(runId, el.dataset.name));
+
+  let html = hasPlan
+    ? `<div data-kind="plan"><span class="file-dot"></span><span class="fname">Plan</span></div>`
+    : "";
+  html += files.map(f => {
+    const spec = f.has_spec
+      ? `<span class="fspec" data-kind="spec" data-name="${esc(f.name)}">spec</span>`
+      : "";
+    return `<div data-kind="code" data-name="${esc(f.name)}">`
+      + `<span class="file-dot ${f.status}"></span>`
+      + `<span class="fname">${esc(f.name)}</span>${spec}`
+      + `<span class="fsize">${f.size}b</span></div>`;
+  }).join("");
+  list.innerHTML = html;
+
+  list.querySelectorAll("[data-kind='plan'], [data-kind='code']").forEach(el => {
+    el.addEventListener("click", () => openFileWindow(runId, el.dataset.kind, el.dataset.name));
   });
-  const names = files.map(f => f.name);
-  if (selectedFile && names.includes(selectedFile)) selectFile(runId, selectedFile);
-  else selectFile(runId, names[0]);
+  list.querySelectorAll("[data-kind='spec']").forEach(el => {
+    el.addEventListener("click", e => {
+      e.stopPropagation();
+      openFileWindow(runId, "spec", el.dataset.name);
+    });
+  });
+
+  // A window left open while its file is still being rewritten stays
+  // live -- refetch it on the same poll instead of freezing on the
+  // content it had when it was first opened.
+  if (openWindow && (openWindow.kind !== "code" || files.some(f => f.name === openWindow.name))) {
+    openFileWindow(runId, openWindow.kind, openWindow.name);
+  }
 }
 
-async function selectFile(runId, name) {
-  selectedFile = name;
-  $("#file-list").querySelectorAll("div[data-name]").forEach(el => {
-    el.classList.toggle("active", el.dataset.name === name);
-  });
+let openWindow = null; // { kind: "code" | "spec" | "plan", name }
+
+async function openFileWindow(runId, kind, name) {
+  openWindow = { kind, name };
+  const modal = $("#file-modal");
+  modal.hidden = false;
+  $("#file-modal-name").textContent =
+    kind === "plan" ? "Plan" : kind === "spec" ? name + " \\u2014 spec" : name;
+  let url;
+  if (kind === "plan") ({ url } = tagUrl("/api/plan/" + runId));
+  else if (kind === "spec") ({ url } = tagUrl("/api/spec/" + runId + "/" + encodeURIComponent(name)));
+  else ({ url } = tagUrl("/api/file/" + runId + "/" + encodeURIComponent(name)));
   try {
-    const { url } = tagUrl("/api/file/" + runId + "/" + encodeURIComponent(name));
     const data = await (await fetch(url)).json();
-    $("#file-view").textContent = data.error ? "(could not read file)" : data.content;
-  } catch (e) { $("#file-view").textContent = "(could not read file)"; }
+    $("#file-modal-body").textContent = data.error ? "(not available)" : data.content;
+  } catch (e) { $("#file-modal-body").textContent = "(could not reach the server)"; }
 }
+
+function closeFileWindow() {
+  openWindow = null;
+  $("#file-modal").hidden = true;
+}
+$("#file-modal-close").addEventListener("click", closeFileWindow);
+$("#file-modal").addEventListener("click", e => {
+  if (e.target.id === "file-modal") closeFileWindow();
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !$("#file-modal").hidden) closeFileWindow();
+});
 
 function onEvent(d) {
   if (d.line) { logEl.textContent += d.line + "\\n"; logEl.scrollTop = logEl.scrollHeight; }
@@ -966,8 +1084,7 @@ function beginTracking() {
   stopBtn.hidden = false; stopBtn.disabled = false;
   logEl.textContent = ""; $("#summary").innerHTML = "";
   $("#files-panel").hidden = true; $("#file-list").innerHTML = "";
-  $("#file-view").textContent = "select a file";
-  selectedFile = null;
+  closeFileWindow();
   calls = fixes = filesDone = filesTotal = 0; started = Date.now();
   renderStats(false);
   tick = setInterval(() => { renderStats(false); pollActive(); refreshFiles(currentRunId); }, 1000);

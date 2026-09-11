@@ -117,11 +117,17 @@ core design, not just style.
   `max_fix_attempts`/`max_total_iterations`/`timeout_seconds` for runs
   started after the change; saved to `config/gui_settings.json`
   (gitignored -- default.yaml keeps its comments) and merged on top of
-  it at server start. A **Files panel** (`/api/files/<run_id>`,
-  `/api/file/<run_id>/<name>`) lists a run's generated `.py` files with
-  their latest verify status and shows the selected one's source,
-  refreshed on the same poll as progress -- `_read_run_file` confines
-  reads to that run's own directory.
+  it at server start. A **Files panel** lists a run's generated `.py`
+  files with their latest verify status, plus a top `Plan` row (when the
+  run went through the planner) and a `spec` link on files that got one
+  (single-file runs skip both). Clicking any of these opens a small
+  modal window over the page (`#file-modal`) rather than an inline pane
+  -- `/api/files/<run_id>` (list + `has_plan`/`has_spec` flags),
+  `/api/file/<run_id>/<name>` (source), `/api/plan/<run_id>` (the
+  planner's file list rendered as text), `/api/spec/<run_id>/<name>`
+  (that file's spec). A window left open stays live as the run
+  continues -- refreshed on the same poll as progress. `_read_run_file`
+  confines reads to that run's own directory.
 - `config/default.yaml` — model, host, temperature (the *base*; retries
   step up from it), token limits/ceiling, retry budgets, timeout, and an
   optional `endpoints:` list (`Config.Endpoint` / `resolved_endpoints()`)
