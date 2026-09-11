@@ -208,7 +208,10 @@ class RequestTracker:
         with self._lock:
             self._active.pop(req_id, None)
 
-    def active(self) -> list[dict]:
+    def active(self, *, exclude: str = "") -> list[dict]:
+        """Snapshot of in-flight requests. `exclude` leaves out the caller's
+        own id -- otherwise a GET /api/requests always includes itself,
+        since it's still "in flight" until its own handler returns."""
         with self._lock:
             now = time.monotonic()
             return [
@@ -219,6 +222,7 @@ class RequestTracker:
                     "elapsed": round(now - v["started"], 1),
                 }
                 for rid, v in self._active.items()
+                if rid != exclude
             ]
 
 
@@ -292,7 +296,7 @@ class _Handler(BaseHTTPRequestHandler):
                 host = parse_qs(parsed.query).get("host", [self._config.ollama_host])[0]
                 self._send_json({"models": available_models(host)})
             elif path == "/api/requests":
-                self._send_json({"active": self._tracker.active()})
+                self._send_json({"active": self._tracker.active(exclude=req_id)})
             elif path.startswith("/api/summary/"):
                 run_id = path.rsplit("/", 1)[-1]
                 log_path = self._runs.log_path(run_id)
@@ -408,6 +412,11 @@ _INDEX_HTML = """<!doctype html>
   h1 { font-size:19px; font-weight:600; letter-spacing:-.01em; margin:0 0 24px; }
   h1 span { color:var(--muted); font-weight:400; }
   h1 .reqs { font-size:11px; }
+  .reqs-list { margin:2px 0 20px; padding:7px 10px; border:1px solid var(--line);
+               border-radius:8px; background:color-mix(in srgb, var(--fg) 4%, transparent);
+               font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--muted); }
+  .reqs-list div { display:flex; justify-content:space-between; gap:10px; }
+  .reqs-list .t { color:var(--fg); opacity:.7; flex:0 0 auto; }
   label { display:block; font-size:12px; text-transform:uppercase; letter-spacing:.06em;
           color:var(--muted); margin:16px 0 6px; }
   select, input[type=text], textarea {
@@ -449,6 +458,7 @@ _INDEX_HTML = """<!doctype html>
 <body>
 <main>
   <h1>kiddie-harness <span>&mdash; generate a project</span> <span id="reqs" class="reqs"></span></h1>
+  <div id="reqs-list" class="reqs-list" hidden></div>
 
   <label for="model">Model</label>
   <div class="row">
@@ -557,12 +567,31 @@ function renderStats(done, verdict) {
   statsEl.innerHTML = s;
 }
 
+function shortPath(p) {
+  try {
+    const u = new URL(p, location.origin);
+    u.searchParams.delete("_r");
+    return u.pathname + u.search;
+  } catch (e) { return p; }
+}
+
 async function pollActive() {
   try {
     const { url } = tagUrl("/api/requests");
     const { active } = await (await fetch(url)).json();
-    $("#reqs").textContent = active.length
-      ? `\\u00b7 ${active.length} request${active.length === 1 ? "" : "s"} active` : "";
+    const badge = $("#reqs"), list = $("#reqs-list");
+    if (!active.length) {
+      badge.textContent = "";
+      list.hidden = true;
+      list.innerHTML = "";
+      return;
+    }
+    badge.textContent = `\\u00b7 ${active.length} request${active.length === 1 ? "" : "s"} active`;
+    list.hidden = false;
+    list.innerHTML = active
+      .sort((a, b) => b.elapsed - a.elapsed)
+      .map(r => `<div><span>${esc(r.method)} ${esc(shortPath(r.path))}</span><span class="t">${r.elapsed}s</span></div>`)
+      .join("");
   } catch (e) { /* not worth surfacing */ }
 }
 
