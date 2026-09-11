@@ -186,6 +186,42 @@ def stream_events(
         time.sleep(poll_interval)
 
 
+class RequestTracker:
+    """Tracks in-flight HTTP requests by the `_r` id the page puts on
+    every URL, so `/api/requests` (and the page's own small readout) can
+    show what's currently being served -- in particular that a run's SSE
+    stream is still open, not just whether the run itself is done."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: dict[str, dict] = {}
+
+    def start(self, req_id: str, method: str, path: str) -> None:
+        if not req_id:
+            return
+        with self._lock:
+            self._active[req_id] = {"method": method, "path": path, "started": time.monotonic()}
+
+    def finish(self, req_id: str) -> None:
+        if not req_id:
+            return
+        with self._lock:
+            self._active.pop(req_id, None)
+
+    def active(self) -> list[dict]:
+        with self._lock:
+            now = time.monotonic()
+            return [
+                {
+                    "id": rid,
+                    "method": v["method"],
+                    "path": v["path"],
+                    "elapsed": round(now - v["started"], 1),
+                }
+                for rid, v in self._active.items()
+            ]
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "kiddie-harness-gui"
 
@@ -217,67 +253,94 @@ class _Handler(BaseHTTPRequestHandler):
     def _runs(self) -> RunManager:
         return self.server.run_manager  # type: ignore[attr-defined]
 
+    @property
+    def _tracker(self) -> RequestTracker:
+        return self.server.requests  # type: ignore[attr-defined]
+
+    def _request_id(self) -> str:
+        """The `_r` the page tags every URL with, for `/api/requests` and
+        the stale-response guards on the client -- empty for a request
+        that didn't set one (e.g. a plain curl)."""
+        return (parse_qs(urlparse(self.path).query).get("_r") or [""])[0]
+
     # --- routes ----------------------------------------------------------
     def do_GET(self) -> None:
+        req_id = self._request_id()
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path == "/":
-            self._send_text(_INDEX_HTML)
-        elif path == "/api/config":
-            self._send_json(
-                {
-                    "host": self._config.ollama_host,
-                    "model": self._config.model,
-                    "state": self._runs.status(),
-                }
-            )
-        elif path == "/api/models":
-            host = parse_qs(parsed.query).get("host", [self._config.ollama_host])[0]
-            self._send_json({"models": available_models(host)})
-        elif path.startswith("/api/summary/"):
-            run_id = path.rsplit("/", 1)[-1]
-            log_path = self._runs.log_path(run_id)
-            if not log_path.exists():
-                self._send_json({"error": "no such run"}, status=404)
+        if path.startswith("/api/events/"):
+            # Long-lived: stays "active" for the whole SSE stream, not
+            # just this dispatch, so _serve_events finishes it itself.
+            self._tracker.start(req_id, "GET", self.path)
+            self._serve_events(path.rsplit("/", 1)[-1], req_id)
+            return
+
+        self._tracker.start(req_id, "GET", self.path)
+        try:
+            if path == "/":
+                self._send_text(_INDEX_HTML)
+            elif path == "/api/config":
+                self._send_json(
+                    {
+                        "host": self._config.ollama_host,
+                        "model": self._config.model,
+                        "state": self._runs.status(),
+                    }
+                )
+            elif path == "/api/models":
+                host = parse_qs(parsed.query).get("host", [self._config.ollama_host])[0]
+                self._send_json({"models": available_models(host)})
+            elif path == "/api/requests":
+                self._send_json({"active": self._tracker.active()})
+            elif path.startswith("/api/summary/"):
+                run_id = path.rsplit("/", 1)[-1]
+                log_path = self._runs.log_path(run_id)
+                if not log_path.exists():
+                    self._send_json({"error": "no such run"}, status=404)
+                else:
+                    self._send_json(asdict(summary.load_run_summary(log_path)))
             else:
-                self._send_json(asdict(summary.load_run_summary(log_path)))
-        elif path.startswith("/api/events/"):
-            self._serve_events(path.rsplit("/", 1)[-1])
-        else:
-            self._send_json({"error": "not found"}, status=404)
+                self._send_json({"error": "not found"}, status=404)
+        finally:
+            self._tracker.finish(req_id)
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/api/run":
-            self._send_json({"error": "not found"}, status=404)
-            return
-        length = int(self.headers.get("Content-Length", 0))
+        req_id = self._request_id()
+        self._tracker.start(req_id, "POST", self.path)
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            self._send_json({"error": "invalid JSON"}, status=400)
-            return
-        goal = (body.get("goal") or "").strip()
-        if not goal:
-            self._send_json({"error": "goal is required"}, status=400)
-            return
-        endpoints = body.get("endpoints") or None
-        if isinstance(endpoints, list):
-            endpoints = [e for e in endpoints if isinstance(e, dict) and e.get("host")]
-        try:
-            run_id = self._runs.start(
-                goal=goal,
-                model=body.get("model") or self._config.model,
-                host=body.get("host") or self._config.ollama_host,
-                multi_file=bool(body.get("multi_file", True)),
-                endpoints=endpoints or None,
-            )
-        except RuntimeError as exc:
-            self._send_json({"error": str(exc)}, status=409)
-            return
-        self._send_json({"run_id": run_id})
+            if urlparse(self.path).path != "/api/run":
+                self._send_json({"error": "not found"}, status=404)
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON"}, status=400)
+                return
+            goal = (body.get("goal") or "").strip()
+            if not goal:
+                self._send_json({"error": "goal is required"}, status=400)
+                return
+            endpoints = body.get("endpoints") or None
+            if isinstance(endpoints, list):
+                endpoints = [e for e in endpoints if isinstance(e, dict) and e.get("host")]
+            try:
+                run_id = self._runs.start(
+                    goal=goal,
+                    model=body.get("model") or self._config.model,
+                    host=body.get("host") or self._config.ollama_host,
+                    multi_file=bool(body.get("multi_file", True)),
+                    endpoints=endpoints or None,
+                )
+            except RuntimeError as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
+            self._send_json({"run_id": run_id})
+        finally:
+            self._tracker.finish(req_id)
 
-    def _serve_events(self, run_id: str) -> None:
+    def _serve_events(self, run_id: str, req_id: str) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -298,12 +361,15 @@ class _Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ValueError):
             pass
+        finally:
+            self._tracker.finish(req_id)
 
 
 def build_server(config: Config, *, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), _Handler)
     server.config = config  # type: ignore[attr-defined]
     server.run_manager = RunManager(config)  # type: ignore[attr-defined]
+    server.requests = RequestTracker()  # type: ignore[attr-defined]
     return server
 
 
@@ -341,6 +407,7 @@ _INDEX_HTML = """<!doctype html>
   main { max-width:640px; margin:0 auto; padding:44px 20px 80px; }
   h1 { font-size:19px; font-weight:600; letter-spacing:-.01em; margin:0 0 24px; }
   h1 span { color:var(--muted); font-weight:400; }
+  h1 .reqs { font-size:11px; }
   label { display:block; font-size:12px; text-transform:uppercase; letter-spacing:.06em;
           color:var(--muted); margin:16px 0 6px; }
   select, input[type=text], textarea {
@@ -381,7 +448,7 @@ _INDEX_HTML = """<!doctype html>
 </head>
 <body>
 <main>
-  <h1>kiddie-harness <span>&mdash; generate a project</span></h1>
+  <h1>kiddie-harness <span>&mdash; generate a project</span> <span id="reqs" class="reqs"></span></h1>
 
   <label for="model">Model</label>
   <div class="row">
@@ -422,8 +489,20 @@ const logEl = $("#log"), statsEl = $("#stats"), goBtn = $("#go"), errEl = $("#er
 let started = 0, calls = 0, fixes = 0, filesDone = 0, filesTotal = 0, tick = null, es = null;
 let defaultModel = "";
 
+// Every request to the server carries a unique id in the URL (_r=...):
+// the server exposes what's currently in flight at /api/requests, and
+// the page uses the id itself to drop a response that's been superseded
+// by a newer request for the same field (e.g. two quick re-fetch clicks).
+let reqSeq = 0;
+function tagUrl(url) {
+  const id = "r" + (++reqSeq) + "-" + Date.now().toString(36);
+  return { url: url + (url.includes("?") ? "&" : "?") + "_r=" + id, id };
+}
+const rowReq = { "": 0, "2": 0 };
+
 async function loadConfig() {
-  const c = await (await fetch("/api/config")).json();
+  const { url } = tagUrl("/api/config");
+  const c = await (await fetch(url)).json();
   $("#host").value = c.host;
   defaultModel = c.model;
   await refreshRow("");
@@ -437,6 +516,8 @@ async function loadConfig() {
     if (!$("#host2").value) $("#host2").value = c.host;
     refreshRow("2");
   });
+  pollActive();
+  setInterval(pollActive, 3000);
 }
 async function refreshRow(p) {
   const host = $("#host" + p).value.trim();
@@ -444,10 +525,13 @@ async function refreshRow(p) {
   const want = sel.value || defaultModel;
   const btn = $("#refresh" + p);
   sel.disabled = true; btn.disabled = true; btn.textContent = "\\u21bb fetching\\u2026";
+  const { url, id } = tagUrl("/api/models?host=" + encodeURIComponent(host));
+  rowReq[p] = id;
   let models = [];
   try {
-    ({ models } = await (await fetch("/api/models?host=" + encodeURIComponent(host))).json());
+    ({ models } = await (await fetch(url)).json());
   } catch (e) { /* leave empty; UI falls back to the wanted model */ }
+  if (rowReq[p] !== id) return; // a newer re-fetch for this row beat us back
   sel.innerHTML = "";
   const list = models.length ? models : (want ? [want] : []);
   list.forEach(m => {
@@ -471,6 +555,15 @@ function renderStats(done, verdict) {
         + `<span><b>${el}</b></span>`;
   if (done && verdict) s = `<span class="verdict ${verdict.cls}">${verdict.text}</span> ` + s;
   statsEl.innerHTML = s;
+}
+
+async function pollActive() {
+  try {
+    const { url } = tagUrl("/api/requests");
+    const { active } = await (await fetch(url)).json();
+    $("#reqs").textContent = active.length
+      ? `\\u00b7 ${active.length} request${active.length === 1 ? "" : "s"} active` : "";
+  } catch (e) { /* not worth surfacing */ }
 }
 
 function onEvent(d) {
@@ -507,7 +600,8 @@ function whyFailed(s) {
 }
 
 async function showSummary(runId) {
-  const s = await (await fetch("/api/summary/" + runId)).json();
+  const { url: sumUrl } = tagUrl("/api/summary/" + runId);
+  const s = await (await fetch(sumUrl)).json();
   let verdict = { cls: "ok", text: "SUCCESS" };
   if (s.aborted) verdict = { cls: "bad", text: "ABORTED" };
   else if (!s.finished) verdict = { cls: "warn", text: "INCOMPLETE" };
@@ -538,7 +632,7 @@ $("#go").addEventListener("click", async () => {
   logEl.textContent = ""; $("#summary").innerHTML = "";
   calls = fixes = filesDone = filesTotal = 0; started = Date.now();
   renderStats(false);
-  tick = setInterval(() => renderStats(false), 1000);
+  tick = setInterval(() => { renderStats(false); pollActive(); }, 1000);
 
   const body = {
     goal, model: $("#model").value, host: $("#host").value.trim(),
@@ -550,9 +644,10 @@ $("#go").addEventListener("click", async () => {
       { host: $("#host2").value.trim(), model: $("#model2").value },
     ];
   }
+  const { url: runUrl } = tagUrl("/api/run");
   let res;
   try {
-    res = await fetch("/api/run", {
+    res = await fetch(runUrl, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
@@ -566,14 +661,16 @@ $("#go").addEventListener("click", async () => {
     await showSummary(runId);
     goBtn.disabled = false;
   };
-  es = new EventSource("/api/events/" + runId);
+  const { url: evUrl } = tagUrl("/api/events/" + runId);
+  es = new EventSource(evUrl);
   es.onmessage = e => onEvent(JSON.parse(e.data));
   es.addEventListener("done", finish);
   es.onerror = async () => {
     // EventSource reconnects on its own; only wrap up if the run is
     // actually over -- a dropped connection is not a finished run.
     try {
-      const c = await (await fetch("/api/config")).json();
+      const { url } = tagUrl("/api/config");
+      const c = await (await fetch(url)).json();
       if (c.state.run_id === runId && c.state.state === "running") return;
     } catch (e) { return; }
     finish();

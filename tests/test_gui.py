@@ -180,6 +180,75 @@ def test_stream_events_keeps_polling_while_the_run_is_active(tmp_path: Path):
     assert chunks[-1].strip() == "event: done\ndata: {}"
 
 
+def test_request_tracker_reports_and_clears_an_active_request():
+    tracker = gui.RequestTracker()
+
+    tracker.start("r1", "GET", "/api/models?host=h&_r=r1")
+    active = tracker.active()
+    assert len(active) == 1
+    assert active[0]["id"] == "r1"
+    assert active[0]["method"] == "GET"
+    assert active[0]["elapsed"] >= 0
+
+    tracker.finish("r1")
+    assert tracker.active() == []
+
+
+def test_request_tracker_ignores_a_blank_id():
+    tracker = gui.RequestTracker()
+
+    tracker.start("", "GET", "/api/config")
+    tracker.finish("")
+
+    assert tracker.active() == []
+
+
+def test_requests_endpoint_reports_a_request_while_it_is_in_flight(tmp_path: Path, monkeypatch):
+    import threading
+    import urllib.request
+
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    gate = threading.Event()
+    release = threading.Event()
+
+    def slow_get(*a, **k):
+        gate.set()
+        release.wait(timeout=5)
+        raise OSError("simulated: never reaches a real host")
+
+    monkeypatch.setattr(gui.requests, "get", slow_get)
+
+    try:
+        caller = threading.Thread(
+            target=lambda: urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/models?host=h&_r=track-me", timeout=5
+            ).read()
+        )
+        caller.start()
+        assert gate.wait(timeout=5)
+
+        active = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/requests", timeout=5).read()
+        )["active"]
+        assert any(r["id"] == "track-me" for r in active)
+
+        release.set()
+        caller.join(timeout=5)
+
+        active_after = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/requests", timeout=5).read()
+        )["active"]
+        assert not any(r["id"] == "track-me" for r in active_after)
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
 def test_the_index_page_and_config_endpoint_serve(tmp_path: Path):
     import urllib.request
 
