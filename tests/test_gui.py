@@ -113,6 +113,41 @@ def test_run_manager_rejects_a_second_run_while_one_is_active(tmp_path: Path):
     manager.wait(timeout=10)
 
 
+def test_cancel_frees_the_gui_to_start_a_new_run_immediately(tmp_path: Path):
+    config = make_config(tmp_path)
+    import threading
+
+    gate = threading.Event()
+
+    class _Blocking:
+        def generate(self, *a, **k):
+            gate.wait(timeout=5)
+            raise AssertionError("unblocked")
+
+    manager = gui.RunManager(config, client_factory=lambda *a, **k: _Blocking())
+
+    assert manager.cancel() is False  # nothing running yet
+
+    manager.start(goal="x", model="m", host="h", multi_file=True)
+    assert manager.status()["state"] == "running"
+    t1 = manager._thread
+
+    assert manager.cancel() is True
+    assert manager.status()["state"] == "idle"  # unblocked without waiting on t1
+
+    # a second run can start right away -- it is not rejected with
+    # "a run is already in progress" just because t1 hasn't noticed yet.
+    run2 = manager.start(goal="y", model="m", host="h", multi_file=True)
+    t2 = manager._thread
+    assert manager.status()["run_id"] == run2
+
+    gate.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    # t1 finishing late must not clobber run2's own "done" transition.
+    assert manager.status() == {"state": "done", "run_id": run2}
+
+
 def test_run_manager_records_a_crash_as_a_failed_run(tmp_path: Path):
     config = make_config(tmp_path)
 
@@ -244,6 +279,144 @@ def test_requests_endpoint_reports_a_request_while_it_is_in_flight(tmp_path: Pat
             urllib.request.urlopen(f"http://127.0.0.1:{port}/api/requests", timeout=5).read()
         )["active"]
         assert not any(r["id"] == "track-me" for r in active_after)
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def _post_json(url: str, payload: dict):
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=5)
+        return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_settings_endpoint_reads_updates_and_persists_config(tmp_path: Path, monkeypatch):
+    import urllib.request
+
+    monkeypatch.setattr(gui, "_SETTINGS_PATH", tmp_path / "gui_settings.json")
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    import threading
+
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        current = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/settings", timeout=5).read()
+        )
+        assert current["max_fix_attempts"] == config.max_fix_attempts
+
+        status, body = _post_json(
+            f"http://127.0.0.1:{port}/api/settings", {"max_fix_attempts": 9, "temperature": 0.5}
+        )
+        assert status == 200
+        assert body["max_fix_attempts"] == 9
+        assert body["temperature"] == 0.5
+        # applies to the next run started on this server, not just the response
+        assert server.run_manager.config.max_fix_attempts == 9
+        # persisted so a restart picks it back up
+        assert json.loads((tmp_path / "gui_settings.json").read_text())["max_fix_attempts"] == 9
+
+        status, body = _post_json(f"http://127.0.0.1:{port}/api/settings", {"max_fix_attempts": "x"})
+        assert status == 400
+        assert "max_fix_attempts" in body["error"]
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_cancel_endpoint_stops_a_run_and_frees_the_gui(tmp_path: Path):
+    import threading
+
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    gate = threading.Event()
+
+    class _Blocking:
+        def generate(self, *a, **k):
+            gate.wait(timeout=5)
+            raise AssertionError("unblocked")
+
+    server.run_manager._client_factory = lambda *a, **k: _Blocking()
+    try:
+        server.run_manager.start(goal="x", model="m", host="h", multi_file=True)
+        assert server.run_manager.status()["state"] == "running"
+
+        status, body = _post_json(f"http://127.0.0.1:{port}/api/run/cancel", {})
+        assert status == 200
+        assert body == {"cancelled": True}
+        assert server.run_manager.status()["state"] == "idle"
+
+        # nothing running any more -- a second cancel is a no-op, not an error
+        status, body = _post_json(f"http://127.0.0.1:{port}/api/run/cancel", {})
+        assert status == 200
+        assert body == {"cancelled": False}
+
+        gate.set()
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
+    import threading
+    import urllib.request
+
+    config = make_config(tmp_path)
+    run_dir = config.workspace_root / "20260101-000000-abcd1234"
+    run_dir.mkdir(parents=True)
+    (run_dir / "core.py").write_text("x = 1\n")
+    (run_dir / "log.jsonl").write_text(
+        json.dumps({"event": "verify", "path": str(run_dir / "core.py"), "attempt": 0,
+                    "stage": "compile", "success": True, "output": ""}) + "\n"
+    )
+
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        files = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/files/20260101-000000-abcd1234", timeout=5
+            ).read()
+        )["files"]
+        assert files == [{"name": "core.py", "status": "ok", "size": 6}]
+
+        content = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/file/20260101-000000-abcd1234/core.py", timeout=5
+            ).read()
+        )
+        assert content["content"] == "x = 1\n"
+
+        # a path that tries to escape the run directory is refused, not served
+        import urllib.error
+
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/file/20260101-000000-abcd1234/../../secret",
+                timeout=5,
+            )
+            raise AssertionError("expected an error response")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
     finally:
         server.shutdown()
         t.join(timeout=5)

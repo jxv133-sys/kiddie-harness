@@ -78,6 +78,10 @@ class Config:
         max_fix_attempts: int | None = None,
         timeout_seconds: int | None = None,
         endpoints: tuple[Endpoint, ...] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        max_tokens_ceiling: int | None = None,
+        max_total_iterations: int | None = None,
     ) -> Config:
         return dataclasses.replace(
             self,
@@ -86,4 +90,8 @@ class Config:
             max_fix_attempts=max_fix_attempts or self.max_fix_attempts,
             timeout_seconds=timeout_seconds or self.timeout_seconds,
             endpoints=self.endpoints if endpoints is None else endpoints,
+            temperature=self.temperature if temperature is None else temperature,
+            max_tokens=max_tokens or self.max_tokens,
+            max_tokens_ceiling=max_tokens_ceiling or self.max_tokens_ceiling,
+            max_total_iterations=max_total_iterations or self.max_total_iterations,
         )

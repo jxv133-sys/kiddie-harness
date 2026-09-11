@@ -21,6 +21,17 @@ from .steps.plan import FileTask
 from .steps.verify import VerifyResult
 
 
+class RunCancelled(Exception):
+    """Raised when a `cancel_event` is set between two LLM calls.
+
+    Cooperative only: a call already in flight to Ollama still has to
+    return (or time out) before this is noticed -- there is no way to
+    safely kill a thread mid-request. It fires at the next checkpoint
+    (after a verify, before the next fix or integration round), which is
+    also every place a long fix loop actually spends its time stuck.
+    """
+
+
 @dataclasses.dataclass
 class RunResult:
     success: bool
@@ -102,6 +113,8 @@ def _generate_and_fix(
     file_path: Path,
     instruction: str,
     verify_fn: Callable[[Path], VerifyResult],
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[VerifyResult, int]:
     """Shared bounded-retry loop: generate once, verify, fix on failure.
 
@@ -150,6 +163,9 @@ def _generate_and_fix(
         if result.success or attempts >= config.max_fix_attempts:
             return result, attempts
 
+        if cancel_event is not None and cancel_event.is_set():
+            raise RunCancelled("cancelled by user")
+
         if result.stage == "lint":
             # ruff's --fix may have just rewritten the file in place; make
             # sure the fix prompt sees the current file, not stale
@@ -192,10 +208,18 @@ class SingleFileLoop:
     with a small local model before multi-file planning is layered on top.
     """
 
-    def __init__(self, client: OllamaClient, config: Config, session: Session):
+    def __init__(
+        self,
+        client: OllamaClient,
+        config: Config,
+        session: Session,
+        *,
+        cancel_event: threading.Event | None = None,
+    ):
         self.client = client
         self.config = config
         self.session = session
+        self._cancel = cancel_event
 
     def run(self, goal: str, filename: str = "main.py") -> RunResult:
         self.session.log("goal", goal=goal)
@@ -203,18 +227,25 @@ class SingleFileLoop:
 
         try:
             result, attempts = _generate_and_fix(
-                self.client, self.config, self.session, file_path, goal, verify.verify_python_file
+                self.client,
+                self.config,
+                self.session,
+                file_path,
+                goal,
+                verify.verify_python_file,
+                cancel_event=self._cancel,
             )
-        except OllamaError as exc:
-            self.session.log("run_aborted", reason=str(exc))
+        except (OllamaError, RunCancelled) as exc:
+            reason = "cancelled by user" if isinstance(exc, RunCancelled) else str(exc)
+            self.session.log("run_aborted", reason=reason)
             self.session.log("run_result", success=False)
             return RunResult(
                 success=False,
                 file_path=str(file_path),
                 attempts=0,
-                last_output=str(exc),
+                last_output=reason,
                 aborted=True,
-                abort_reason=str(exc),
+                abort_reason=reason,
             )
 
         if not result.success:
@@ -257,11 +288,13 @@ class MultiFileLoop:
         session: Session,
         *,
         pool_clients: list[OllamaClient] | None = None,
+        cancel_event: threading.Event | None = None,
     ):
         self.client = client
         self.config = config
         self.session = session
         self._pool = list(pool_clients) if pool_clients else [client]
+        self._cancel = cancel_event
 
     def run(self, goal: str) -> MultiFileRunResult:
         self.session.log("goal", goal=goal)
@@ -300,6 +333,12 @@ class MultiFileLoop:
             and not stopped_early
             and (integration is None or integration.success)
         )
+
+        if not overall_success and abort_reason is None and self._cancel is not None and self._cancel.is_set():
+            # The run didn't already succeed before the cancellation was
+            # noticed -- attribute the (non-)result to the user's Stop,
+            # not a generic "gave up".
+            abort_reason = "cancelled by user"
 
         if abort_reason is not None:
             self.session.log("run_aborted", reason=abort_reason)
@@ -386,6 +425,10 @@ class MultiFileLoop:
                         while True:
                             if abort_reason[0] is not None:
                                 return
+                            if self._cancel is not None and self._cancel.is_set():
+                                abort_reason[0] = "cancelled by user"
+                                cv.notify_all()
+                                return
                             task = claim()
                             if task is not None:
                                 break
@@ -406,6 +449,11 @@ class MultiFileLoop:
                         with cv:
                             last_error[0] = str(exc)
                             pending.insert(0, task)  # another endpoint may manage it
+                            cv.notify_all()
+                        return
+                    except RunCancelled:
+                        with cv:
+                            abort_reason[0] = abort_reason[0] or "cancelled by user"
                             cv.notify_all()
                         return
                     with cv:
@@ -456,6 +504,7 @@ class MultiFileLoop:
             file_path,
             instruction,
             verify.verify_test_file if is_test_file else verify.verify_python_file_static,
+            cancel_event=self._cancel,
         )
         advisory = is_test_file and not result.success
         if advisory:
@@ -520,6 +569,7 @@ class MultiFileLoop:
             not result.success
             and rounds < max_rounds
             and iterations < self.config.max_total_iterations
+            and not (self._cancel is not None and self._cancel.is_set())
         ):
             target = self._find_implicated_file(result.output, generated_paths)
             if target is None:

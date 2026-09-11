@@ -15,5 +15,12 @@ Rules:
 - List files that other files depend on before the files that depend on them.
 - For each file give `depends_on`: the filenames earlier in the list that
   it imports from (an empty list if it imports from none of them).
+- `depends_on` means "this file has an `import` statement pulling from
+  that file" -- nothing else. Do not add a file just because it feels
+  like the natural build order, or because the two are related in
+  purpose. Two files that don't import each other get an empty (or
+  smaller) `depends_on` even when one is listed after the other --
+  independent files can be built at the same time, so an accurate,
+  sparse dependency list matters as much as a correct one.
 
 Goal: {goal}

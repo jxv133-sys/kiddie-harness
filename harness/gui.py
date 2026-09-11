@@ -25,10 +25,37 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from . import progress, summary
-from .config import Config
+from .config import DEFAULT_CONFIG_PATH, Config
 from .llm_client import OllamaClient
 from .orchestrator import MultiFileLoop, SingleFileLoop
 from .session import Session
+
+# Config fields the settings screen can change. Persisted alongside the
+# repo's own config/default.yaml (never rewriting that file -- it keeps
+# its comments) so they survive a `harness gui` restart.
+_SETTINGS_KEYS = (
+    "temperature",
+    "max_tokens",
+    "max_tokens_ceiling",
+    "max_fix_attempts",
+    "max_total_iterations",
+    "timeout_seconds",
+)
+_SETTINGS_PATH = DEFAULT_CONFIG_PATH.parent / "gui_settings.json"
+
+
+def _load_settings_overrides() -> dict:
+    try:
+        return json.loads(_SETTINGS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_settings_overrides(values: dict) -> None:
+    try:
+        _SETTINGS_PATH.write_text(json.dumps(values, indent=2) + "\n")
+    except OSError:
+        pass  # best-effort persistence -- the setting still applies this session
 
 
 def available_models(host: str) -> list[str]:
@@ -53,6 +80,20 @@ class RunManager:
         self._thread: threading.Thread | None = None
         self._run_id: str | None = None
         self._state = "idle"  # idle | running | done
+        self._cancel_event: threading.Event | None = None
+
+    @property
+    def config(self) -> Config:
+        with self._lock:
+            return self._config
+
+    def update_config(self, **overrides) -> Config:
+        """Apply settings-screen overrides for every run started from now
+        on. Never touches a run already in progress -- its own Config was
+        captured at `start()` time."""
+        with self._lock:
+            self._config = self._config.with_overrides(**overrides)
+            return self._config
 
     def status(self) -> dict:
         return {"state": self._state, "run_id": self._run_id}
@@ -74,13 +115,27 @@ class RunManager:
             session = Session.create(config.workspace_root)
             self._run_id = session.run_id
             self._state = "running"
+            self._cancel_event = threading.Event()
             self._thread = threading.Thread(
                 target=self._run,
-                args=(config, session, goal, multi_file, eps),
+                args=(config, session, goal, multi_file, eps, self._cancel_event),
                 daemon=True,
             )
             self._thread.start()
             return session.run_id
+
+    def cancel(self) -> bool:
+        """Ask the active run to stop, and free the GUI to start a new one
+        right away. The old run's thread keeps going until it notices the
+        cancellation at its next checkpoint (at most one in-flight LLM
+        call's worth of delay) and writes its own `run_aborted` -- but it
+        no longer holds the whole GUI hostage while that happens."""
+        with self._lock:
+            if self._state != "running" or self._cancel_event is None:
+                return False
+            self._cancel_event.set()
+            self._state = "idle"
+            return True
 
     def log_path(self, run_id: str) -> Path:
         return self._config.workspace_root / run_id / "log.jsonl"
@@ -96,7 +151,9 @@ class RunManager:
         goal: str,
         multi_file: bool,
         endpoints: list[dict],
+        cancel_event: threading.Event,
     ) -> None:
+        run_id = session.run_id
         try:
             pool = [
                 self._client_factory(
@@ -105,9 +162,11 @@ class RunManager:
                 for e in endpoints
             ]
             if multi_file:
-                MultiFileLoop(pool[0], config, session, pool_clients=pool).run(goal)
+                MultiFileLoop(
+                    pool[0], config, session, pool_clients=pool, cancel_event=cancel_event
+                ).run(goal)
             else:
-                SingleFileLoop(pool[0], config, session).run(goal)
+                SingleFileLoop(pool[0], config, session, cancel_event=cancel_event).run(goal)
         except Exception as exc:  # noqa: BLE001 -- a GUI run must never crash silently
             try:
                 session.log("run_aborted", reason=f"{type(exc).__name__}: {exc}")
@@ -115,7 +174,12 @@ class RunManager:
             except Exception:  # noqa: BLE001, S110
                 pass
         finally:
-            self._state = "done"
+            with self._lock:
+                # Only the still-current run gets to flip state back to
+                # "done" -- a cancelled run's thread finishing late must
+                # not clobber whatever run superseded it.
+                if self._run_id == run_id:
+                    self._state = "done"
 
 
 def stream_events(
@@ -251,7 +315,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     @property
     def _config(self) -> Config:
-        return self.server.config  # type: ignore[attr-defined]
+        # RunManager is the single source of truth once the settings
+        # screen can change it at runtime; `server.config` is only the
+        # value it was constructed with.
+        return self._runs.config
 
     @property
     def _runs(self) -> RunManager:
@@ -297,6 +364,18 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"models": available_models(host)})
             elif path == "/api/requests":
                 self._send_json({"active": self._tracker.active(exclude=req_id)})
+            elif path == "/api/settings":
+                c = self._config
+                self._send_json({k: getattr(c, k) for k in _SETTINGS_KEYS})
+            elif path.startswith("/api/files/"):
+                run_id = path[len("/api/files/") :]
+                self._send_json({"files": self._file_statuses(run_id)})
+            elif path.startswith("/api/file/"):
+                content = self._read_run_file(path[len("/api/file/") :])
+                if content is None:
+                    self._send_json({"error": "no such file"}, status=404)
+                else:
+                    self._send_json({"content": content})
             elif path.startswith("/api/summary/"):
                 run_id = path.rsplit("/", 1)[-1]
                 log_path = self._runs.log_path(run_id)
@@ -313,36 +392,116 @@ class _Handler(BaseHTTPRequestHandler):
         req_id = self._request_id()
         self._tracker.start(req_id, "POST", self.path)
         try:
-            if urlparse(self.path).path != "/api/run":
+            path = urlparse(self.path).path
+            if path == "/api/run":
+                self._post_run()
+            elif path == "/api/run/cancel":
+                self._send_json({"cancelled": self._runs.cancel()})
+            elif path == "/api/settings":
+                self._post_settings()
+            else:
                 self._send_json({"error": "not found"}, status=404)
-                return
-            length = int(self.headers.get("Content-Length", 0))
-            try:
-                body = json.loads(self.rfile.read(length) or b"{}")
-            except json.JSONDecodeError:
-                self._send_json({"error": "invalid JSON"}, status=400)
-                return
-            goal = (body.get("goal") or "").strip()
-            if not goal:
-                self._send_json({"error": "goal is required"}, status=400)
-                return
-            endpoints = body.get("endpoints") or None
-            if isinstance(endpoints, list):
-                endpoints = [e for e in endpoints if isinstance(e, dict) and e.get("host")]
-            try:
-                run_id = self._runs.start(
-                    goal=goal,
-                    model=body.get("model") or self._config.model,
-                    host=body.get("host") or self._config.ollama_host,
-                    multi_file=bool(body.get("multi_file", True)),
-                    endpoints=endpoints or None,
-                )
-            except RuntimeError as exc:
-                self._send_json({"error": str(exc)}, status=409)
-                return
-            self._send_json({"run_id": run_id})
         finally:
             self._tracker.finish(req_id)
+
+    def _read_json_body(self) -> dict | None:
+        """Parses the request body as JSON, or sends a 400 and returns
+        None -- callers just bail out when they get None back."""
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            return json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            self._send_json({"error": "invalid JSON"}, status=400)
+            return None
+
+    def _post_run(self) -> None:
+        body = self._read_json_body()
+        if body is None:
+            return
+        goal = (body.get("goal") or "").strip()
+        if not goal:
+            self._send_json({"error": "goal is required"}, status=400)
+            return
+        endpoints = body.get("endpoints") or None
+        if isinstance(endpoints, list):
+            endpoints = [e for e in endpoints if isinstance(e, dict) and e.get("host")]
+        try:
+            run_id = self._runs.start(
+                goal=goal,
+                model=body.get("model") or self._config.model,
+                host=body.get("host") or self._config.ollama_host,
+                multi_file=bool(body.get("multi_file", True)),
+                endpoints=endpoints or None,
+            )
+        except RuntimeError as exc:
+            self._send_json({"error": str(exc)}, status=409)
+            return
+        self._send_json({"run_id": run_id})
+
+    def _post_settings(self) -> None:
+        body = self._read_json_body()
+        if body is None:
+            return
+        updates: dict[str, float | int] = {}
+        bad_keys: list[str] = []
+        for key in _SETTINGS_KEYS:
+            if key not in body:
+                continue
+            try:
+                updates[key] = float(body[key]) if key == "temperature" else int(body[key])
+            except (TypeError, ValueError):
+                bad_keys.append(key)
+        if bad_keys:
+            self._send_json({"error": f"invalid value(s) for: {', '.join(bad_keys)}"}, status=400)
+            return
+        new_config = self._runs.update_config(**updates)
+        values = {k: getattr(new_config, k) for k in _SETTINGS_KEYS}
+        _save_settings_overrides(values)
+        self._send_json(values)
+
+    _MAX_FILE_VIEW_BYTES = 200_000
+
+    def _file_statuses(self, run_id: str) -> list[dict]:
+        """The `.py` files on disk for a run, each tagged with its latest
+        known verify outcome from the log (or "pending" while it hasn't
+        been verified yet, e.g. mid-generation)."""
+        run_dir = self._runs.log_path(run_id).parent
+        if not run_dir.is_dir():
+            return []
+        status_by_name: dict[str, str] = {}
+        log_path = run_dir / "log.jsonl"
+        if log_path.exists():
+            for f in summary.load_run_summary(log_path).files:
+                name = Path(f.path).name
+                if f.advisory:
+                    status_by_name[name] = "advisory"
+                else:
+                    status_by_name[name] = "ok" if f.success else "failed"
+        files = []
+        for p in sorted(run_dir.glob("*.py")):
+            files.append(
+                {
+                    "name": p.name,
+                    "status": status_by_name.get(p.name, "pending"),
+                    "size": p.stat().st_size,
+                }
+            )
+        return files
+
+    def _read_run_file(self, rest: str) -> str | None:
+        """`rest` is `<run_id>/<filename>`. Confines the read to that
+        run's own directory -- `filename` ultimately comes from the URL,
+        so a `../` must never be able to walk it anywhere else."""
+        run_id, _, filename = rest.partition("/")
+        if not filename:
+            return None
+        run_dir = self._runs.log_path(run_id).parent.resolve()
+        target = (run_dir / filename).resolve()
+        if run_dir not in target.parents:
+            return None
+        if not target.is_file() or target.stat().st_size > self._MAX_FILE_VIEW_BYTES:
+            return None
+        return target.read_text(errors="replace")
 
     def _serve_events(self, run_id: str, req_id: str) -> None:
         self.send_response(200)
@@ -370,6 +529,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def build_server(config: Config, *, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
+    overrides = _load_settings_overrides()
+    if overrides:
+        config = config.with_overrides(**overrides)
     server = ThreadingHTTPServer((host, port), _Handler)
     server.config = config  # type: ignore[attr-defined]
     server.run_manager = RunManager(config)  # type: ignore[attr-defined]
@@ -408,15 +570,26 @@ _INDEX_HTML = """<!doctype html>
   [hidden] { display:none !important; }
   body { margin:0; background:var(--bg); color:var(--fg);
          font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  main { max-width:640px; margin:0 auto; padding:44px 20px 80px; }
-  h1 { font-size:19px; font-weight:600; letter-spacing:-.01em; margin:0 0 24px; }
+  main { max-width:680px; margin:0 auto; padding:44px 20px 80px; }
+  h1 { font-size:19px; font-weight:600; letter-spacing:-.01em; margin:0 0 24px;
+       display:flex; align-items:baseline; gap:0; }
   h1 span { color:var(--muted); font-weight:400; }
   h1 .reqs { font-size:11px; }
-  .reqs-list { margin:2px 0 20px; padding:7px 10px; border:1px solid var(--line);
-               border-radius:8px; background:color-mix(in srgb, var(--fg) 4%, transparent);
-               font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--muted); }
+  .gear { margin-left:auto; background:none; border:0; padding:0 0 0 6px; width:auto;
+          color:var(--muted); font-size:14px; cursor:pointer; }
+  .gear:hover { color:var(--accent); }
+  .reqs-list, .settings-panel { margin:2px 0 20px; padding:7px 10px; border:1px solid var(--line);
+               border-radius:8px; background:color-mix(in srgb, var(--fg) 4%, transparent); }
+  .reqs-list { font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--muted); }
   .reqs-list div { display:flex; justify-content:space-between; gap:10px; }
   .reqs-list .t { color:var(--fg); opacity:.7; flex:0 0 auto; }
+  .settings-panel { padding:12px 14px 4px; }
+  .settings-panel .row > div { margin-bottom:10px; }
+  .settings-panel label { margin:0 0 4px; font-size:10px; }
+  .settings-panel input { padding:6px 8px; font-size:13px; }
+  .settings-actions { display:flex; align-items:center; gap:10px; margin:-2px 0 10px; }
+  .settings-actions button { margin:0; width:auto; padding:6px 14px; }
+  .settings-msg { font-size:12px; color:var(--muted); }
   label { display:block; font-size:12px; text-transform:uppercase; letter-spacing:.06em;
           color:var(--muted); margin:16px 0 6px; }
   select, input[type=text], textarea {
@@ -433,6 +606,7 @@ _INDEX_HTML = """<!doctype html>
   button.link { display:block; margin-top:8px; width:auto; padding:2px 0; background:none;
                 color:var(--muted); font-weight:400; font-size:12px; text-align:left; }
   button.link:hover:not(:disabled) { color:var(--accent); }
+  #stop { background:var(--bad); }
   .stats { display:flex; flex-wrap:wrap; gap:6px 18px; margin:26px 0 10px;
            font-size:13px; color:var(--muted); min-height:20px; }
   .stats b { color:var(--fg); font-weight:600; }
@@ -445,6 +619,24 @@ _INDEX_HTML = """<!doctype html>
             border:1px solid var(--line); border-radius:8px; font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
             white-space:pre-wrap; word-break:break-word; max-height:340px; overflow:auto; }
   pre#log:empty { display:none; }
+  .files-panel { margin-top:14px; }
+  .files-panel > label { margin:0 0 6px; }
+  .files-row { display:flex; height:230px; border:1px solid var(--line); border-radius:8px;
+               overflow:hidden; }
+  .file-list { width:180px; flex:0 0 auto; overflow-y:auto; border-right:1px solid var(--line);
+               background:color-mix(in srgb, var(--fg) 3%, transparent); }
+  .file-list div { padding:6px 10px; font-size:12.5px; cursor:pointer; display:flex;
+                    align-items:center; gap:7px; white-space:nowrap; overflow:hidden;
+                    text-overflow:ellipsis; }
+  .file-list div:hover { background:color-mix(in srgb, var(--fg) 7%, transparent); }
+  .file-list div.active { background:color-mix(in srgb, var(--accent) 16%, transparent); }
+  .file-dot { width:7px; height:7px; border-radius:50%; flex:0 0 auto; background:var(--muted); }
+  .file-dot.ok { background:var(--ok); }
+  .file-dot.failed { background:var(--bad); }
+  .file-dot.advisory { background:var(--warn); }
+  .file-view { flex:1; margin:0; padding:10px 12px; overflow:auto; font-size:12px; line-height:1.5;
+               font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap;
+               word-break:break-word; color:var(--fg); }
   table { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
   td { padding:5px 8px; border-top:1px solid var(--line); }
   td.s-ok { color:var(--ok); } td.s-bad { color:var(--bad); } td.s-adv { color:var(--warn); }
@@ -457,8 +649,28 @@ _INDEX_HTML = """<!doctype html>
 </head>
 <body>
 <main>
-  <h1>kiddie-harness <span>&mdash; generate a project</span> <span id="reqs" class="reqs"></span></h1>
+  <h1>kiddie-harness <span>&mdash; generate a project</span> <span id="reqs" class="reqs"></span>
+    <button type="button" id="settings-btn" class="gear" title="settings">&#9881;</button>
+  </h1>
   <div id="reqs-list" class="reqs-list" hidden></div>
+  <div id="settings-panel" class="settings-panel" hidden>
+    <div class="row">
+      <div><label for="s-temperature">Temperature</label><input type="text" id="s-temperature"></div>
+      <div><label for="s-max_tokens">Max tokens</label><input type="text" id="s-max_tokens"></div>
+    </div>
+    <div class="row">
+      <div><label for="s-max_tokens_ceiling">Max tokens ceiling</label><input type="text" id="s-max_tokens_ceiling"></div>
+      <div><label for="s-max_fix_attempts">Fix attempts</label><input type="text" id="s-max_fix_attempts"></div>
+    </div>
+    <div class="row">
+      <div><label for="s-max_total_iterations">Max LLM calls</label><input type="text" id="s-max_total_iterations"></div>
+      <div><label for="s-timeout_seconds">Call timeout (s)</label><input type="text" id="s-timeout_seconds"></div>
+    </div>
+    <div class="settings-actions">
+      <button type="button" id="settings-save">Save</button>
+      <span class="settings-msg" id="settings-msg"></span>
+    </div>
+  </div>
 
   <label for="model">Model</label>
   <div class="row">
@@ -486,18 +698,28 @@ _INDEX_HTML = """<!doctype html>
   </div>
 
   <button id="go">Generate</button>
+  <button type="button" id="stop" hidden>Stop</button>
   <div class="err" id="err" hidden></div>
 
   <div class="stats" id="stats"></div>
   <pre id="log"></pre>
+  <div class="files-panel" id="files-panel" hidden>
+    <label>Files</label>
+    <div class="files-row">
+      <div class="file-list" id="file-list"></div>
+      <pre class="file-view" id="file-view">select a file</pre>
+    </div>
+  </div>
   <div id="summary"></div>
 </main>
 
 <script>
 const $ = s => document.querySelector(s);
 const logEl = $("#log"), statsEl = $("#stats"), goBtn = $("#go"), errEl = $("#err");
+const stopBtn = $("#stop");
 let started = 0, calls = 0, fixes = 0, filesDone = 0, filesTotal = 0, tick = null, es = null;
 let defaultModel = "";
+let currentRunId = null, selectedFile = null;
 
 // Every request to the server carries a unique id in the URL (_r=...):
 // the server exposes what's currently in flight at /api/requests, and
@@ -528,7 +750,55 @@ async function loadConfig() {
   });
   pollActive();
   setInterval(pollActive, 3000);
+  loadSettings();
+
+  // A run started before this page load (or before a reload) is still
+  // going -- pick its stream back up instead of showing an idle form
+  // that silently rejects "Generate" with "already in progress".
+  if (c.state && c.state.state === "running" && c.state.run_id) {
+    beginTracking();
+    watchRun(c.state.run_id);
+  }
 }
+
+const SETTINGS_KEYS = [
+  "temperature", "max_tokens", "max_tokens_ceiling",
+  "max_fix_attempts", "max_total_iterations", "timeout_seconds",
+];
+
+async function loadSettings() {
+  try {
+    const { url } = tagUrl("/api/settings");
+    const s = await (await fetch(url)).json();
+    SETTINGS_KEYS.forEach(k => { if (k in s) $("#s-" + k).value = s[k]; });
+  } catch (e) { /* settings panel just stays blank */ }
+}
+
+$("#settings-btn").addEventListener("click", () => {
+  $("#settings-panel").hidden = !$("#settings-panel").hidden;
+});
+
+$("#settings-save").addEventListener("click", async () => {
+  const body = {};
+  SETTINGS_KEYS.forEach(k => {
+    const v = $("#s-" + k).value.trim();
+    if (v !== "") body[k] = v;
+  });
+  const msg = $("#settings-msg");
+  msg.textContent = "saving\\u2026";
+  try {
+    const { url } = tagUrl("/api/settings");
+    const res = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) { msg.textContent = data.error || "save failed"; return; }
+    SETTINGS_KEYS.forEach(k => { if (k in data) $("#s-" + k).value = data[k]; });
+    msg.textContent = "saved \\u2014 applies to the next run";
+    setTimeout(() => { if (msg.textContent.startsWith("saved")) msg.textContent = ""; }, 3000);
+  } catch (e) { msg.textContent = "could not reach the server"; }
+});
 async function refreshRow(p) {
   const host = $("#host" + p).value.trim();
   const sel = $("#model" + p);
@@ -595,6 +865,40 @@ async function pollActive() {
   } catch (e) { /* not worth surfacing */ }
 }
 
+async function refreshFiles(runId) {
+  if (!runId) return;
+  let files = [];
+  try {
+    const { url } = tagUrl("/api/files/" + runId);
+    ({ files } = await (await fetch(url)).json());
+  } catch (e) { return; }
+  const panel = $("#files-panel"), list = $("#file-list");
+  if (!files.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+  list.innerHTML = files.map(f =>
+    `<div data-name="${esc(f.name)}" class="${f.name === selectedFile ? "active" : ""}">`
+    + `<span class="file-dot ${f.status}"></span>${esc(f.name)}</div>`
+  ).join("");
+  list.querySelectorAll("div[data-name]").forEach(el => {
+    el.addEventListener("click", () => selectFile(runId, el.dataset.name));
+  });
+  const names = files.map(f => f.name);
+  if (selectedFile && names.includes(selectedFile)) selectFile(runId, selectedFile);
+  else selectFile(runId, names[0]);
+}
+
+async function selectFile(runId, name) {
+  selectedFile = name;
+  $("#file-list").querySelectorAll("div[data-name]").forEach(el => {
+    el.classList.toggle("active", el.dataset.name === name);
+  });
+  try {
+    const { url } = tagUrl("/api/file/" + runId + "/" + encodeURIComponent(name));
+    const data = await (await fetch(url)).json();
+    $("#file-view").textContent = data.error ? "(could not read file)" : data.content;
+  } catch (e) { $("#file-view").textContent = "(could not read file)"; }
+}
+
 function onEvent(d) {
   if (d.line) { logEl.textContent += d.line + "\\n"; logEl.scrollTop = logEl.scrollHeight; }
   const CALLS = ["plan", "spec", "codegen", "fix", "integration_fix"];
@@ -653,15 +957,55 @@ async function showSummary(runId) {
   $("#summary").innerHTML = (rows ? `<table>${rows}</table>` : "") + reason;
 }
 
+// Shared by both a fresh "Generate" click and resuming a run that was
+// already in progress when the page loaded -- everything that resets
+// the display for "a run is now live", with no network call of its own.
+function beginTracking() {
+  errEl.hidden = true;
+  goBtn.disabled = true;
+  stopBtn.hidden = false; stopBtn.disabled = false;
+  logEl.textContent = ""; $("#summary").innerHTML = "";
+  $("#files-panel").hidden = true; $("#file-list").innerHTML = "";
+  $("#file-view").textContent = "select a file";
+  selectedFile = null;
+  calls = fixes = filesDone = filesTotal = 0; started = Date.now();
+  renderStats(false);
+  tick = setInterval(() => { renderStats(false); pollActive(); refreshFiles(currentRunId); }, 1000);
+}
+
+// Opens the SSE stream for `runId` and wires it up to the log/stats/
+// summary. With no Last-Event-ID this always replays the run's log from
+// the top, so resuming after a page reload rebuilds the same counters a
+// tab that had been open the whole time would show.
+function watchRun(runId) {
+  currentRunId = runId;
+  const finish = async () => {
+    es.close(); clearInterval(tick);
+    stopBtn.hidden = true;
+    await showSummary(runId);
+    await refreshFiles(runId);
+    goBtn.disabled = false;
+  };
+  const { url: evUrl } = tagUrl("/api/events/" + runId);
+  es = new EventSource(evUrl);
+  es.onmessage = e => onEvent(JSON.parse(e.data));
+  es.addEventListener("done", finish);
+  es.onerror = async () => {
+    // EventSource reconnects on its own; only wrap up if the run is
+    // actually over -- a dropped connection is not a finished run.
+    try {
+      const { url } = tagUrl("/api/config");
+      const c = await (await fetch(url)).json();
+      if (c.state.run_id === runId && c.state.state === "running") return;
+    } catch (e) { return; }
+    finish();
+  };
+}
+
 $("#go").addEventListener("click", async () => {
   const goal = $("#goal").value.trim();
   if (!goal) return;
-  errEl.hidden = true;
-  goBtn.disabled = true;
-  logEl.textContent = ""; $("#summary").innerHTML = "";
-  calls = fixes = filesDone = filesTotal = 0; started = Date.now();
-  renderStats(false);
-  tick = setInterval(() => { renderStats(false); pollActive(); }, 1000);
+  beginTracking();
 
   const body = {
     goal, model: $("#model").value, host: $("#host").value.trim(),
@@ -683,31 +1027,19 @@ $("#go").addEventListener("click", async () => {
   } catch (e) { return fail("could not reach the server"); }
   const data = await res.json();
   if (!res.ok) return fail(data.error || "run failed to start");
+  watchRun(data.run_id);
+});
 
-  const runId = data.run_id;
-  const finish = async () => {
-    es.close(); clearInterval(tick);
-    await showSummary(runId);
-    goBtn.disabled = false;
-  };
-  const { url: evUrl } = tagUrl("/api/events/" + runId);
-  es = new EventSource(evUrl);
-  es.onmessage = e => onEvent(JSON.parse(e.data));
-  es.addEventListener("done", finish);
-  es.onerror = async () => {
-    // EventSource reconnects on its own; only wrap up if the run is
-    // actually over -- a dropped connection is not a finished run.
-    try {
-      const { url } = tagUrl("/api/config");
-      const c = await (await fetch(url)).json();
-      if (c.state.run_id === runId && c.state.state === "running") return;
-    } catch (e) { return; }
-    finish();
-  };
+stopBtn.addEventListener("click", async () => {
+  stopBtn.disabled = true;
+  try {
+    const { url } = tagUrl("/api/run/cancel");
+    await fetch(url, { method: "POST" });
+  } catch (e) { /* the poll loop will notice the run is over either way */ }
 });
 
 function fail(msg) {
-  clearInterval(tick); goBtn.disabled = false;
+  clearInterval(tick); goBtn.disabled = false; stopBtn.hidden = true;
   errEl.textContent = msg; errEl.hidden = false;
 }
 

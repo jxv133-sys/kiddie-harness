@@ -6,6 +6,8 @@ venv/
 .pytest_cache/
 .ruff_cache/
 workspace/
+# per-machine overrides saved by the GUI's settings screen
+config/gui_settings.json
 # stray artifacts a generated/test project may drop in the repo root
 *.db
 *.sqlite

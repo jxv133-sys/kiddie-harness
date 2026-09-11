@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 from harness.orchestrator import SingleFileLoop
@@ -136,3 +137,20 @@ def test_max_tokens_growth_is_capped_by_ceiling(tmp_path: Path):
     assert result.success
     assert result.attempts == 2
     assert client.max_tokens_calls == [3000, 4000, 4000]
+
+
+def test_a_cancelled_run_stops_before_the_next_fix_call(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=5)
+    session = Session.create(config.workspace_root)
+    # Never actually reached: cancellation fires right after the first
+    # verify fails, before a second call would be made.
+    client = FakeClient(["def broken(:\n", "print('should not be requested')\n"])
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    result = SingleFileLoop(client, config, session, cancel_event=cancel_event).run("goal")
+
+    assert not result.success
+    assert result.aborted
+    assert result.abort_reason == "cancelled by user"
+    assert len(client.calls) == 1  # the fix call never went out

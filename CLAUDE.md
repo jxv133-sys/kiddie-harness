@@ -104,6 +104,24 @@ core design, not just style.
   `stream_events(log_path)` (tails `log.jsonl` → SSE frames using
   `progress.format_event`). The page is one embedded HTML string. No new
   deps; it reuses `progress` + `summary` and changes nothing elsewhere.
+  `RunManager.cancel()` sets a cooperative `cancel_event` (checked in
+  `orchestrator._generate_and_fix`, the multi-file worker loop, and the
+  integration-fix loop -- it raises `RunCancelled` between calls, never
+  mid-call) and immediately flips the manager back to `idle` so the GUI
+  can start a new run without waiting for the old thread to notice; a
+  `run_id` check in that thread's `finally` stops it from clobbering
+  whatever run superseded it. `RequestTracker` (server-side) backs a
+  small live "N requests active" readout on the page, keyed by a `_r=`
+  id every client request tags its own URL with. A **settings screen**
+  (gear icon) edits `temperature`/`max_tokens`/`max_tokens_ceiling`/
+  `max_fix_attempts`/`max_total_iterations`/`timeout_seconds` for runs
+  started after the change; saved to `config/gui_settings.json`
+  (gitignored -- default.yaml keeps its comments) and merged on top of
+  it at server start. A **Files panel** (`/api/files/<run_id>`,
+  `/api/file/<run_id>/<name>`) lists a run's generated `.py` files with
+  their latest verify status and shows the selected one's source,
+  refreshed on the same poll as progress -- `_read_run_file` confines
+  reads to that run's own directory.
 - `config/default.yaml` — model, host, temperature (the *base*; retries
   step up from it), token limits/ceiling, retry budgets, timeout, and an
   optional `endpoints:` list (`Config.Endpoint` / `resolved_endpoints()`)
@@ -117,6 +135,21 @@ Single-file loop → multi-file planning → hardening/observability →
 minimal web GUI → parallel dual-endpoint dispatch are complete. The
 dual-endpoint work is unit-tested but **not yet exercised against two
 live models** — see `docs/design/2026-09-10-dual-endpoint-parallelism.md`.
+
+**A real GUI run against `deepseek-r1:7b` surfaced the actual reason the
+dual-endpoint feature looked broken in practice: `RunManager` had no way
+to cancel a run, so a slow model stuck in its fix loop (or a model
+returning a diff/patch format `codegen` doesn't understand, looping on
+`fix_noop`) held the GUI's one-run-at-a-time lock indefinitely — no new
+run, dual-endpoint or not, could start until it finished or the process
+was killed.** Fixed with the cooperative `cancel_event` described under
+`harness/gui.py` above (a Stop button in the GUI). Separately, the
+planner's real depends_on output for that same run was a fully linear
+chain (`core → auth → web`) even with two endpoints configured — the
+dispatcher has nothing to parallelize when every file depends on the
+one before it. `plan.md` now tells the model `depends_on` means "has an
+`import` for," not "came after," since a weak model defaults to
+narrative build order otherwise; unverified against a live model yet.
 
 **The small model no longer writes tests.** An earlier phase had
 `MultiFileLoop` generate a `test_*.py` for every implementation file

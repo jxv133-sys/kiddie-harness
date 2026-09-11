@@ -227,7 +227,15 @@ type a goal, hit **Generate**. **+ second endpoint** adds a parallel
 backend. The progress log streams in as it happens (`[plan]`,
 `[codegen]`, `[verify:*]`, `[fix]`, ...), a small strip tracks files /
 fix attempts / LLM calls / elapsed time, and the final verdict and
-per-file table drop in when the run finishes. One run at a time; stdlib
+per-file table drop in when the run finishes. A **Files** panel lists
+each generated file with its pass/fail status as it's built and shows
+the selected one's source. **Stop** cancels a run in progress — the GUI
+is free to start a new one right away even if the model is still mid-call
+underneath. The gear icon opens a **settings** panel for the retry/token/
+temperature/timeout knobs that are otherwise only in `config/default.yaml`;
+changes apply to runs started after that point and persist across a GUI
+restart. Reloading the page while a run is active picks its stream back
+up instead of showing a blank form. One run at a time; stdlib
 `http.server`, no new dependencies, binds to localhost only. `--port`
 and `--no-browser` are
 available.

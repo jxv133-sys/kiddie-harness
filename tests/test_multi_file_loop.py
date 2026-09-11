@@ -503,3 +503,21 @@ def test_integration_fix_rounds_sample_at_a_rising_temperature(tmp_path: Path):
     assert len(client.temperature_calls) == 3
     assert client.temperature_calls == sorted(client.temperature_calls)
     assert client.temperature_calls[0] > config.temperature
+
+
+def test_a_cancelled_run_aborts_before_claiming_any_file(tmp_path: Path):
+    config = make_config(tmp_path, max_fix_attempts=5)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "a.py", "purpose": "x", "depends_on": []}]})
+    # Never actually reached: a cancel already set before dispatch starts
+    # is noticed at the top of the worker loop, before it claims a file.
+    client = FakeClient([plan, "should not be requested"])
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    result = MultiFileLoop(client, config, session, cancel_event=cancel_event).run("goal")
+
+    assert not result.success
+    assert result.aborted
+    assert result.abort_reason == "cancelled by user"
+    assert len(client.calls) == 1  # just the plan call
