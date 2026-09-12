@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from harness.llm_client import OllamaError
 from harness.steps.plan import FileTask, PlanError, _parse_free_form, plan_files
 
 from .fakes import FakeClient
@@ -76,6 +77,18 @@ def test_plan_files_retries_when_the_first_plan_is_empty():
     assert len(client.calls) == 2
     assert client.temperature_calls[1] > client.temperature_calls[0]
     assert "empty list" in client.calls[1]
+
+
+def test_plan_files_does_not_retry_an_unreachable_host():
+    # A dead connection isn't fixed by a blunter prompt or a hotter
+    # temperature -- it should propagate immediately, not burn through
+    # the same timeout two or three more times before giving up.
+    client = FakeClient([OllamaError("Read timed out"), "should never be requested"])
+
+    with pytest.raises(OllamaError):
+        plan_files(client, "x", temperature=0.2, max_tokens=512, max_attempts=3)
+
+    assert len(client.calls) == 1
 
 
 def test_plan_files_raises_after_exhausting_retries():

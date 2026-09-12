@@ -177,6 +177,41 @@ def test_main_multi_file_notes_advisory_tests_on_an_otherwise_successful_run(
     assert "advisory" in (captured.out + captured.err).lower()
 
 
+def test_max_tokens_flags_override_the_configured_generation_length(tmp_path, monkeypatch, capsys):
+    config = _patch_config(monkeypatch, tmp_path)
+    client = FakeClient(["print('hi')\n"])
+    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: client)
+
+    exit_code = cli.main(
+        ["run", "--goal", "print hi", "--max-tokens", "4096", "--max-tokens-ceiling", "16384"]
+    )
+
+    assert exit_code == 0
+    assert client.max_tokens_calls == [4096]
+    assert config.max_tokens != 4096  # the yaml default is untouched
+
+
+def test_endpoint_with_no_model_defaults_to_the_run_overridden_model(tmp_path, monkeypatch, capsys):
+    # --endpoint host (no ",model") should default to what --model just
+    # asked for on this run, not silently fall back to the raw yaml
+    # default ("fake-model", from make_config) underneath it.
+    _patch_config(monkeypatch, tmp_path)
+    made: list[tuple[str, str, int]] = []
+
+    def factory(host, model, timeout):
+        made.append((host, model, timeout))
+        return FakeClient(["print('hi')\n"])
+
+    monkeypatch.setattr(cli, "OllamaClient", factory)
+
+    exit_code = cli.main(
+        ["run", "--goal", "print hi", "--model", "custom-model", "--endpoint", "http://a:11434"]
+    )
+
+    assert exit_code == 0
+    assert made == [("http://a:11434", "custom-model", made[0][2])]
+
+
 def test_main_multi_file_prints_plan_and_spec_progress(tmp_path, monkeypatch, capsys):
     _patch_config(monkeypatch, tmp_path)
     plan_json = '{"files": [{"path": "main.py", "purpose": "entry point"}]}'

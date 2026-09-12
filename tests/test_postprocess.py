@@ -75,3 +75,23 @@ def test_drops_paired_think_block_then_returns_bare_code():
 def test_think_close_tag_with_no_fence_returns_remaining_text():
     text = "reasoning about the fix\n</think>\nprint('fixed')"
     assert strip_code_fences(text) == "print('fixed')"
+
+
+def test_drops_an_unclosed_opening_fence_from_a_truncated_response():
+    # max_tokens cut the response off mid-file, inside the fence it
+    # opened -- the leading marker is a guaranteed syntax error and worth
+    # dropping; everything after it is real, usable (if incomplete) code.
+    text = "```python\ndef greet():\n    return 'hi"
+    assert strip_code_fences(text) == "def greet():\n    return 'hi"
+
+
+def test_drops_an_unclosed_fence_after_reasoning_in_a_truncated_response():
+    text = "<think>\nI'll write a function\n</think>\n```python\ndef greet():\n    return 'hi"
+    assert strip_code_fences(text) == "def greet():\n    return 'hi"
+
+
+def test_leaves_a_lone_opening_marker_alone_when_nothing_follows_it():
+    # Degenerate case: truncated before even the newline after the
+    # language tag, so there's no fence *line* to recognize and drop --
+    # falls through to the plain-text case and lets the verifier judge it.
+    assert strip_code_fences("```python") == "```python"

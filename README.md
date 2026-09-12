@@ -180,6 +180,8 @@ Options:
 - `--host` — override the Ollama host (default `http://localhost:11434`)
 - `--max-retries` — override the bounded fix-loop attempt count per file (default `5`; each retry samples a little hotter)
 - `--timeout` — override the per-call Ollama timeout in seconds (default `800`; raise it further for slow reasoning models)
+- `--max-tokens` — override the starting generation length per call (raise it for a verbose reasoning model that keeps getting cut off mid-file)
+- `--max-tokens-ceiling` — override the cap on adaptive growth after a truncated response
 - `--filename` — output filename, single-file mode only (default `main.py`)
 - `--multi-file` — plan and generate a multi-file project instead of one script
 - `--quiet` — suppress live per-step progress lines; print only the final summary

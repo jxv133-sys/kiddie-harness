@@ -17,7 +17,7 @@ import posixpath
 import re
 from pathlib import Path
 
-from ..llm_client import OllamaClient, OllamaError
+from ..llm_client import OllamaClient
 from ..postprocess import strip_code_fences
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -193,6 +193,12 @@ def plan_files(
     Schema-constrained every attempt; a retry escalates the temperature
     and appends a blunter instruction to get past a reasoning model that
     filled the grammar with an empty list.
+
+    Only retries a *content* failure (empty/malformed response) -- an
+    unreachable host (`OllamaError`) propagates immediately. A dead
+    connection isn't fixed by a blunter prompt or a hotter temperature,
+    and retrying it here just means the caller waits out the same
+    timeout two or three more times before finding out.
     """
     base_prompt = _PLAN_TEMPLATE.format(goal=goal)
     last_error = "no attempts made"
@@ -217,7 +223,7 @@ def plan_files(
             )
             data = _parse_free_form(response.text) if free_form else json.loads(response.text)
             return _tasks_from_plan(data)
-        except (OllamaError, PlanError, json.JSONDecodeError) as exc:
+        except (PlanError, json.JSONDecodeError) as exc:
             last_error = str(exc)
 
     raise PlanError(

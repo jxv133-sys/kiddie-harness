@@ -384,6 +384,12 @@ class MultiFileLoop:
         last_error: list[str | None] = [None]
         abort_reason: list[str | None] = [None]
         active = [len(self._pool)]
+        # Workers currently mid-build (outside the lock, in _build_one_file).
+        # An idle worker must not give up just because `pending` happens to
+        # be momentarily empty -- the file a busy worker is holding can
+        # still fail and land right back in `pending`, and by then an idle
+        # worker that already returned is gone for good and never claims it.
+        busy = [0]
 
         def record(task: FileTask, result: FileRunResult) -> None:
             results[result.path] = result
@@ -440,10 +446,17 @@ class MultiFileLoop:
                                 return
                             task = claim()
                             if task is not None:
+                                busy[0] += 1
                                 break
-                            if stopped_early[0] or not pending:
+                            if stopped_early[0] or (not pending and busy[0] == 0):
+                                # Nothing left to claim, and nobody else is
+                                # mid-build to possibly fail and reissue more
+                                # -- there is genuinely no more work for me.
                                 return
-                            if active[0] <= 1:
+                            if pending and active[0] <= 1:
+                                # Something is still pending but blocked on a
+                                # dependency, and I'm the last worker left --
+                                # a real stall, not just "no work right now".
                                 abort_reason[0] = (
                                     last_error[0]
                                     or "no endpoint could build the remaining files"
@@ -458,15 +471,25 @@ class MultiFileLoop:
                         with cv:
                             last_error[0] = str(exc)
                             pending.insert(0, task)  # another endpoint may manage it
+                            busy[0] -= 1
                             cv.notify_all()
+                        # Otherwise this endpoint just silently vanishes from
+                        # the log and the file's whole build (spec included)
+                        # quietly restarts from scratch on another worker --
+                        # confusing to watch live with no explanation.
+                        self.session.log(
+                            "endpoint_retired", path=task.path, endpoint=client.host, reason=str(exc)
+                        )
                         return
                     except RunCancelled:
                         with cv:
                             abort_reason[0] = abort_reason[0] or "cancelled by user"
+                            busy[0] -= 1
                             cv.notify_all()
                         return
                     with cv:
                         iterations[0] += used
+                        busy[0] -= 1
                         record(task, result)
                         cv.notify_all()
             finally:

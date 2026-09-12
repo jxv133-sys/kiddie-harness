@@ -31,6 +31,10 @@ _ANY_FENCE_RE = re.compile(
     re.DOTALL,
 )
 
+# An opening fence with no matching close -- a truncated response cut off
+# mid-file, still inside the block it opened.
+_LEADING_OPEN_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_+-]*\n")
+
 # Reasoning models emit chain-of-thought wrapped in <think>...</think>.
 # Depending on the model/template, the opening tag is sometimes consumed
 # by Ollama and only a bare closing </think> reaches us, so match either
@@ -58,7 +62,13 @@ def strip_code_fences(text: str) -> str:
     2. If what remains is exactly one fenced block, return its body.
     3. If fenced blocks appear amid prose, return the last block's body
        (a model that "reconsiders" puts its final answer last).
-    4. Otherwise return the trimmed text and let the verifier judge it.
+    4. If the response opens a fence and is cut off before closing it
+       (``max_tokens`` hit mid-file), drop just the opening marker and
+       keep everything after -- the alternative is leaving a guaranteed
+       syntax error (a bare ` ``` ` line) at the top of the file, which
+       reads to the fixer as "your code is malformed" instead of what
+       actually happened ("you ran out of room").
+    5. Otherwise return the trimmed text and let the verifier judge it.
     """
     stripped = strip_reasoning(text)
 
@@ -69,5 +79,9 @@ def strip_code_fences(text: str) -> str:
     blocks = _ANY_FENCE_RE.findall(stripped)
     if blocks:
         return blocks[-1].strip("\n")
+
+    open_fence = _LEADING_OPEN_FENCE_RE.match(stripped)
+    if open_fence and "```" not in stripped[open_fence.end() :]:
+        return stripped[open_fence.end() :]
 
     return stripped

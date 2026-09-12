@@ -29,12 +29,21 @@ def test_with_overrides_replaces_only_the_values_given():
     assert config.max_fix_attempts == 5
 
 
-def test_with_overrides_ignores_none_and_zero():
-    config = _config().with_overrides(host=None, max_fix_attempts=None, timeout_seconds=0)
+def test_with_overrides_ignores_none():
+    config = _config().with_overrides(host=None, max_fix_attempts=None, timeout_seconds=None)
 
     assert config.ollama_host == "http://h"
     assert config.max_fix_attempts == 5
     assert config.timeout_seconds == 300
+
+
+def test_with_overrides_applies_an_explicit_zero():
+    # An explicit 0 is a real value ("no fix attempts, just report the
+    # first failure"), not "leave it alone" -- only None means that.
+    config = _config().with_overrides(max_fix_attempts=0, max_total_iterations=0)
+
+    assert config.max_fix_attempts == 0
+    assert config.max_total_iterations == 0
 
 
 def test_config_load_reads_the_default_yaml():

@@ -438,6 +438,43 @@ def test_a_dead_endpoint_does_not_sink_a_run_another_endpoint_can_finish(tmp_pat
     assert result.success
     assert not result.aborted
     assert {Path(f.path).name for f in result.files} == {"a.py", "b.py"}
+    # the dropped endpoint is visible in the log, not just inferable from
+    # the file it was assigned quietly reappearing on another worker
+    events = [json.loads(line) for line in session.log_path.read_text().splitlines()]
+    retired = [e for e in events if e["event"] == "endpoint_retired"]
+    assert len(retired) == 1
+    assert retired[0]["reason"] == "endpoint B is down"
+
+
+def test_an_idle_worker_does_not_retire_just_because_the_only_file_is_already_claimed(
+    tmp_path: Path,
+):
+    # Regression: with a single file, the second worker finds nothing to
+    # claim from its very first check and (before the fix) retired for
+    # good right then -- so when the worker actually holding that file
+    # hit OllamaError and requeued it, nobody was left to pick it up and
+    # the whole run aborted, even though a perfectly good second endpoint
+    # was sitting right there. `dying` is first in the pool -- in CPython
+    # the first-started thread reliably wins an uncontended lock this
+    # short-lived, so it claims the only file; `good` finds pending empty
+    # immediately and must not treat that as "no more work, ever".
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "a.py", "purpose": "x", "depends_on": []}]})
+    # The delay gives the second worker time to observe "nothing to
+    # claim" *before* the failure requeues the file -- without it, the
+    # requeue can (depending on scheduling) land before the second worker
+    # ever checks, which would pass by accident and prove nothing.
+    dying = FakeClient([OllamaError("connection reset")], delay=0.1)
+    good = FakeClient(["- spec", "def thing():\n    return 1\n"])
+
+    result = MultiFileLoop(
+        FakeClient([plan]), config, session, pool_clients=[dying, good]
+    ).run("one leaf")
+
+    assert result.success
+    assert not result.aborted
+    assert [Path(f.path).name for f in result.files] == ["a.py"]
 
 
 def test_run_aborts_gracefully_when_the_model_becomes_unreachable(tmp_path: Path):

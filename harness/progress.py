@@ -66,6 +66,12 @@ def format_event(event: str, fields: dict) -> str | None:
     if event == "integration_fix":
         return f"[integration-fix] {fields['path']} -> round {fields['round']}"
 
+    if event == "endpoint_retired":
+        return (
+            f"[endpoint] {fields['endpoint']} failed on {fields['path']} "
+            f"({fields['reason']}) -- requeued for another endpoint"
+        )
+
     if event == "budget_exhausted":
         return f"[budget] exhausted before {fields['before']} ({fields['iterations']} iteration(s) used)"
 

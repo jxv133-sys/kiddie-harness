@@ -6,6 +6,14 @@ def test_format_event_returns_none_for_goal_and_giving_up():
     assert format_event("giving_up", {"attempts": 3}) is None
 
 
+def test_format_event_endpoint_retired():
+    line = format_event(
+        "endpoint_retired",
+        {"path": "b.py", "endpoint": "http://h2:11434", "reason": "Read timed out"},
+    )
+    assert line == "[endpoint] http://h2:11434 failed on b.py (Read timed out) -- requeued for another endpoint"
+
+
 def test_format_event_returns_none_for_unknown_event():
     assert format_event("something_future", {}) is None
 

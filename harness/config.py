@@ -83,15 +83,23 @@ class Config:
         max_tokens_ceiling: int | None = None,
         max_total_iterations: int | None = None,
     ) -> Config:
+        # `is None` throughout, not `or` -- an explicit 0 (e.g. "no fix
+        # attempts, just report the first failure") is a real, meaningful
+        # override, not "unset"; `or` would silently discard it and keep
+        # the old value instead.
         return dataclasses.replace(
             self,
             model=model or self.model,
             ollama_host=host or self.ollama_host,
-            max_fix_attempts=max_fix_attempts or self.max_fix_attempts,
-            timeout_seconds=timeout_seconds or self.timeout_seconds,
+            max_fix_attempts=self.max_fix_attempts if max_fix_attempts is None else max_fix_attempts,
+            timeout_seconds=self.timeout_seconds if timeout_seconds is None else timeout_seconds,
             endpoints=self.endpoints if endpoints is None else endpoints,
             temperature=self.temperature if temperature is None else temperature,
-            max_tokens=max_tokens or self.max_tokens,
-            max_tokens_ceiling=max_tokens_ceiling or self.max_tokens_ceiling,
-            max_total_iterations=max_total_iterations or self.max_total_iterations,
+            max_tokens=self.max_tokens if max_tokens is None else max_tokens,
+            max_tokens_ceiling=(
+                self.max_tokens_ceiling if max_tokens_ceiling is None else max_tokens_ceiling
+            ),
+            max_total_iterations=(
+                self.max_total_iterations if max_total_iterations is None else max_total_iterations
+            ),
         )

@@ -35,6 +35,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the per-call Ollama timeout in seconds (raise it for slow reasoning models)",
     )
     run.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Override the starting generation length per call (raise it for a model that keeps "
+        "getting cut off mid-file, e.g. a verbose reasoning model)",
+    )
+    run.add_argument(
+        "--max-tokens-ceiling",
+        type=int,
+        default=None,
+        help="Override the cap on adaptive growth after a truncated response",
+    )
+    run.add_argument(
         "--endpoint",
         action="append",
         metavar="HOST,MODEL",
@@ -161,13 +174,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
+        # Apply --model/--host/--timeout first, then parse --endpoint
+        # against *that* -- an --endpoint with no model given should
+        # default to what the user just asked for on this run, not
+        # silently fall back to the raw yaml default underneath it.
         config = Config.load().with_overrides(
             model=args.model,
             host=args.host,
             max_fix_attempts=args.max_retries,
             timeout_seconds=args.timeout,
-            endpoints=_parse_endpoints(args.endpoint, config=Config.load()) if args.endpoint else None,
+            max_tokens=args.max_tokens,
+            max_tokens_ceiling=args.max_tokens_ceiling,
         )
+        if args.endpoint:
+            config = config.with_overrides(endpoints=_parse_endpoints(args.endpoint, config=config))
         endpoints = config.resolved_endpoints()
         pool_clients = [OllamaClient(e.host, e.model, e.timeout_seconds) for e in endpoints]
         client = pool_clients[0]

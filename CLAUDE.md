@@ -174,6 +174,59 @@ once a run's files actually used more than one endpoint (a single-
 endpoint run would just see the same badge on every row, so it's
 suppressed).
 
+**A round of real bugs found generating an actual project (a mock login
+page) against `huihui_ai/deepseek-r1-abliterated:8b` on both endpoints:**
+
+- **`strip_code_fences` left a guaranteed syntax error in place.** A
+  response truncated mid-file, still inside the fence it opened (` ```python\n `
+  with no closing ` ``` `), was returned verbatim -- the leading marker
+  is not valid Python, so the fix loop's very first attempt was always a
+  SyntaxError on a markdown artifact, not the model's actual mistake. Now
+  drops a confirmed-unclosed opening fence and keeps everything after it
+  (real, if incomplete, code) rather than leaving the marker in.
+- **`plan_files` retried a dead connection like a bad response.** An
+  `OllamaError` (host unreachable) was caught by the same retry loop as
+  "the model returned nonsense," so a genuinely offline host cost 2-3x
+  its own timeout before the run gave up. Now propagates immediately --
+  only a content failure (empty/malformed plan) escalates temperature
+  and retries.
+- **A CLI `--endpoint` with no model silently ignored `--model`.** Config
+  was loaded twice: once with the CLI overrides applied, once again
+  (raw, un-overridden) just to resolve endpoint defaults, so `--model
+  foo --endpoint host` gave that endpoint the yaml's default model, not
+  `foo`. Endpoints now resolve against the already-overridden config.
+- **An explicit `0` in `Config.with_overrides` was silently discarded.**
+  `max_fix_attempts or self.max_fix_attempts` treats `0` the same as
+  "not given" -- a real, meaningful override ("no retries, just report
+  the first failure") was dropped in favor of the old value. Switched to
+  explicit `is None` checks throughout.
+- **No visibility when a worker's endpoint died mid-file.** `OllamaError`
+  in the dispatcher requeues the file for another endpoint but never
+  logged it -- a file's whole build (spec included) would just silently
+  restart from scratch on a different host, with nothing in the log
+  explaining why. Logged as `endpoint_retired` now, surfaced live as
+  `[endpoint] <host> failed on <path> (<error>) -- requeued for another
+  endpoint`.
+- Added `--max-tokens` / `--max-tokens-ceiling` CLI flags (previously
+  yaml-only) -- the fastest lever for a verbose reasoning model that
+  keeps getting cut off mid-file, and exactly what surfaced the fence bug
+  above in the first place.
+- **An idle worker retired for good the instant `pending` was momentarily
+  empty, even if another worker was still mid-build on the only
+  remaining file.** With a single-file plan (or any moment where every
+  pending file happens to already be claimed), the second endpoint would
+  see nothing to claim on its very first check and exit permanently --
+  so when the worker actually holding that file hit `OllamaError` and
+  requeued it, nobody was left to pick it up and the whole run aborted,
+  even with a perfectly good second endpoint sitting idle. This is the
+  single biggest reason a run can fail to "use the second endpoint" at
+  all: it's not that dispatch didn't try, it's that the backup worker
+  had already given up before it was needed. Fixed with a `busy` counter
+  -- a worker only retires when there's nothing pending *and* nobody
+  else is mid-build (and so might fail and reissue more work). Regression
+  test proven both ways: fails 5/5 against the pre-fix code, passes
+  15/15 against the fix (`test_an_idle_worker_does_not_retire_just_because_the_only_file_is_already_claimed`).
+
 **The small model no longer writes tests.** An earlier phase had
 `MultiFileLoop` generate a `test_*.py` for every implementation file
 (from the module's real source, its own call). In practice a 7B model
