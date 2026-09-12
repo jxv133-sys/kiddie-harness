@@ -6,6 +6,20 @@ def test_format_event_returns_none_for_goal_and_giving_up():
     assert format_event("giving_up", {"attempts": 3}) is None
 
 
+def test_format_event_critic_check_agrees():
+    line = format_event("critic_check", {"path": "main.py", "follows_spec": True, "issues": ""})
+    assert line == "[critic] main.py -> ok"
+
+
+def test_format_event_critic_check_disagreement_is_silent():
+    # Already surfaced as its own [verify:critic] -> FAILED line with the
+    # same issues text -- a second line here would just be noise.
+    line = format_event(
+        "critic_check", {"path": "main.py", "follows_spec": False, "issues": "wrong output"}
+    )
+    assert line is None
+
+
 def test_format_event_endpoint_retired():
     line = format_event(
         "endpoint_retired",

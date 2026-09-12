@@ -16,7 +16,7 @@ from pathlib import Path
 from .config import Config
 from .llm_client import OllamaClient, OllamaError
 from .session import Session
-from .steps import codegen, plan, spec, verify
+from .steps import codegen, critic, plan, spec, verify
 from .steps.plan import FileTask
 from .steps.verify import VerifyResult
 
@@ -42,6 +42,9 @@ class RunResult:
     # without ever reaching a verdict on the code.
     aborted: bool = False
     abort_reason: str = ""
+    # True when the file compiles/runs clean but the critic step never
+    # signed off on it against the goal -- see FileRunResult.spec_flagged.
+    spec_flagged: bool = False
 
 
 @dataclasses.dataclass
@@ -56,6 +59,14 @@ class FileRunResult:
     # check -- a test we couldn't get green means "unverified", not
     # "the code is broken".
     advisory: bool = False
+    # True when the file compiles, lints, and imports clean, but the
+    # critic step (another LLM's opinion, not real tooling -- see
+    # harness/steps/critic.py) never signed off on it against its own
+    # spec, even after the normal bounded fix attempts. Reported, but --
+    # like `advisory` -- never fails the run or blocks a dependent file:
+    # an opinion that might be wrong must not be able to sink code that
+    # every deterministic check already passed.
+    spec_flagged: bool = False
 
 
 @dataclasses.dataclass
@@ -209,6 +220,49 @@ def _generate_and_fix(
             session.log("fix_noop", path=str(file_path), attempt=attempts, stage=result.stage)
 
 
+def _with_critic(
+    verify_fn: Callable[[Path], VerifyResult],
+    client: OllamaClient,
+    config: Config,
+    session: Session,
+    spec_text: str,
+    calls: list[int],
+) -> Callable[[Path], VerifyResult]:
+    """Wraps a real-tooling `verify_fn` so that, once it passes, one more
+    call asks the model whether its own output holds up against `spec_text`
+    -- composes into `_generate_and_fix`'s existing `verify_fn` contract
+    with no changes to that loop at all. `calls` is a mutable single-item
+    counter the caller reads back afterwards, so the critic's LLM calls
+    count against the run's iteration budget like any other call.
+
+    Logs its own `critic_check` event on *every* call, agree or not --
+    when it agrees, `verify_fn`'s own result is returned unchanged (so a
+    passing critic never shows up as its own "verify" event), and without
+    this there would be no evidence a critic call was ever made at all."""
+
+    def wrapped(path: Path) -> VerifyResult:
+        result = verify_fn(path)
+        if not result.success:
+            return result
+        calls[0] += 1
+        verdict = critic.critique_file(
+            client,
+            spec_text,
+            path.read_text(),
+            str(path.name),
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+        )
+        session.log(
+            "critic_check", path=str(path), follows_spec=verdict.follows_spec, issues=verdict.issues
+        )
+        if verdict.follows_spec:
+            return result
+        return VerifyResult(success=False, stage="critic", output=verdict.issues)
+
+    return wrapped
+
+
 class SingleFileLoop:
     """Phase 1: goal -> one Python file -> verify -> bounded fix loop.
 
@@ -233,6 +287,14 @@ class SingleFileLoop:
     def run(self, goal: str, filename: str = "main.py") -> RunResult:
         self.session.log("goal", goal=goal)
         file_path = self.session.run_dir / filename
+        verify_fn = verify.verify_python_file
+        critic_calls = [0]
+        if self.config.critic_enabled:
+            # No separate spec step in single-file mode -- the goal itself
+            # is the only specification there is to check against.
+            verify_fn = _with_critic(
+                verify_fn, self.client, self.config, self.session, goal, critic_calls
+            )
 
         try:
             result, attempts = _generate_and_fix(
@@ -241,7 +303,7 @@ class SingleFileLoop:
                 self.session,
                 file_path,
                 goal,
-                verify.verify_python_file,
+                verify_fn,
                 cancel_event=self._cancel,
             )
         except (OllamaError, RunCancelled) as exc:
@@ -257,15 +319,23 @@ class SingleFileLoop:
                 abort_reason=reason,
             )
 
-        if not result.success:
+        # A critic disagreement is the one verify failure that must not
+        # sink an otherwise-working file (see FileRunResult.spec_flagged)
+        # -- everything real (compile/run) already passed by this point.
+        spec_flagged = not result.success and result.stage == "critic"
+        success = result.success or spec_flagged
+        if spec_flagged:
+            self.session.log("spec_flagged", path=str(file_path), issues=result.output)
+        elif not success:
             self.session.log("giving_up", attempts=attempts)
-        self.session.log("run_result", success=result.success)
+        self.session.log("run_result", success=success)
 
         return RunResult(
-            success=result.success,
+            success=success,
             file_path=str(file_path),
             attempts=attempts,
             last_output=result.output,
+            spec_flagged=spec_flagged,
         )
 
 
@@ -317,9 +387,12 @@ class MultiFileLoop:
 
         integration: VerifyResult | None = None
         advisory_paths = [Path(f.path) for f in file_results if f.advisory]
-        # A run's success rides on its non-advisory files: the
-        # implementation, and any test that actually passed.
-        required = [f for f in file_results if not f.advisory]
+        # A run's success rides on its non-advisory, non-spec_flagged
+        # files: the implementation, and any test that actually passed.
+        # A spec_flagged file already passed every real check (compile,
+        # lint, import) -- only the critic's opinion disagreed, and an
+        # opinion that might be wrong must not be able to fail the run.
+        required = [f for f in file_results if not f.advisory and not f.spec_flagged]
         all_required_ok = bool(required) and all(f.success for f in required)
         if all_required_ok and not stopped_early and abort_reason is None:
             # A passing test_*.py file (one the planner asked for) means
@@ -395,7 +468,7 @@ class MultiFileLoop:
             results[result.path] = result
             order.append(result.path)
             name = Path(task.path).name
-            if result.success or result.advisory:
+            if result.success or result.advisory or result.spec_flagged:
                 done.add(name)
             else:
                 hard_failed.add(name)
@@ -529,18 +602,32 @@ class MultiFileLoop:
             f"{self._sibling_context(task, built_so_far)}"
         )
         is_test_file = Path(task.path).name.startswith("test_")
+        verify_fn = verify.verify_test_file if is_test_file else verify.verify_python_file_static
+        critic_calls = [0]
+        if self.config.critic_enabled and not is_test_file:
+            # Not applied to test files: a test's own pass/fail against
+            # pytest already is its verification: layering a second,
+            # fallible opinion on top adds uncertainty without a clear
+            # question for it to answer.
+            verify_fn = _with_critic(
+                verify_fn, client, self.config, self.session, spec_text, critic_calls
+            )
         result, attempts = _generate_and_fix(
             client,
             self.config,
             self.session,
             file_path,
             instruction,
-            verify.verify_test_file if is_test_file else verify.verify_python_file_static,
+            verify_fn,
             cancel_event=self._cancel,
         )
         advisory = is_test_file and not result.success
         if advisory:
             self.session.log("advisory_test", path=str(file_path), last_error=result.output)
+
+        spec_flagged = not result.success and result.stage == "critic"
+        if spec_flagged:
+            self.session.log("spec_flagged", path=str(file_path), issues=result.output)
 
         return (
             FileRunResult(
@@ -550,8 +637,9 @@ class MultiFileLoop:
                 attempts=attempts,
                 last_output=result.output,
                 advisory=advisory,
+                spec_flagged=spec_flagged,
             ),
-            2 + attempts,  # spec + codegen + fixes
+            2 + attempts + critic_calls[0],  # spec + codegen + fixes + critic checks
         )
 
     _SIBLING_CONTEXT_CHAR_CAP = 6000
@@ -567,7 +655,11 @@ class MultiFileLoop:
         used = 0
         for f in file_results:
             name = Path(f.path).name
-            if name not in wanted or not f.success or f.advisory or name.startswith("test_"):
+            # A spec_flagged file already compiles/lints/imports clean --
+            # only the critic disagreed -- so it's still safe, real source
+            # for a dependent to import from.
+            ok = f.success or f.spec_flagged
+            if name not in wanted or not ok or f.advisory or name.startswith("test_"):
                 continue
             source = Path(f.path).read_text()
             if used + len(source) > self._SIBLING_CONTEXT_CHAR_CAP:

@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the cap on adaptive growth after a truncated response",
     )
     run.add_argument(
+        "--no-critic",
+        action="store_true",
+        help="Skip the critic check (an extra LLM call per file judging it against its own "
+        "spec; never hard-fails a file that compiles/lints/imports clean, but costs a call)",
+    )
+    run.add_argument(
         "--endpoint",
         action="append",
         metavar="HOST,MODEL",
@@ -185,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout,
             max_tokens=args.max_tokens,
             max_tokens_ceiling=args.max_tokens_ceiling,
+            critic_enabled=False if args.no_critic else None,
         )
         if args.endpoint:
             config = config.with_overrides(endpoints=_parse_endpoints(args.endpoint, config=config))

@@ -182,6 +182,7 @@ Options:
 - `--timeout` — override the per-call Ollama timeout in seconds (default `800`; raise it further for slow reasoning models)
 - `--max-tokens` — override the starting generation length per call (raise it for a verbose reasoning model that keeps getting cut off mid-file)
 - `--max-tokens-ceiling` — override the cap on adaptive growth after a truncated response
+- `--no-critic` — skip the critic check (see below); saves one LLM call per file
 - `--filename` — output filename, single-file mode only (default `main.py`)
 - `--multi-file` — plan and generate a multi-file project instead of one script
 - `--quiet` — suppress live per-step progress lines; print only the final summary
@@ -195,6 +196,21 @@ crashed before finishing), use:
 ```bash
 harness inspect --run-id <run-id>
 ```
+
+## Critic check
+
+Once a file compiles, lints, and imports clean, one more call asks the
+model to judge its own output against the spec it was given -- catches a
+requirement that got dropped or misread, which no deterministic tool can.
+This is the one check in the harness that isn't real tooling; it's
+another LLM's opinion, and opinions can be wrong. So it never gets veto
+power over code that already passes every real check: a disagreement
+gets the same bounded fix attempts as any other verify failure, and if
+it's still unresolved when those run out, the file is reported
+`[flagged]` (`FileRunResult.spec_flagged`) rather than `FAILED` -- it
+does not block the run, block a dependent file's build, or fail the exit
+code. On by default (`config/default.yaml`'s `critic.enabled`); turn it
+off per run with `--no-critic`, or from the GUI's settings screen.
 
 ## Parallel endpoints
 
@@ -238,9 +254,9 @@ opens its content in a small window over the page, kept live while it's
 open. **Stop** cancels a run in progress — the GUI
 is free to start a new one right away even if the model is still mid-call
 underneath. The gear icon opens a **settings** panel for the retry/token/
-temperature/timeout knobs that are otherwise only in `config/default.yaml`;
-changes apply to runs started after that point and persist across a GUI
-restart. Reloading the page while a run is active picks its stream back
+temperature/timeout knobs (and the critic check toggle) that are otherwise
+only in `config/default.yaml`; changes apply to runs started after that
+point and persist across a GUI restart. Reloading the page while a run is active picks its stream back
 up instead of showing a blank form. One run at a time; stdlib
 `http.server`, no new dependencies, binds to localhost only. `--port`
 and `--no-browser` are

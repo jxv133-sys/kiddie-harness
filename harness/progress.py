@@ -43,6 +43,15 @@ def format_event(event: str, fields: dict) -> str | None:
         status = "ok" if fields["success"] else "FAILED"
         return f"[verify:{fields['stage']}] {fields['path']} -> {status}"
 
+    if event == "critic_check":
+        # A disagreement is already about to show up as its own
+        # [verify:critic] -> FAILED line (with the same issues text) --
+        # only worth a line here when it agrees, which otherwise leaves
+        # no trace at all that the critic call happened.
+        if fields["follows_spec"]:
+            return f"[critic] {fields['path']} -> ok"
+        return None
+
     if event == "fix":
         note = " (truncated)" if fields.get("truncated") else ""
         return f"[fix] {fields['path']} -> attempt {fields['attempt']}{note}"
@@ -57,6 +66,12 @@ def format_event(event: str, fields: dict) -> str | None:
         return (
             f"[advisory] {fields['path']} -> generated test never passed "
             f"(not blocking the run)"
+        )
+
+    if event == "spec_flagged":
+        return (
+            f"[flagged] {fields['path']} -> passes every real check but the "
+            f"critic disagrees (not blocking the run): {fields['issues']}"
         )
 
     if event == "integration_verify":

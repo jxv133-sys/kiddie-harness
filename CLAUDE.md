@@ -21,7 +21,12 @@ exists to route around that failure mode:
   file's test, fix one file given one exact error).
 - Every LLM output is verified with **real tooling** (`py_compile`,
   `ruff`, `pytest`, actual import resolution) — never another LLM's
-  opinion of whether the code is right.
+  opinion of whether the code is right. The one deliberate, narrow
+  exception is the critic check (`harness/steps/critic.py`): "does this
+  file actually do what its spec asked for" has no deterministic check,
+  only a human or a model can judge it. Because that's an opinion and can
+  be wrong, it never gets veto power the way real tooling does -- see
+  `spec_flagged` in Status.
 - Context per call stays narrow: code generation sees that file's own
   spec, the source of the sibling modules already built this run (capped;
   so its imports resolve instead of guessing), and — on a retry — its own
@@ -54,13 +59,21 @@ core design, not just style.
   itself listed is built like any other file but verified with pytest
   (`verify_test_file`); if it never passes it is **advisory** — recorded,
   excluded from the integration pytest run (`run_pytest(ignore=…)`), not
-  counted against `overall_success`.
+  counted against `overall_success`. `_with_critic` optionally wraps a
+  file's `verify_fn` (see `harness/steps/critic.py` below): once it
+  passes, one more call judges the file against its own spec; a
+  disagreement becomes a `stage="critic"` verify failure, so it gets the
+  same bounded fix attempts as any other stage, and if still unresolved
+  at the end, the file is `spec_flagged` rather than failed (see Status).
 - `harness/steps/` — one atomic LLM call per concern: `plan.py`
   (schema-constrained file list, bounded retry, a final schema-free
   attempt parsed by `_parse_free_form`; also flattens to bare filenames,
   drops non-`.py`, dedups), `spec.py` (per-file bullet spec, reasoning
   stripped), `codegen.py` (`generate_file` / `fix_file` — a file body in,
-  a file body out, nothing else).
+  a file body out, nothing else), `critic.py` (`critique_file` — a file's
+  spec + contents in, a `{follows_spec, issues}` verdict out; fails open
+  -- an unparseable or errored call is treated as "follows the spec,"
+  never as grounds to fail a file on its own).
 - `harness/steps/verify.py` — deterministic checks only, **no LLM calls
   anywhere in this file**. `compile_check`, `lint_check` (runs `ruff
   check --fix`, so trivial nits get fixed for free instead of costing a
@@ -134,8 +147,37 @@ core design, not just style.
   for the parallel dispatcher.
 - `tests/fakes.py` — shared `FakeClient`/`FakeResponse`/`make_config` test
   doubles used by every test file. No test needs a live Ollama server.
+  `make_config`'s `critic_enabled` defaults to `False` (opposite of
+  `config/default.yaml`'s `True`) so every pre-existing FakeClient test's
+  queued response count is unaffected by the critic's extra call; tests
+  for the critic itself opt in explicitly.
 
 ## Status
+
+**Critic check, added on request** ("make sure the file follows what the
+spec was"): once a file passes every real check (compile/lint/guard/
+import), one more call asks the model to judge its own output against
+its own spec (`harness/steps/critic.py`, `orchestrator._with_critic`).
+This is the project's one deliberate exception to "real tooling, never
+another LLM's opinion" (see "Why it's built this way" above) -- resolved
+in favor of that principle by making it advisory: a disagreement gets
+the same bounded fix attempts as any other verify stage, but if it's
+still unresolved when those run out, the file is reported `spec_flagged`
+(`[flagged]` in the table, a distinct dot color in the GUI) rather than
+`FAILED` -- it doesn't block the run, doesn't block a dependent file's
+sibling-context, and doesn't fail the exit code. An agreeing critic call
+returns the wrapped `verify_fn`'s own result unchanged (so it doesn't
+show up as its own "verify" event), which would leave zero evidence the
+call ever happened -- worth knowing since it looks identical to "critic
+never ran" in the log otherwise; a dedicated `critic_check` event (always
+logged, agree or not) and its own `[critic]` progress line exist
+specifically to make that visible. Verified live against a real model
+(`llama3.2:latest`): `[critic] main.py -> ok`, correctly counted in the
+LLM-call total. On by default (`config/default.yaml`'s `critic.enabled`);
+`--no-critic` / `RunManager.update_config` / the GUI's settings checkbox
+all turn it off. Applies to single-file mode too (the goal itself stands
+in for a spec there); not applied to `test_*.py` files -- a test's own
+pass/fail against pytest already is its verification.
 
 Single-file loop → multi-file planning → hardening/observability →
 minimal web GUI → parallel dual-endpoint dispatch are complete. The

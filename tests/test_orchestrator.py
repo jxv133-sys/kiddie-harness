@@ -1,3 +1,4 @@
+import json
 import threading
 from pathlib import Path
 
@@ -154,3 +155,60 @@ def test_a_cancelled_run_stops_before_the_next_fix_call(tmp_path: Path):
     assert result.aborted
     assert result.abort_reason == "cancelled by user"
     assert len(client.calls) == 1  # the fix call never went out
+
+
+def test_critic_disabled_by_default_never_calls_the_model_a_third_time(tmp_path: Path):
+    config = make_config(tmp_path)  # critic_enabled=False
+    session = Session.create(config.workspace_root)
+    client = FakeClient(["print('hi')\n"])
+
+    result = SingleFileLoop(client, config, session).run("print hi")
+
+    assert result.success
+    assert not result.spec_flagged
+    assert len(client.calls) == 1  # codegen only -- no critic call queued or made
+
+
+def test_critic_lets_a_passing_file_through_untouched(tmp_path: Path):
+    config = make_config(tmp_path, critic_enabled=True)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(["print('hi')\n", '{"follows_spec": true, "issues": ""}'])
+
+    result = SingleFileLoop(client, config, session).run("print hi")
+
+    assert result.success
+    assert not result.spec_flagged
+    assert len(client.calls) == 2  # codegen + one critic check
+    # Proof the critic call actually happened -- an agreeing critic
+    # returns the original verify result unchanged, so without its own
+    # log event there would be no other evidence of it in the log.
+    events = [json.loads(line) for line in session.log_path.read_text().splitlines()]
+    checks = [e for e in events if e["event"] == "critic_check"]
+    assert len(checks) == 1
+    assert checks[0]["follows_spec"] is True
+
+
+def test_a_file_the_critic_disagrees_with_is_flagged_not_failed(tmp_path: Path):
+    config = make_config(tmp_path, critic_enabled=True, max_fix_attempts=2)
+    session = Session.create(config.workspace_root)
+    # Compiles and runs fine every time -- the critic is the only thing
+    # that never signs off, across every attempt.
+    disagree = '{"follows_spec": false, "issues": "never greets the user by name"}'
+    client = FakeClient(
+        [
+            "print('hi')\n", disagree,  # initial generation + critic
+            "print('hi')\n", disagree,  # fix attempt 1 + critic
+            "print('hi')\n", disagree,  # fix attempt 2 + critic
+        ]
+    )
+
+    result = SingleFileLoop(client, config, session).run("greet the user by name")
+
+    # The code genuinely runs -- a critic opinion, which can be wrong,
+    # must not be able to fail a file that passes every real check.
+    assert result.success
+    assert result.spec_flagged
+    assert "never greets" in result.last_output
+    events = [json.loads(line) for line in session.log_path.read_text().splitlines()]
+    assert any(e["event"] == "spec_flagged" for e in events)
+    assert events[-1]["event"] == "run_result" and events[-1]["success"] is True

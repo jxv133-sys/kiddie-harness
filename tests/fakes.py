@@ -77,7 +77,14 @@ def make_config(
     max_total_iterations: int = 25,
     max_tokens: int = 512,
     max_tokens_ceiling: int = 4096,
+    critic_enabled: bool = False,
 ) -> Config:
+    # critic_enabled defaults off here (unlike config/default.yaml, where
+    # it's on): the critic is its own concern with its own tests
+    # (test_critic.py); leaving it off by default keeps every other
+    # FakeClient-based test's queued response count exactly what it was
+    # before the critic existed, instead of forcing every test file in
+    # the suite to account for its extra call.
     return Config(
         ollama_host="http://unused",
         model="fake-model",
@@ -88,4 +95,5 @@ def make_config(
         max_fix_attempts=max_fix_attempts,
         max_total_iterations=max_total_iterations,
         workspace_root=tmp_path / "workspace",
+        critic_enabled=critic_enabled,
     )

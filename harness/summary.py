@@ -12,7 +12,7 @@ import dataclasses
 import json
 from pathlib import Path
 
-_CALL_EVENTS = {"plan", "spec", "codegen", "fix", "integration_fix"}
+_CALL_EVENTS = {"plan", "spec", "codegen", "fix", "integration_fix", "critic_check"}
 
 
 @dataclasses.dataclass
@@ -22,6 +22,13 @@ class FileSummary:
     attempts: int
     truncated: bool
     advisory: bool = False
+    # True when the file passed every real check (compile/lint/import)
+    # but the critic step (an LLM's opinion, not real tooling) disagreed
+    # with it against its own spec, even after normal fix attempts.
+    # `success` stays False (an honest record of the critic's verdict);
+    # this flag is what keeps it from blocking the run -- see
+    # orchestrator.FileRunResult.spec_flagged.
+    spec_flagged: bool = False
     # The last verifier output for this file (the error, when it failed;
     # or "skipped: ..." when a dependency didn't build).
     last_error: str = ""
@@ -55,6 +62,7 @@ def load_run_summary(log_path: Path) -> RunSummary:
     """Reconstruct a RunSummary from a run's log.jsonl."""
     files: dict[str, dict] = {}
     advisory_paths: set[str] = set()
+    spec_flagged_paths: set[str] = set()
     integration: IntegrationSummary | None = None
     total_llm_calls = 0
     stopped_early = False
@@ -99,6 +107,8 @@ def load_run_summary(log_path: Path) -> RunSummary:
             )
         elif event == "advisory_test":
             advisory_paths.add(record["path"])
+        elif event == "spec_flagged":
+            spec_flagged_paths.add(record["path"])
         elif event == "integration_verify":
             integration = IntegrationSummary(
                 stage=record["stage"],
@@ -131,6 +141,7 @@ def load_run_summary(log_path: Path) -> RunSummary:
             attempts=data["attempts"],
             truncated=data["truncated"],
             advisory=path in advisory_paths,
+            spec_flagged=path in spec_flagged_paths,
             last_error=data.get("last_error", ""),
         )
         for path, data in files.items()
@@ -156,6 +167,8 @@ def render_table(summary: RunSummary) -> str:
     for f in summary.files:
         if f.success:
             status = "ok"
+        elif f.spec_flagged:
+            status = "flagged"
         elif f.advisory:
             status = "advisory"
         else:
@@ -163,6 +176,8 @@ def render_table(summary: RunSummary) -> str:
         note = " (truncated at least once)" if f.truncated else ""
         if f.advisory:
             note += " -- generated test never passed; not blocking the run"
+        elif f.spec_flagged:
+            note += " -- passes every real check, but the critic disagrees; not blocking the run"
         lines.append(f"  [{status}] {f.path} ({f.attempts} fix attempt(s)){note}")
 
     if summary.integration is not None:
@@ -185,8 +200,13 @@ def render_table(summary: RunSummary) -> str:
     advisory_note = ""
     if advisory_count:
         advisory_note = f", {advisory_count} advisory test(s) not passing"
+    flagged_count = sum(1 for f in summary.files if f.spec_flagged)
+    flagged_note = ""
+    if flagged_count:
+        flagged_note = f", {flagged_count} file(s) flagged by the critic"
     lines.append(
-        f"Result: {result} ({summary.total_llm_calls} LLM call(s) total{advisory_note})"
+        f"Result: {result} ({summary.total_llm_calls} LLM call(s) total"
+        f"{advisory_note}{flagged_note})"
     )
 
     return "\n".join(lines)

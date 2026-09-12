@@ -317,17 +317,23 @@ def test_settings_endpoint_reads_updates_and_persists_config(tmp_path: Path, mon
             urllib.request.urlopen(f"http://127.0.0.1:{port}/api/settings", timeout=5).read()
         )
         assert current["max_fix_attempts"] == config.max_fix_attempts
+        assert current["critic_enabled"] == config.critic_enabled
 
         status, body = _post_json(
-            f"http://127.0.0.1:{port}/api/settings", {"max_fix_attempts": 9, "temperature": 0.5}
+            f"http://127.0.0.1:{port}/api/settings",
+            {"max_fix_attempts": 9, "temperature": 0.5, "critic_enabled": True},
         )
         assert status == 200
         assert body["max_fix_attempts"] == 9
         assert body["temperature"] == 0.5
+        assert body["critic_enabled"] is True
         # applies to the next run started on this server, not just the response
         assert server.run_manager.config.max_fix_attempts == 9
+        assert server.run_manager.config.critic_enabled is True
         # persisted so a restart picks it back up
-        assert json.loads((tmp_path / "gui_settings.json").read_text())["max_fix_attempts"] == 9
+        persisted = json.loads((tmp_path / "gui_settings.json").read_text())
+        assert persisted["max_fix_attempts"] == 9
+        assert persisted["critic_enabled"] is True
 
         status, body = _post_json(f"http://127.0.0.1:{port}/api/settings", {"max_fix_attempts": "x"})
         assert status == 400
@@ -461,6 +467,38 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
             raise AssertionError("expected an error response")
         except urllib.error.HTTPError as exc:
             assert exc.code == 404
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_files_endpoint_reports_a_spec_flagged_file_as_flagged_not_failed(tmp_path: Path):
+    import threading
+    import urllib.request
+
+    config = make_config(tmp_path)
+    run_dir = config.workspace_root / "20260101-000000-flagged1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "core.py").write_text("x = 1\n")
+    records = [
+        {"event": "verify", "path": str(run_dir / "core.py"), "attempt": 0,
+         "stage": "critic", "success": False, "output": "doesn't handle negatives"},
+        {"event": "spec_flagged", "path": str(run_dir / "core.py"),
+         "issues": "doesn't handle negatives"},
+    ]
+    (run_dir / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        body = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/files/20260101-000000-flagged1", timeout=5
+            ).read()
+        )
+        assert body["files"][0]["status"] == "flagged"
     finally:
         server.shutdown()
         t.join(timeout=5)

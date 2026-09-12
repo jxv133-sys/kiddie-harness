@@ -41,6 +41,10 @@ _SETTINGS_KEYS = (
     "max_total_iterations",
     "timeout_seconds",
 )
+# Boolean settings, handled separately from the numeric ones above (no
+# float()/int() parsing -- the value is already a real JSON boolean).
+_BOOL_SETTINGS_KEYS = ("critic_enabled",)
+_ALL_SETTINGS_KEYS = _SETTINGS_KEYS + _BOOL_SETTINGS_KEYS
 _SETTINGS_PATH = DEFAULT_CONFIG_PATH.parent / "gui_settings.json"
 
 
@@ -366,7 +370,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"active": self._tracker.active(exclude=req_id)})
             elif path == "/api/settings":
                 c = self._config
-                self._send_json({k: getattr(c, k) for k in _SETTINGS_KEYS})
+                self._send_json({k: getattr(c, k) for k in _ALL_SETTINGS_KEYS})
             elif path.startswith("/api/files/"):
                 run_id = path[len("/api/files/") :]
                 self._send_json(self._files_response(run_id))
@@ -456,7 +460,7 @@ class _Handler(BaseHTTPRequestHandler):
         body = self._read_json_body()
         if body is None:
             return
-        updates: dict[str, float | int] = {}
+        updates: dict[str, float | int | bool] = {}
         bad_keys: list[str] = []
         for key in _SETTINGS_KEYS:
             if key not in body:
@@ -465,11 +469,14 @@ class _Handler(BaseHTTPRequestHandler):
                 updates[key] = float(body[key]) if key == "temperature" else int(body[key])
             except (TypeError, ValueError):
                 bad_keys.append(key)
+        for key in _BOOL_SETTINGS_KEYS:
+            if key in body:
+                updates[key] = bool(body[key])
         if bad_keys:
             self._send_json({"error": f"invalid value(s) for: {', '.join(bad_keys)}"}, status=400)
             return
         new_config = self._runs.update_config(**updates)
-        values = {k: getattr(new_config, k) for k in _SETTINGS_KEYS}
+        values = {k: getattr(new_config, k) for k in _ALL_SETTINGS_KEYS}
         _save_settings_overrides(values)
         self._send_json(values)
 
@@ -505,7 +512,9 @@ class _Handler(BaseHTTPRequestHandler):
         if log_path.exists():
             for f in summary.load_run_summary(log_path).files:
                 name = Path(f.path).name
-                if f.advisory:
+                if f.spec_flagged:
+                    status_by_name[name] = "flagged"
+                elif f.advisory:
                     status_by_name[name] = "advisory"
                 else:
                     status_by_name[name] = "ok" if f.success else "failed"
@@ -708,6 +717,7 @@ _INDEX_HTML = """<!doctype html>
   .file-dot.ok { background:var(--ok); }
   .file-dot.failed { background:var(--bad); }
   .file-dot.advisory { background:var(--warn); }
+  .file-dot.flagged { background:var(--accent); }
   .file-modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex;
                 align-items:center; justify-content:center; padding:30px; z-index:10; }
   .file-modal-box { width:100%; max-width:700px; max-height:100%; display:flex;
@@ -725,6 +735,7 @@ _INDEX_HTML = """<!doctype html>
   table { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
   td { padding:5px 8px; border-top:1px solid var(--line); }
   td.s-ok { color:var(--ok); } td.s-bad { color:var(--bad); } td.s-adv { color:var(--warn); }
+  td.s-flag { color:var(--accent); }
   .err { color:var(--bad); font-size:13px; margin-top:10px; }
   pre.reason { margin:12px 0 0; padding:12px 14px; border:1px solid var(--bad);
                border-radius:8px; background:color-mix(in srgb, var(--bad) 8%, transparent);
@@ -750,6 +761,10 @@ _INDEX_HTML = """<!doctype html>
     <div class="row">
       <div><label for="s-max_total_iterations">Max LLM calls</label><input type="text" id="s-max_total_iterations"></div>
       <div><label for="s-timeout_seconds">Call timeout (s)</label><input type="text" id="s-timeout_seconds"></div>
+    </div>
+    <div class="check" style="margin-top:0">
+      <input type="checkbox" id="s-critic_enabled">
+      <label for="s-critic_enabled" style="margin:0;text-transform:none;letter-spacing:0;font-size:13px">critic check (one extra call per file, judges it against its own spec)</label>
     </div>
     <div class="settings-actions">
       <button type="button" id="settings-save">Save</button>
@@ -857,12 +872,14 @@ const SETTINGS_KEYS = [
   "temperature", "max_tokens", "max_tokens_ceiling",
   "max_fix_attempts", "max_total_iterations", "timeout_seconds",
 ];
+const BOOL_SETTINGS_KEYS = ["critic_enabled"];
 
 async function loadSettings() {
   try {
     const { url } = tagUrl("/api/settings");
     const s = await (await fetch(url)).json();
     SETTINGS_KEYS.forEach(k => { if (k in s) $("#s-" + k).value = s[k]; });
+    BOOL_SETTINGS_KEYS.forEach(k => { if (k in s) $("#s-" + k).checked = s[k]; });
   } catch (e) { /* settings panel just stays blank */ }
 }
 
@@ -876,6 +893,7 @@ $("#settings-save").addEventListener("click", async () => {
     const v = $("#s-" + k).value.trim();
     if (v !== "") body[k] = v;
   });
+  BOOL_SETTINGS_KEYS.forEach(k => { body[k] = $("#s-" + k).checked; });
   const msg = $("#settings-msg");
   msg.textContent = "saving\\u2026";
   try {
@@ -887,6 +905,7 @@ $("#settings-save").addEventListener("click", async () => {
     const data = await res.json();
     if (!res.ok) { msg.textContent = data.error || "save failed"; return; }
     SETTINGS_KEYS.forEach(k => { if (k in data) $("#s-" + k).value = data[k]; });
+    BOOL_SETTINGS_KEYS.forEach(k => { if (k in data) $("#s-" + k).checked = data[k]; });
     msg.textContent = "saved \\u2014 applies to the next run";
     setTimeout(() => { if (msg.textContent.startsWith("saved")) msg.textContent = ""; }, 3000);
   } catch (e) { msg.textContent = "could not reach the server"; }
@@ -1086,8 +1105,8 @@ async function showSummary(runId) {
   renderStats(true, verdict);
 
   let rows = (s.files || []).map(f => {
-    const cls = f.success ? "s-ok" : (f.advisory ? "s-adv" : "s-bad");
-    const tag = f.success ? "ok" : (f.advisory ? "advisory" : "FAILED");
+    const cls = f.success ? "s-ok" : (f.spec_flagged ? "s-flag" : (f.advisory ? "s-adv" : "s-bad"));
+    const tag = f.success ? "ok" : (f.spec_flagged ? "flagged" : (f.advisory ? "advisory" : "FAILED"));
     const name = f.path.split("/").pop();
     return `<tr><td class="${cls}">${tag}</td><td>${esc(name)}</td><td>${f.attempts} fix${f.attempts === 1 ? "" : "es"}</td></tr>`;
   }).join("");

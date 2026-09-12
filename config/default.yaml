@@ -29,6 +29,15 @@ generation:
   # file's budget grow unbounded.
   max_tokens_ceiling: 8192
 
+critic:
+  # After a file compiles/lints/imports clean, one more call asks the
+  # model to check its own output against the spec it was given -- an
+  # opinion, not a deterministic check, so it never hard-fails an
+  # otherwise-working file (see FileRunResult.spec_flagged); it just gets
+  # bounded fix attempts like any other verify failure, and a persistent
+  # disagreement is reported, not fatal. Off saves one LLM call per file.
+  enabled: true
+
 retries:
   # Bounded retries per file's fix loop. Each retry samples a little
   # hotter than the last (see orchestrator._retry_temperature), so these

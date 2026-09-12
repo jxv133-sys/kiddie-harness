@@ -33,6 +33,11 @@ class Config:
     # Extra endpoints for parallel multi-file generation. Empty -> the
     # single `ollama_host`/`model` above is the only backend.
     endpoints: tuple[Endpoint, ...] = ()
+    # Whether a generated file's own critic check (does it hold up against
+    # its spec?) runs at all. On by default; the fastest way to turn it
+    # off is per-run (--no-critic / the GUI's settings screen), not
+    # editing the yaml.
+    critic_enabled: bool = True
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:
@@ -61,6 +66,7 @@ class Config:
             max_total_iterations=retries["max_total_iterations"],
             workspace_root=Path(workspace["root"]),
             endpoints=endpoints,
+            critic_enabled=bool((raw.get("critic") or {}).get("enabled", True)),
         )
 
     def resolved_endpoints(self) -> list[Endpoint]:
@@ -82,6 +88,7 @@ class Config:
         max_tokens: int | None = None,
         max_tokens_ceiling: int | None = None,
         max_total_iterations: int | None = None,
+        critic_enabled: bool | None = None,
     ) -> Config:
         # `is None` throughout, not `or` -- an explicit 0 (e.g. "no fix
         # attempts, just report the first failure") is a real, meaningful
@@ -102,4 +109,5 @@ class Config:
             max_total_iterations=(
                 self.max_total_iterations if max_total_iterations is None else max_total_iterations
             ),
+            critic_enabled=self.critic_enabled if critic_enabled is None else critic_enabled,
         )

@@ -191,6 +191,28 @@ def test_max_tokens_flags_override_the_configured_generation_length(tmp_path, mo
     assert config.max_tokens != 4096  # the yaml default is untouched
 
 
+def test_no_critic_flag_skips_the_critic_call(tmp_path, monkeypatch, capsys):
+    _patch_config(monkeypatch, tmp_path, critic_enabled=True)
+    client = FakeClient(["print('hi')\n"])
+    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: client)
+
+    exit_code = cli.main(["run", "--goal", "print hi", "--no-critic"])
+
+    assert exit_code == 0
+    assert len(client.calls) == 1  # codegen only -- no critic call
+
+
+def test_critic_runs_by_default_when_the_config_enables_it(tmp_path, monkeypatch, capsys):
+    _patch_config(monkeypatch, tmp_path, critic_enabled=True)
+    client = FakeClient(["print('hi')\n", '{"follows_spec": true, "issues": ""}'])
+    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: client)
+
+    exit_code = cli.main(["run", "--goal", "print hi"])
+
+    assert exit_code == 0
+    assert len(client.calls) == 2  # codegen + critic
+
+
 def test_endpoint_with_no_model_defaults_to_the_run_overridden_model(tmp_path, monkeypatch, capsys):
     # --endpoint host (no ",model") should default to what --model just
     # asked for on this run, not silently fall back to the raw yaml

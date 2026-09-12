@@ -60,6 +60,45 @@ def test_succeeds_across_files_with_integration_check(tmp_path: Path):
     assert (session.run_dir / "helper.py").read_text() == "def add(a, b):\n    return a + b"
 
 
+def test_a_file_the_critic_disagrees_with_does_not_sink_the_run(tmp_path: Path):
+    config = make_config(tmp_path, critic_enabled=True, max_fix_attempts=1)
+    session = Session.create(config.workspace_root)
+    disagree = '{"follows_spec": false, "issues": "does not handle negative numbers"}'
+    agree = '{"follows_spec": true, "issues": ""}'
+    client = FakeClient(
+        [
+            _PLAN_TWO_FILES,
+            "- add two numbers",  # spec for helper.py
+            "def add(a, b):\n    return a + b\n",  # codegen for helper.py
+            disagree,  # critic: no
+            "def add(a, b):\n    return a + b\n",  # fix attempt 1 (unchanged -- still correct)
+            disagree,  # critic: still no -- fix attempts exhausted
+            "- call add and print it",  # spec for main.py
+            (
+                "from helper import add\n\n\n"
+                "def main():\n    print(add(2, 3))\n\n\n"
+                'if __name__ == "__main__":\n    main()\n'
+            ),  # codegen for main.py
+            agree,  # critic: main.py is fine
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("a script that adds two numbers")
+
+    # The critic's opinion never gets the final word over real tooling --
+    # helper.py compiles, lints, and imports clean, so the run succeeds.
+    assert result.success
+    assert result.integration is not None and result.integration.success
+    helper = next(f for f in result.files if f.path.endswith("helper.py"))
+    assert not helper.success  # honest: the critic's verdict was "no"
+    assert helper.spec_flagged
+    assert "negative numbers" in helper.last_output
+    # main.py still saw helper.py's real source as sibling context, even
+    # though helper.py is only spec_flagged, not plain "success".
+    main_codegen_call = client.calls[7]
+    assert "def add(a, b):" in main_codegen_call
+
+
 def test_codegen_instruction_carries_the_sibling_modules_already_built(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
