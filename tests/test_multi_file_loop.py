@@ -349,8 +349,8 @@ def test_two_endpoints_build_independent_files_in_parallel(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
     barrier = threading.Barrier(2, timeout=5)
-    x = FakeClient(list(_GENERIC), first_call_barrier=barrier)
-    y = FakeClient(list(_GENERIC), first_call_barrier=barrier)
+    x = FakeClient(list(_GENERIC), first_call_barrier=barrier, host="http://endpoint-x")
+    y = FakeClient(list(_GENERIC), first_call_barrier=barrier, host="http://endpoint-y")
 
     result = MultiFileLoop(
         FakeClient([_LEAF_PAIR_PLAN]), config, session, pool_clients=[x, y]
@@ -360,6 +360,14 @@ def test_two_endpoints_build_independent_files_in_parallel(tmp_path: Path):
     assert {Path(f.path).name for f in result.files} == {"a.py", "b.py"}
     # the barrier only releases once BOTH endpoints have started a file
     assert x.calls and y.calls
+    # ...and which endpoint built which file is visible in the log, not
+    # just inferable from the fact that both clients got called. Which
+    # worker claims which file is a race, so only assert both endpoints
+    # were used and each file is attributed to exactly one of them.
+    events = [json.loads(line) for line in session.log_path.read_text().splitlines()]
+    codegen_endpoints = {e["path"].split("/")[-1]: e["endpoint"] for e in events if e["event"] == "codegen"}
+    assert set(codegen_endpoints) == {"a.py", "b.py"}
+    assert set(codegen_endpoints.values()) == {"http://endpoint-x", "http://endpoint-y"}
 
 
 def test_a_dependent_is_built_after_its_dependency_and_sees_its_source(tmp_path: Path):

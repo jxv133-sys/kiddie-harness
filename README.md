@@ -227,11 +227,13 @@ type a goal, hit **Generate**. **+ second endpoint** adds a parallel
 backend. The progress log streams in as it happens (`[plan]`,
 `[codegen]`, `[verify:*]`, `[fix]`, ...), a small strip tracks files /
 fix attempts / LLM calls / elapsed time, and the final verdict and
-per-file table drop in when the run finishes. A **Files** panel lists
-each generated file with its pass/fail status as it's built, plus the
-overall **Plan** and each file's **spec** for a multi-file run; clicking
-any of them opens its content in a small window over the page, kept
-live while it's open. **Stop** cancels a run in progress — the GUI
+per-file table drop in when the run finishes (with two endpoints, the
+log lines and each file's row show which one built it, e.g. `[codegen]
+b.py @ http://localhost:11434`). A **Files** panel lists each generated
+file with its pass/fail status as it's built, plus the overall **Plan**
+and each file's **spec** for a multi-file run; clicking any of them
+opens its content in a small window over the page, kept live while it's
+open. **Stop** cancels a run in progress — the GUI
 is free to start a new one right away even if the model is still mid-call
 underneath. The gear icon opens a **settings** panel for the retry/token/
 temperature/timeout knobs that are otherwise only in `config/default.yaml`;

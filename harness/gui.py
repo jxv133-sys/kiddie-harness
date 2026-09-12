@@ -499,6 +499,7 @@ class _Handler(BaseHTTPRequestHandler):
             return {"files": [], "has_plan": False}
         status_by_name: dict[str, str] = {}
         spec_names: set[str] = set()
+        endpoint_by_name: dict[str, str] = {}
         has_plan = False
         log_path = run_dir / "log.jsonl"
         if log_path.exists():
@@ -509,10 +510,16 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     status_by_name[name] = "ok" if f.success else "failed"
             for record in self._iter_log_events(run_id):
-                if record.get("event") == "plan":
+                event = record.get("event")
+                if event == "plan":
                     has_plan = True
-                elif record.get("event") == "spec":
+                elif event == "spec":
                     spec_names.add(Path(record.get("path", "")).name)
+                elif event == "codegen" and record.get("endpoint"):
+                    # The same worker (client/endpoint) owns a file for
+                    # its whole build, so this is set once and stays --
+                    # last-write-wins is only relevant if it ever isn't.
+                    endpoint_by_name[Path(record.get("path", "")).name] = record["endpoint"]
         files = []
         for p in sorted(run_dir.glob("*.py")):
             files.append(
@@ -521,6 +528,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "status": status_by_name.get(p.name, "pending"),
                     "size": p.stat().st_size,
                     "has_spec": p.name in spec_names,
+                    "endpoint": endpoint_by_name.get(p.name, ""),
                 }
             )
         return {"files": files, "has_plan": has_plan}
@@ -690,7 +698,12 @@ _INDEX_HTML = """<!doctype html>
   .file-list div:first-child { border-top:0; }
   .file-list div:hover { background:color-mix(in srgb, var(--fg) 7%, transparent); }
   .file-list div .fname { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .file-list div .fspec { font-size:10.5px; color:var(--muted); cursor:pointer; flex:0 0 auto;
+                           text-decoration:underline; text-underline-offset:2px; }
+  .file-list div .fspec:hover { color:var(--accent); }
   .file-list div .fsize { color:var(--muted); font-size:11px; flex:0 0 auto; }
+  .file-list div .fep { font-size:10px; color:var(--muted); flex:0 0 auto; padding:1px 6px;
+                         border-radius:4px; background:color-mix(in srgb, var(--fg) 8%, transparent); }
   .file-dot { width:7px; height:7px; border-radius:50%; flex:0 0 auto; background:var(--muted); }
   .file-dot.ok { background:var(--ok); }
   .file-dot.failed { background:var(--bad); }
@@ -924,6 +937,10 @@ function shortPath(p) {
   } catch (e) { return p; }
 }
 
+function shortHost(h) {
+  return h.replace("https://", "").replace("http://", "");
+}
+
 async function pollActive() {
   try {
     const { url } = tagUrl("/api/requests");
@@ -955,6 +972,11 @@ async function refreshFiles(runId) {
   if (!files.length && !hasPlan) { panel.hidden = true; return; }
   panel.hidden = false;
 
+  // Only worth a badge once there's actually more than one endpoint in
+  // play for this run -- the common single-endpoint case would just see
+  // the same host repeated on every row.
+  const showEndpoints = new Set(files.map(f => f.endpoint).filter(Boolean)).size > 1;
+
   let html = hasPlan
     ? `<div data-kind="plan"><span class="file-dot"></span><span class="fname">Plan</span></div>`
     : "";
@@ -962,9 +984,12 @@ async function refreshFiles(runId) {
     const spec = f.has_spec
       ? `<span class="fspec" data-kind="spec" data-name="${esc(f.name)}">spec</span>`
       : "";
+    const ep = showEndpoints && f.endpoint
+      ? `<span class="fep" title="${esc(f.endpoint)}">${esc(shortHost(f.endpoint))}</span>`
+      : "";
     return `<div data-kind="code" data-name="${esc(f.name)}">`
       + `<span class="file-dot ${f.status}"></span>`
-      + `<span class="fname">${esc(f.name)}</span>${spec}`
+      + `<span class="fname">${esc(f.name)}</span>${spec}${ep}`
       + `<span class="fsize">${f.size}b</span></div>`;
   }).join("");
   list.innerHTML = html;

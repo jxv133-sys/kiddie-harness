@@ -158,7 +158,19 @@ regardless of interleaving.
 
 ## What shipped
 
-All three phases, TDD, no live run yet.
+All three phases, TDD. **Since verified live** (2026-09-12) against two
+real Ollama backends (a Dockerized instance on this box at `:7869` and a
+separate native instance at `:11434`, different models on each) with a
+goal planned into two independent leaf files plus a dependent `main.py`
+— both endpoints picked up a leaf concurrently, the dependent file was
+built after on whichever endpoint freed up first, integration passed.
+That first live attempt also surfaced two real gaps, now fixed:
+`RunManager` had no way to cancel a stuck/slow run, so it could hold the
+GUI's one-run-at-a-time lock indefinitely and make dual-endpoint look
+broken simply because nothing new could start; and no log event
+recorded *which* endpoint built a given file, so even correct dispatch
+was invisible. See `harness/gui.py`'s `RunManager.cancel()` and the
+`endpoint=` field on `codegen`/`fix`/`spec` log events.
 
 - **`FileTask.depends_on`** — `plan.md` + `PLAN_SCHEMA` ask for it; the
   planner's list is restricted to *earlier* files (acyclic by

@@ -139,8 +139,12 @@ core design, not just style.
 
 Single-file loop → multi-file planning → hardening/observability →
 minimal web GUI → parallel dual-endpoint dispatch are complete. The
-dual-endpoint work is unit-tested but **not yet exercised against two
-live models** — see `docs/design/2026-09-10-dual-endpoint-parallelism.md`.
+dual-endpoint work **is now verified against two live, real Ollama
+backends** — `harness run --multi-file --endpoint http://<remote>,llama3.2:latest
+--endpoint http://localhost:11434,<local-model>` against a goal with
+genuinely independent files planned two leaf modules onto the two
+endpoints concurrently, then built the dependent file after, all
+`[ok]`. See `docs/design/2026-09-10-dual-endpoint-parallelism.md`.
 
 **A real GUI run against `deepseek-r1:7b` surfaced the actual reason the
 dual-endpoint feature looked broken in practice: `RunManager` had no way
@@ -155,7 +159,20 @@ chain (`core → auth → web`) even with two endpoints configured — the
 dispatcher has nothing to parallelize when every file depends on the
 one before it. `plan.md` now tells the model `depends_on` means "has an
 `import` for," not "came after," since a weak model defaults to
-narrative build order otherwise; unverified against a live model yet.
+narrative build order otherwise -- confirmed live: a later 3-file goal
+with two genuinely independent modules got exactly that shape from the
+planner and both endpoints fired at once.
+
+**The other half of "not seeing it call the second endpoint": nothing
+recorded which endpoint built which file.** Dispatch could be working
+correctly and still look broken with no way to tell. `codegen`/`fix`/
+`spec` log events now carry `endpoint=client.host`; the live progress
+line shows it (`[codegen] b.py @ http://localhost:11434`, `spec` too --
+`fix` omits it since a retry never changes which worker owns the file),
+and the GUI's Files panel shows a small host badge per file, but only
+once a run's files actually used more than one endpoint (a single-
+endpoint run would just see the same badge on every row, so it's
+suppressed).
 
 **The small model no longer writes tests.** An earlier phase had
 `MultiFileLoop` generate a `test_*.py` for every implementation file

@@ -40,11 +40,13 @@ class FakeClient:
         *,
         delay: float = 0.0,
         first_call_barrier: threading.Barrier | None = None,
+        host: str = "http://fake",
     ):
         self._responses = list(responses)
         self._delay = delay
         self._barrier = first_call_barrier
         self._seen_first = False
+        self.host = host
         self.calls: list[str] = []
         self.max_tokens_calls: list[int] = []
         self.temperature_calls: list[float] = []

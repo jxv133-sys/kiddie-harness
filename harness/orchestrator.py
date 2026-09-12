@@ -133,7 +133,9 @@ def _generate_and_fix(
         client, instruction, temperature=config.temperature, max_tokens=max_tokens
     )
     code = gen.code
-    session.log("codegen", path=str(file_path), code=code, truncated=gen.truncated)
+    session.log(
+        "codegen", path=str(file_path), code=code, truncated=gen.truncated, endpoint=client.host
+    )
     if gen.truncated:
         max_tokens = min(max_tokens * 2, config.max_tokens_ceiling)
 
@@ -188,7 +190,14 @@ def _generate_and_fix(
         )
         code = gen.code
         attempts += 1
-        session.log("fix", path=str(file_path), attempt=attempts, code=code, truncated=gen.truncated)
+        session.log(
+            "fix",
+            path=str(file_path),
+            attempt=attempts,
+            code=code,
+            truncated=gen.truncated,
+            endpoint=client.host,
+        )
         if gen.truncated:
             max_tokens = min(max_tokens * 2, config.max_tokens_ceiling)
 
@@ -486,7 +495,7 @@ class MultiFileLoop:
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
         )
-        self.session.log("spec", path=task.path, spec=spec_text)
+        self.session.log("spec", path=task.path, spec=spec_text, endpoint=client.host)
 
         file_path = self.session.run_dir / _safe_relative_path(task.path)
         file_path.parent.mkdir(parents=True, exist_ok=True)

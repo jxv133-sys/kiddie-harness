@@ -19,12 +19,24 @@ def test_format_event_spec():
     assert format_event("spec", {"path": "main.py", "spec": "- x"}) == "[spec] main.py"
 
 
+def test_format_event_spec_notes_which_endpoint_wrote_it():
+    line = format_event("spec", {"path": "main.py", "spec": "- x", "endpoint": "http://h2:11434"})
+    assert line == "[spec] main.py @ http://h2:11434"
+
+
 def test_format_event_codegen_and_codegen_truncated():
     assert format_event("codegen", {"path": "main.py", "code": "x", "truncated": False}) == "[codegen] main.py"
     assert (
         format_event("codegen", {"path": "main.py", "code": "x", "truncated": True})
         == "[codegen] main.py (truncated)"
     )
+
+
+def test_format_event_codegen_notes_which_endpoint_built_it():
+    line = format_event(
+        "codegen", {"path": "b.py", "code": "x", "truncated": False, "endpoint": "http://h2:11434"}
+    )
+    assert line == "[codegen] b.py @ http://h2:11434"
 
 
 def test_format_event_verify_success_and_failure():

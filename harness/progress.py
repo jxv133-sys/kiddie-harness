@@ -12,6 +12,15 @@ from __future__ import annotations
 from collections.abc import Callable
 
 
+def _endpoint_note(fields: dict) -> str:
+    """" @ <host>" when this call carries which endpoint handled it (only
+    logged for multi-file work) -- makes a second/third --endpoint
+    actually visible while it's happening, not just inferable after the
+    fact from timing."""
+    endpoint = fields.get("endpoint")
+    return f" @ {endpoint}" if endpoint else ""
+
+
 def format_event(event: str, fields: dict) -> str | None:
     """One line per event, or None to stay silent.
 
@@ -24,11 +33,11 @@ def format_event(event: str, fields: dict) -> str | None:
         return f"[plan] {len(fields['files'])} file(s) planned"
 
     if event == "spec":
-        return f"[spec] {fields['path']}"
+        return f"[spec] {fields['path']}{_endpoint_note(fields)}"
 
     if event == "codegen":
         note = " (truncated)" if fields.get("truncated") else ""
-        return f"[codegen] {fields['path']}{note}"
+        return f"[codegen] {fields['path']}{note}{_endpoint_note(fields)}"
 
     if event == "verify":
         status = "ok" if fields["success"] else "FAILED"

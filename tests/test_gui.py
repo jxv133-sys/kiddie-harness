@@ -385,6 +385,8 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
     records = [
         {"event": "plan", "files": [{"path": "core.py", "purpose": "x", "depends_on": []}]},
         {"event": "spec", "path": "core.py", "spec": "- set x to 1"},
+        {"event": "codegen", "path": str(run_dir / "core.py"), "code": "x = 1\n",
+         "truncated": False, "endpoint": "http://second:11434"},
         {"event": "verify", "path": str(run_dir / "core.py"), "attempt": 0,
          "stage": "compile", "success": True, "output": ""},
     ]
@@ -401,7 +403,15 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
             ).read()
         )
         assert body["has_plan"] is True
-        assert body["files"] == [{"name": "core.py", "status": "ok", "size": 6, "has_spec": True}]
+        assert body["files"] == [
+            {
+                "name": "core.py",
+                "status": "ok",
+                "size": 6,
+                "has_spec": True,
+                "endpoint": "http://second:11434",
+            }
+        ]
 
         content = json.loads(
             urllib.request.urlopen(
