@@ -77,6 +77,12 @@ class OllamaClient:
             resp.raise_for_status()
         except requests.RequestException as exc:
             raise OllamaError(f"Could not reach Ollama at {self.host}: {exc}") from exc
+        except ValueError as exc:
+            # requests rejects timeout=0 outright (raises here, before any
+            # network I/O) rather than treating it as "no timeout" -- a 0
+            # (or other invalid) timeout_seconds must surface as a clean,
+            # handled error like any other call failure, not a raw crash.
+            raise OllamaError(f"Invalid call to Ollama at {self.host}: {exc}") from exc
 
         try:
             data = resp.json()
