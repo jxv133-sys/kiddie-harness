@@ -25,9 +25,9 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from . import progress, summary
-from .config import DEFAULT_CONFIG_PATH, Config
+from .config import DEFAULT_CONFIG_PATH, Config, Endpoint
 from .llm_client import OllamaClient
-from .orchestrator import MultiFileLoop, SingleFileLoop
+from .orchestrator import MultiFileLoop, SingleFileLoop, partition_clients_by_role
 from .session import Session
 
 # Config fields the settings screen can change. Persisted alongside the
@@ -224,20 +224,26 @@ class RunManager:
     ) -> None:
         run_id = session.run_id
         try:
-            pool = [
-                self._client_factory(
-                    e["host"], e.get("model") or config.model, config.timeout_seconds
+            eps = [
+                Endpoint(
+                    e["host"],
+                    e.get("model") or config.model,
+                    config.timeout_seconds,
+                    role=e.get("role") or "balanced",
                 )
                 for e in endpoints
             ]
+            pool = [self._client_factory(e.host, e.model, e.timeout_seconds) for e in eps]
             if multi_file:
+                primary, workers, critic_client = partition_clients_by_role(eps, pool)
                 MultiFileLoop(
-                    pool[0],
+                    primary,
                     config,
                     session,
-                    pool_clients=pool,
+                    pool_clients=workers,
                     cancel_event=cancel_event,
                     pause_event=pause_event,
+                    critic_client=critic_client,
                 ).run(goal)
             else:
                 SingleFileLoop(
@@ -833,6 +839,8 @@ _INDEX_HTML = """<!doctype html>
   textarea { resize:vertical; min-height:76px; }
   .row { display:flex; gap:12px; }
   .row > div { flex:1; }
+  .row > .role-col { flex:0 0 96px; }
+  .role-col select { padding:9px 4px; text-align:center; }
   .check { display:flex; align-items:center; gap:8px; margin-top:14px; font-size:13px; color:var(--muted); }
   .check input { width:auto; }
   button { margin-top:20px; width:100%; padding:11px; border:0; border-radius:8px;
@@ -930,8 +938,10 @@ _INDEX_HTML = """<!doctype html>
   /* -- dependency graph: doubles as the to-do list -- */
   .graph-wrap { overflow-x:auto; padding:2px 0 4px; }
   .graph-empty { color:var(--muted); font-size:13px; padding:4px 0; }
+  .graph-hint { color:var(--muted); font-size:10.5px; margin:0 0 6px; }
   .dep-svg { display:block; margin:0 auto; }
-  .dep-node-rect { fill:var(--bg); stroke:var(--line); stroke-width:1.5; cursor:pointer; }
+  .dep-node-rect { fill:var(--bg); stroke:var(--line); stroke-width:1.5; cursor:pointer;
+                    transition:opacity .15s ease, stroke-width .15s ease; }
   .dep-node-rect:hover { stroke:var(--accent); }
   .dep-node-rect.pending { stroke-dasharray:4 3; }
   .dep-node-rect.building { stroke:var(--accent); stroke-width:2; }
@@ -942,16 +952,27 @@ _INDEX_HTML = """<!doctype html>
   .dep-node-rect.skipped { stroke:var(--muted); stroke-dasharray:2 2; }
   .dep-node-group { cursor:pointer; }
   .dep-node-name { font:600 11px ui-monospace,SFMono-Regular,Menlo,monospace; fill:var(--fg);
-                    pointer-events:none; }
+                    pointer-events:none; transition:opacity .15s ease; }
   .dep-node-status { font:600 9px ui-monospace,SFMono-Regular,Menlo,monospace; pointer-events:none;
-                       text-transform:uppercase; letter-spacing:.03em; }
+                       text-transform:uppercase; letter-spacing:.03em; transition:opacity .15s ease; }
   .dep-node-status.ok { fill:var(--ok); }
   .dep-node-status.failed { fill:var(--bad); }
   .dep-node-status.advisory { fill:var(--warn); }
   .dep-node-status.flagged { fill:var(--accent); }
   .dep-node-status.building { fill:var(--accent); }
   .dep-node-status.pending, .dep-node-status.skipped { fill:var(--muted); }
-  .dep-edge { fill:none; stroke:var(--line); stroke-width:1.3; }
+  /* Hovering a node highlights its own edges/neighbours (set via JS) and
+     dims everything else -- with more than a handful of files, which
+     line belongs to which box stops being obvious from color alone. */
+  .dep-node-group.dim .dep-node-rect,
+  .dep-node-group.dim .dep-node-name,
+  .dep-node-group.dim .dep-node-status { opacity:.3; }
+  .dep-node-group.hl .dep-node-rect { stroke-width:2.5; }
+  .dep-edge { fill:none; stroke:var(--muted); stroke-width:1.6; opacity:.65;
+               transition:opacity .15s ease, stroke .15s ease, stroke-width .15s ease; }
+  .dep-edge.hl { stroke:var(--accent); stroke-width:2.4; opacity:1; }
+  .dep-edge.dim { opacity:.08; }
+  .dep-arrowhead { fill:var(--muted); }
   .graph-legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin-top:8px; font-size:10.5px;
                    color:var(--muted); }
   .graph-legend span { display:inline-flex; align-items:center; gap:4px; }
@@ -1003,6 +1024,13 @@ _INDEX_HTML = """<!doctype html>
   <div class="row">
     <div><select id="model"></select></div>
     <div><input type="text" id="host" placeholder="http://localhost:11434"></div>
+    <div class="role-col">
+      <select id="role" title="Balanced does both plan/critic and per-file work. Smart handles plan/critic/integration-fix only. Quick does the per-file spec/codegen/fix grind only.">
+        <option value="balanced" selected>Balanced</option>
+        <option value="smart">Smart</option>
+        <option value="quick">Quick</option>
+      </select>
+    </div>
   </div>
   <button type="button" id="refresh" class="link">&#8635; re-fetch models</button>
 
@@ -1032,6 +1060,7 @@ _INDEX_HTML = """<!doctype html>
   <pre id="log"></pre>
   <div class="files-panel" id="files-panel" hidden>
     <label>Files <span id="plan-link-wrap" style="text-transform:none;letter-spacing:0;font-size:11px"></span></label>
+    <div class="graph-hint" id="graph-hint" hidden>hover a file to trace what it depends on and what needs it &mdash; an arrow points from a dependency to the file that needs it</div>
     <div class="graph-wrap" id="graph-wrap"></div>
     <div class="graph-legend" id="graph-legend" hidden>
       <span><i class="pending"></i>pending</span>
@@ -1089,7 +1118,12 @@ function addEndpointRow() {
   row.innerHTML =
     `<label>Endpoint <span style="text-transform:none;letter-spacing:0">(parallel, multi-file only)</span></label>` +
     `<div class="row"><div><select id="model${suffix}"></select></div>` +
-    `<div><input type="text" id="host${suffix}" placeholder="http://localhost:11434"></div></div>` +
+    `<div><input type="text" id="host${suffix}" placeholder="http://localhost:11434"></div>` +
+    `<div class="role-col"><select id="role${suffix}">` +
+    `<option value="balanced" selected>Balanced</option>` +
+    `<option value="smart">Smart</option>` +
+    `<option value="quick">Quick</option>` +
+    `</select></div></div>` +
     `<button type="button" id="refresh${suffix}" class="link">&#8635; re-fetch models</button>` +
     `<button type="button" class="endpoint-remove" title="remove this endpoint">&times;</button>`;
   $("#endpoints-extra").appendChild(row);
@@ -1335,6 +1369,7 @@ async function refreshFiles(runId) {
   }
 
   $("#graph-legend").hidden = false;
+  $("#graph-hint").hidden = false;
   renderGraph(files, runId);
 
   // A window left open while its file is still being rewritten stays
@@ -1394,34 +1429,74 @@ function renderGraph(files, runId) {
     });
   });
 
+  // Reverse map ("needed by") purely for the tooltip -- the arrows
+  // themselves already show it, but a native title works without a
+  // precise hover and reads fine on a trackpad or a small graph alike.
+  const neededBy = {};
+  files.forEach(f => {
+    (f.depends_on || []).forEach(dep => {
+      (neededBy[dep] || (neededBy[dep] = [])).push(f.name);
+    });
+  });
+
   let edges = "";
   files.forEach(f => {
     (f.depends_on || []).forEach(dep => {
       const from = pos[dep], to = pos[f.name];
       if (!from || !to) return;
       const midY = (from.bottom + to.top) / 2;
-      edges += `<path class="dep-edge" d="M${from.cx},${from.bottom} `
-        + `C${from.cx},${midY} ${to.cx},${midY} ${to.cx},${to.top}" />`;
+      edges += `<path class="dep-edge" marker-end="url(#dep-arrow)" `
+        + `data-from="${esc(dep)}" data-to="${esc(f.name)}" `
+        + `d="M${from.cx},${from.bottom} C${from.cx},${midY} ${to.cx},${midY} ${to.cx},${to.top}" />`;
     });
   });
 
   let nodes = "";
   files.forEach(f => {
     const p = pos[f.name];
-    const title = esc(f.purpose ? `${f.name} \\u2014 ${f.purpose}` : f.name);
+    const deps = f.depends_on || [];
+    const dependents = neededBy[f.name] || [];
+    let title = f.purpose ? `${f.name} \\u2014 ${f.purpose}` : f.name;
+    title += deps.length ? `\\ndepends on: ${deps.join(", ")}` : "\\ndepends on: (nothing)";
+    title += dependents.length ? `\\nneeded by: ${dependents.join(", ")}` : "\\nneeded by: (nothing yet)";
     const label = f.name.length > 16 ? f.name.slice(0, 14) + "\\u2026" : f.name;
     nodes += `<g class="dep-node-group" data-name="${esc(f.name)}">`
       + `<rect class="dep-node-rect ${f.status}" x="${p.x}" y="${p.top}" `
-      + `width="${NODE_W}" height="${NODE_H}" rx="7"><title>${title}</title></rect>`
+      + `width="${NODE_W}" height="${NODE_H}" rx="7"><title>${esc(title)}</title></rect>`
       + `<text class="dep-node-name" x="${p.cx}" y="${p.top + 17}" text-anchor="middle">${esc(label)}</text>`
       + `<text class="dep-node-status ${f.status}" x="${p.cx}" y="${p.top + 30}" text-anchor="middle">`
       + `${_STATUS_LABEL[f.status] || esc(f.status)}</text></g>`;
   });
 
+  const defs = `<defs><marker id="dep-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" `
+    + `markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">`
+    + `<path class="dep-arrowhead" d="M0,0 L10,5 L0,10 z"></path></marker></defs>`;
   wrap.innerHTML = `<svg class="dep-svg" viewBox="0 0 ${width} ${height}" `
-    + `width="${width}" height="${height}">${edges}${nodes}</svg>`;
-  wrap.querySelectorAll(".dep-node-group").forEach(el => {
-    el.addEventListener("click", () => openFileWindow(runId, "code", el.dataset.name));
+    + `width="${width}" height="${height}">${defs}${edges}${nodes}</svg>`;
+
+  const edgeEls = wrap.querySelectorAll(".dep-edge");
+  const nodeEls = wrap.querySelectorAll(".dep-node-group");
+  const clearHighlight = () => {
+    edgeEls.forEach(e => e.classList.remove("hl", "dim"));
+    nodeEls.forEach(n => n.classList.remove("hl", "dim"));
+  };
+  nodeEls.forEach(el => {
+    const name = el.dataset.name;
+    el.addEventListener("mouseenter", () => {
+      const related = new Set([name]);
+      edgeEls.forEach(e => {
+        if (e.dataset.from === name || e.dataset.to === name) {
+          e.classList.add("hl");
+          related.add(e.dataset.from);
+          related.add(e.dataset.to);
+        } else {
+          e.classList.add("dim");
+        }
+      });
+      nodeEls.forEach(n => n.classList.add(related.has(n.dataset.name) ? "hl" : "dim"));
+    });
+    el.addEventListener("mouseleave", clearHighlight);
+    el.addEventListener("click", () => openFileWindow(runId, "code", name));
   });
 }
 
@@ -1526,7 +1601,8 @@ function beginTracking() {
   stopBtn.disabled = false;
   setPausedUI(false);
   logEl.textContent = ""; $("#summary").innerHTML = "";
-  $("#files-panel").hidden = true; $("#graph-wrap").innerHTML = ""; $("#graph-legend").hidden = true;
+  $("#files-panel").hidden = true; $("#graph-wrap").innerHTML = "";
+  $("#graph-legend").hidden = true; $("#graph-hint").hidden = true;
   $("#phase-stepper").hidden = false;
   updatePhaseStepper("planning", false);
   closeFileWindow();
@@ -1580,10 +1656,14 @@ $("#go").addEventListener("click", async () => {
     multi_file: $("#multi").checked,
   };
   const extras = extraEpIds
-    .map(suffix => ({ host: $("#host" + suffix).value.trim(), model: $("#model" + suffix).value }))
+    .map(suffix => ({
+      host: $("#host" + suffix).value.trim(),
+      model: $("#model" + suffix).value,
+      role: $("#role" + suffix).value,
+    }))
     .filter(e => e.host);
   if (extras.length) {
-    body.endpoints = [{ host: body.host, model: body.model }, ...extras];
+    body.endpoints = [{ host: body.host, model: body.model, role: $("#role").value }, ...extras];
   }
   const { url: runUrl } = tagUrl("/api/run");
   let res;

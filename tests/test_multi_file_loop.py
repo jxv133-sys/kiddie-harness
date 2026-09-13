@@ -469,6 +469,12 @@ def test_a_dead_endpoint_does_not_sink_a_run_another_endpoint_can_finish(tmp_pat
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
     good = FakeClient(["- spec", "def thing():\n    return 1\n"] * 2, delay=0.05)
+    # Exactly one queued OllamaError, no more -- proves the dead endpoint
+    # is retired on the *first* failure, not retried in place, since a
+    # second attempt would find its queue empty and crash the worker
+    # thread with an AssertionError instead of cleanly failing over. A
+    # good endpoint is still active, so there's no reason to wait out a
+    # retry here rather than handing the file off immediately.
     dead = FakeClient([OllamaError("endpoint B is down")])
 
     result = MultiFileLoop(
@@ -484,6 +490,49 @@ def test_a_dead_endpoint_does_not_sink_a_run_another_endpoint_can_finish(tmp_pat
     retired = [e for e in events if e["event"] == "endpoint_retired"]
     assert len(retired) == 1
     assert retired[0]["reason"] == "endpoint B is down"
+
+
+def test_a_transient_blip_recovers_via_retry_when_no_other_endpoint_exists(tmp_path: Path):
+    # The flip side of the "dead endpoint hands off immediately" test
+    # above: with only one endpoint, there's no one to hand off to, so a
+    # transient failure should be retried in place instead of aborting
+    # the whole run over what clears up a moment later.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "a.py", "purpose": "x", "depends_on": []}]})
+    client = FakeClient(
+        [
+            plan,
+            OllamaError("connection reset"),  # transient -- spec for a.py, first try
+            "- spec",  # succeeds on retry
+            "def thing():\n    return 1\n",
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("goal")
+
+    assert result.success
+    assert not result.aborted
+    assert len(client.calls) == 4
+
+
+def test_a_transient_blip_during_planning_recovers_via_retry(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "a.py", "purpose": "x", "depends_on": []}]})
+    client = FakeClient(
+        [
+            OllamaError("connection reset"),  # transient -- plan, first try
+            plan,  # succeeds on retry
+            "- spec",
+            "def thing():\n    return 1\n",
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("goal")
+
+    assert result.success
+    assert not result.aborted
 
 
 def test_an_idle_worker_does_not_retire_just_because_the_only_file_is_already_claimed(
@@ -525,7 +574,12 @@ def test_run_aborts_gracefully_when_the_model_becomes_unreachable(tmp_path: Path
             _PLAN_TWO_FILES,
             "- add two numbers",  # spec for helper.py
             "def add(a, b):\n    return a + b\n",  # helper.py codegen
-            OllamaError("Read timed out"),  # spec for main.py -- host gone
+            # spec for main.py -- host gone. The sole worker retries its
+            # own endpoint (there's no other to fall back to) up to
+            # _ENDPOINT_RETRY_ATTEMPTS times before the run truly aborts.
+            OllamaError("Read timed out"),
+            OllamaError("Read timed out"),
+            OllamaError("Read timed out"),
         ]
     )
 
@@ -559,6 +613,32 @@ def test_integration_fix_writes_corrected_code_to_the_implicated_file(tmp_path: 
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
     loop = MultiFileLoop(FakeClient(["def test_thing():\n    assert True\n"]), config, session)
+
+    test_path = session.run_dir / "test_thing.py"
+    test_path.write_text("def test_thing():\n    assert False\n")
+
+    tasks = [FileTask(path="thing.py", purpose="x")]
+    result, _iterations = loop._run_integration_with_fixes(
+        tasks, [test_path], has_tests=True, iterations=1
+    )
+
+    assert test_path.read_text() == "def test_thing():\n    assert True"
+    assert result.success
+
+
+def test_integration_fix_recovers_from_a_transient_connection_blip(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    loop = MultiFileLoop(
+        FakeClient(
+            [
+                OllamaError("connection reset"),  # transient -- first attempt
+                "def test_thing():\n    assert True\n",  # succeeds on retry
+            ]
+        ),
+        config,
+        session,
+    )
 
     test_path = session.run_dir / "test_thing.py"
     test_path.write_text("def test_thing():\n    assert False\n")

@@ -12,11 +12,22 @@ ollama:
 # multi-file loop runs one worker per endpoint and builds files whose
 # dependencies are done concurrently. Omit (or leave empty) to use only
 # `ollama.host` above. `model` / `timeout_seconds` default to the values
-# under `ollama`. Also settable per run with repeated --endpoint HOST,MODEL.
+# under `ollama`. Also settable per run with repeated --endpoint HOST,MODEL[,ROLE].
+#
+# `role` (optional, default "balanced") tags what an endpoint is for --
+# see the README's "Model roles" section:
+#   smart    -- plan / critic / integration-fix (the judgement calls);
+#               excluded from per-file generation.
+#   quick    -- the per-file spec/codegen/fix grind only.
+#   balanced -- does either. The default; an endpoint with no role (or
+#               every endpoint on "balanced") behaves exactly as if
+#               roles didn't exist at all.
 # endpoints:
 #   - host: "http://192.168.50.142:7869"
+#     role: "smart"
 #   - host: "http://localhost:11434"
 #     model: "qwen2.5-coder:7b"
+#     role: "quick"
 
 generation:
   # Kept low and stable on purpose: small models drift more at higher temperature,

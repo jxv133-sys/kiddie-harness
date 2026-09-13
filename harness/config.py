@@ -10,6 +10,13 @@ import yaml
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
 
 
+#: What an endpoint is for, see orchestrator.partition_clients_by_role.
+#: "balanced" (the default) means "no opinion" -- an endpoint tagged this
+#: way (or every endpoint, if none are tagged at all) does everything,
+#: exactly like before this existed.
+ROLES = ("smart", "quick", "balanced")
+
+
 @dataclasses.dataclass(frozen=True)
 class Endpoint:
     """One Ollama backend the multi-file loop can dispatch a file to."""
@@ -17,6 +24,10 @@ class Endpoint:
     host: str
     model: str
     timeout_seconds: int
+    # "smart" (bigger/slower/more careful -- plan, critic, integration
+    # fixes), "quick" (smaller/faster -- the high-volume per-file spec/
+    # codegen/fix grind), or "balanced" (does either, see ROLES above).
+    role: str = "balanced"
 
 
 @dataclasses.dataclass
@@ -52,6 +63,7 @@ class Config:
                 host=e["host"],
                 model=e.get("model", ollama["model"]),
                 timeout_seconds=e.get("timeout_seconds", ollama["timeout_seconds"]),
+                role=e.get("role") or "balanced",
             )
             for e in (raw.get("endpoints") or [])
         )

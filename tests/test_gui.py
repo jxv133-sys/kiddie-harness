@@ -91,6 +91,38 @@ def test_run_manager_builds_one_client_per_endpoint(tmp_path: Path):
     assert manager.status()["state"] == "done"
 
 
+def test_run_manager_routes_critic_and_plan_to_the_smart_endpoint(tmp_path: Path):
+    config = make_config(tmp_path, critic_enabled=True)
+    # plan and critic (the "judgement" calls) are both expected on
+    # `smart`; spec and codegen (the per-file grind) stay on `quick`.
+    smart = FakeClient(
+        [
+            json.dumps({"files": [{"path": "a.py", "purpose": "x", "depends_on": []}]}),
+            '{"follows_spec": true, "issues": ""}',
+        ],
+        host="http://smart",
+    )
+    quick = FakeClient(["- spec", "def thing():\n    return 1\n"], host="http://quick")
+    by_host = {"http://quick": quick, "http://smart": smart}
+
+    manager = gui.RunManager(config, client_factory=lambda host, model, timeout: by_host[host])
+    manager.start(
+        goal="x",
+        model="m",
+        host="http://quick",
+        multi_file=True,
+        endpoints=[
+            {"host": "http://quick", "model": "m", "role": "quick"},
+            {"host": "http://smart", "model": "m", "role": "smart"},
+        ],
+    )
+    manager.wait(timeout=10)
+
+    assert manager.status()["state"] == "done"
+    assert len(smart.calls) == 2  # plan, critic
+    assert len(quick.calls) == 2  # spec, codegen
+
+
 def test_run_manager_rejects_a_second_run_while_one_is_active(tmp_path: Path):
     config = make_config(tmp_path)
     # a client that blocks forever on the first call keeps the run "active"

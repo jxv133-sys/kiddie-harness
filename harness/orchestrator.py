@@ -10,10 +10,12 @@ from __future__ import annotations
 import dataclasses
 import re
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
-from .config import Config
+from .config import Config, Endpoint
 from .llm_client import OllamaClient, OllamaError
 from .session import Session
 from .steps import codegen, critic, plan, spec, verify
@@ -49,6 +51,61 @@ def _wait_if_paused(
         if cancel_event is not None and cancel_event.is_set():
             raise RunCancelled("cancelled by user")
         pause_event.wait(timeout=0.5)
+
+
+_T = TypeVar("_T")
+_ENDPOINT_RETRY_ATTEMPTS = 3
+_ENDPOINT_RETRY_BACKOFF_SECONDS = 5.0
+
+
+def _with_endpoint_retry(
+    fn: Callable[[], _T],
+    *,
+    attempts: int = _ENDPOINT_RETRY_ATTEMPTS,
+    cancel_event: threading.Event | None = None,
+) -> _T:
+    """Runs `fn` (one call into `harness.steps`, backed by one specific
+    Ollama endpoint), retrying up to `attempts` times (default
+    `_ENDPOINT_RETRY_ATTEMPTS`) with a short pause between attempts if it
+    raises `OllamaError`, before letting the last one propagate. Pass a
+    smaller `attempts` when the caller already spent one itself (see the
+    worker dispatch loop) so the *total* tries against one endpoint stays
+    `_ENDPOINT_RETRY_ATTEMPTS`, not that many again on top.
+
+    This is a deliberate exception to `llm_client`'s own "never loops or
+    retries on its own" -- that principle is about the *client* not
+    deciding what happens next; this is the orchestrator doing exactly
+    that, the same way it already decides to escalate temperature on a
+    content failure. A dead connection is very often transient (Ollama
+    mid-restart, a brief Wi-Fi drop) and clears up within a few seconds;
+    only an endpoint that fails every attempt gets treated as genuinely
+    unreachable -- which, in `MultiFileLoop`'s per-file dispatch, is what
+    hands the file to a *different* endpoint if one exists (see
+    `_generate_files`'s `endpoint_retired` handling) or aborts the run if
+    it doesn't. This is the "just retry" underneath that: give the same
+    endpoint a real chance before falling back to either of those.
+
+    The backoff itself still honours `cancel_event`, polled in short
+    slices rather than one long sleep, so Stop doesn't have to wait out
+    the full pause. Deliberately does *not* check `cancel_event` before
+    the first attempt -- that's not a retry gap, it's the original call,
+    and cancellation there is `fn` itself's own responsibility (checked
+    between its own internal calls, never before the first), exactly as
+    if this wrapper didn't exist."""
+    last_exc: OllamaError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except OllamaError as exc:
+            last_exc = exc
+            if attempt < attempts:
+                deadline = time.monotonic() + _ENDPOINT_RETRY_BACKOFF_SECONDS
+                while time.monotonic() < deadline:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RunCancelled("cancelled by user") from exc
+                    time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+    assert last_exc is not None
+    raise last_exc
 
 
 @dataclasses.dataclass
@@ -134,6 +191,44 @@ _RETRY_TEMPERATURE_MAX = 0.9
 def _retry_temperature(base: float, fix_attempt: int) -> float:
     """Sampling temperature for fix attempt N (1 = first fix)."""
     return round(min(base + _RETRY_TEMPERATURE_STEP * fix_attempt, _RETRY_TEMPERATURE_MAX), 3)
+
+
+def partition_clients_by_role(
+    endpoints: list[Endpoint], clients: list[OllamaClient]
+) -> tuple[OllamaClient, list[OllamaClient], OllamaClient | None]:
+    """Splits a resolved endpoint pool into (the client for plan/critic/
+    integration-fix -- the "judgement" calls), (the pool for per-file
+    spec/codegen/fix dispatch -- the high-volume grind), and (an explicit
+    override for critic, or None).
+
+    No endpoint tagged "smart" (every one left at the "balanced" default,
+    today's only option before roles existed) reproduces today's exact
+    behaviour byte for byte: the first endpoint is the plan/integration
+    client *and* a full member of the worker pool, and the third value is
+    None -- meaning "don't override anything," so a file's own critic
+    check keeps running on whichever worker actually built that file, not
+    a fixed endpoint every file's critic gets funneled through.
+
+    A "smart"-tagged endpoint is excluded from the worker pool (the slow,
+    careful model shouldn't be spent on high-volume per-file generation)
+    and *does* become the critic override -- every file's critic check,
+    regardless of which "quick" worker built it, goes to the one model
+    asked to be careful. "quick" and "balanced" endpoints both work the
+    per-file grind; "balanced" alone (no "smart" tag anywhere) also
+    supplies the plan/integration client, same as today.
+    """
+    smart = [c for e, c in zip(endpoints, clients) if e.role == "smart"]
+    quick = [c for e, c in zip(endpoints, clients) if e.role == "quick"]
+    # Anything that isn't "smart" or "quick" -- "balanced", or a typo'd/
+    # unrecognised role -- behaves like "balanced": no endpoint silently
+    # falls out of the worker pool just because its role string doesn't
+    # match one of the two special-cased ones exactly.
+    balanced = [c for e, c in zip(endpoints, clients) if e.role not in ("smart", "quick")]
+
+    workers = quick + balanced or list(clients)
+    primary = smart[0] if smart else (balanced[0] if balanced else clients[0])
+    critic_override = smart[0] if smart else None
+    return primary, workers, critic_override
 
 
 def _generate_and_fix(
@@ -331,15 +426,18 @@ class SingleFileLoop:
             )
 
         try:
-            result, attempts = _generate_and_fix(
-                self.client,
-                self.config,
-                self.session,
-                file_path,
-                goal,
-                verify_fn,
+            result, attempts = _with_endpoint_retry(
+                lambda: _generate_and_fix(
+                    self.client,
+                    self.config,
+                    self.session,
+                    file_path,
+                    goal,
+                    verify_fn,
+                    cancel_event=self._cancel,
+                    pause_event=self._pause,
+                ),
                 cancel_event=self._cancel,
-                pause_event=self._pause,
             )
         except (OllamaError, RunCancelled) as exc:
             reason = "cancelled by user" if isinstance(exc, RunCancelled) else str(exc)
@@ -392,7 +490,11 @@ class MultiFileLoop:
     a file is claimed once every file in its `depends_on` has been built,
     so with a single endpoint this is the same serial walk as before, and
     with two it builds independent files concurrently. `plan` and the
-    integration check always run on the primary client.
+    integration check always run on the primary client. Roles
+    (see `partition_clients_by_role`) decide what `client` and
+    `pool_clients` actually are by the time they get here -- this class
+    itself doesn't know about roles at all, only about a primary client
+    and a worker pool, plus one optional override.
     """
 
     def __init__(
@@ -404,6 +506,7 @@ class MultiFileLoop:
         pool_clients: list[OllamaClient] | None = None,
         cancel_event: threading.Event | None = None,
         pause_event: threading.Event | None = None,
+        critic_client: OllamaClient | None = None,
     ):
         self.client = client
         self.config = config
@@ -411,17 +514,41 @@ class MultiFileLoop:
         self._pool = list(pool_clients) if pool_clients else [client]
         self._cancel = cancel_event
         self._pause = pause_event
+        # None (the default) means "no override" -- a file's critic check
+        # runs on whichever worker built that file, same as ever. Set by
+        # a "smart"-tagged endpoint (see partition_clients_by_role) to
+        # funnel every file's critic check through that one model
+        # instead, regardless of which "quick" worker wrote the code.
+        self._critic_client = critic_client
 
     def run(self, goal: str) -> MultiFileRunResult:
         self.session.log("goal", goal=goal)
 
-        with self.session.track_call("plan", "", self.client.host) as update:
-            tasks = plan.plan_files(
-                self.client,
-                goal,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                on_chunk=update,
+        try:
+            with self.session.track_call("plan", "", self.client.host) as update:
+                tasks = _with_endpoint_retry(
+                    lambda: plan.plan_files(
+                        self.client,
+                        goal,
+                        temperature=self.config.temperature,
+                        max_tokens=self.config.max_tokens,
+                        on_chunk=update,
+                    ),
+                    cancel_event=self._cancel,
+                )
+        except (OllamaError, RunCancelled) as exc:
+            reason = "cancelled by user" if isinstance(exc, RunCancelled) else str(exc)
+            self.session.log("run_aborted", reason=reason)
+            self.session.log("run_result", success=False)
+            return MultiFileRunResult(
+                success=False,
+                run_dir=str(self.session.run_dir),
+                files=[],
+                integration=None,
+                total_iterations=1,
+                stopped_early=False,
+                aborted=True,
+                abort_reason=reason,
             )
         self.session.log("plan", files=[dataclasses.asdict(t) for t in tasks])
 
@@ -606,9 +733,47 @@ class MultiFileLoop:
                         snapshot = list(results.values())
                     try:
                         result, used = self._build_one_file(client, goal, task, snapshot)
-                    except OllamaError as exc:
+                    except OllamaError as first_exc:
                         with cv:
-                            last_error[0] = str(exc)
+                            am_last_worker = active[0] <= 1
+                        final_exc: OllamaError = first_exc
+                        if am_last_worker:
+                            # No other endpoint to hand this file to right
+                            # now -- retry this one, with backoff, before
+                            # giving up on it. Skipped when another worker
+                            # is still active: that worker can pick this
+                            # file up immediately once it's requeued below,
+                            # which is strictly faster than waiting out a
+                            # retry here that might not even be needed.
+                            try:
+                                result, used = _with_endpoint_retry(
+                                    lambda task=task, snapshot=snapshot: self._build_one_file(
+                                        client, goal, task, snapshot
+                                    ),
+                                    # One attempt already spent above --
+                                    # this makes up the rest of
+                                    # _ENDPOINT_RETRY_ATTEMPTS, not that
+                                    # many more on top.
+                                    attempts=_ENDPOINT_RETRY_ATTEMPTS - 1,
+                                    cancel_event=self._cancel,
+                                )
+                            except OllamaError as retried_exc:
+                                final_exc = retried_exc
+                            except RunCancelled:
+                                with cv:
+                                    abort_reason[0] = abort_reason[0] or "cancelled by user"
+                                    busy[0] -= 1
+                                    cv.notify_all()
+                                return
+                            else:
+                                with cv:
+                                    iterations[0] += used
+                                    busy[0] -= 1
+                                    record(task, result)
+                                    cv.notify_all()
+                                continue
+                        with cv:
+                            last_error[0] = str(final_exc)
                             pending.insert(0, task)  # another endpoint may manage it
                             busy[0] -= 1
                             cv.notify_all()
@@ -617,7 +782,10 @@ class MultiFileLoop:
                         # quietly restarts from scratch on another worker --
                         # confusing to watch live with no explanation.
                         self.session.log(
-                            "endpoint_retired", path=task.path, endpoint=client.host, reason=str(exc)
+                            "endpoint_retired",
+                            path=task.path,
+                            endpoint=client.host,
+                            reason=str(final_exc),
                         )
                         return
                     except RunCancelled:
@@ -681,7 +849,12 @@ class MultiFileLoop:
             # fallible opinion on top adds uncertainty without a clear
             # question for it to answer.
             verify_fn = _with_critic(
-                verify_fn, client, self.config, self.session, spec_text, critic_calls
+                verify_fn,
+                self._critic_client or client,
+                self.config,
+                self.session,
+                spec_text,
+                critic_calls,
             )
         result, attempts = _generate_and_fix(
             client,
@@ -775,15 +948,18 @@ class MultiFileLoop:
             with self.session.track_call(
                 "integration_fix", str(target), self.client.host
             ) as update:
-                gen = codegen.fix_file(
-                    self.client,
-                    code=target.read_text(),
-                    error=result.output,
-                    stage=result.stage,
-                    path=str(target),
-                    temperature=_retry_temperature(self.config.temperature, rounds + 1),
-                    max_tokens=self.config.max_tokens,
-                    on_chunk=update,
+                gen = _with_endpoint_retry(
+                    lambda target=target, result=result, rounds=rounds: codegen.fix_file(
+                        self.client,
+                        code=target.read_text(),
+                        error=result.output,
+                        stage=result.stage,
+                        path=str(target),
+                        temperature=_retry_temperature(self.config.temperature, rounds + 1),
+                        max_tokens=self.config.max_tokens,
+                        on_chunk=update,
+                    ),
+                    cancel_event=self._cancel,
                 )
             target.write_text(gen.code)
             iterations += 1

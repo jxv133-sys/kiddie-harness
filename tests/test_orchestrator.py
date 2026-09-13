@@ -2,6 +2,7 @@ import json
 import threading
 from pathlib import Path
 
+from harness.llm_client import OllamaError
 from harness.orchestrator import SingleFileLoop
 from harness.session import Session
 
@@ -155,6 +156,22 @@ def test_a_cancelled_run_stops_before_the_next_fix_call(tmp_path: Path):
     assert result.aborted
     assert result.abort_reason == "cancelled by user"
     assert len(client.calls) == 1  # the fix call never went out
+
+
+def test_a_transient_connection_blip_recovers_via_retry(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            OllamaError("connection reset"),  # transient -- first codegen attempt
+            "print('hi')\n",  # succeeds on retry
+        ]
+    )
+
+    result = SingleFileLoop(client, config, session).run("goal")
+
+    assert result.success
+    assert not result.aborted
 
 
 def test_critic_disabled_by_default_never_calls_the_model_a_third_time(tmp_path: Path):

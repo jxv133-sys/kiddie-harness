@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from harness.cli import _parse_endpoints
 from harness.config import Config, Endpoint
 
@@ -97,3 +99,20 @@ def test_parse_endpoints_splits_host_and_model_and_defaults_the_model():
         Endpoint("http://a:11434", "qwen2.5-coder:7b", 300),
         Endpoint("http://b:11434", "fallback", 300),
     )
+
+
+def test_parse_endpoints_reads_an_optional_role():
+    config = _config(model="fallback", timeout_seconds=300)
+    parsed = _parse_endpoints(
+        ["http://a:11434,m,smart", "http://b:11434,m,quick", "http://c:11434,m"],
+        config=config,
+    )
+
+    assert [e.role for e in parsed] == ["smart", "quick", "balanced"]
+
+
+def test_parse_endpoints_rejects_an_unrecognised_role():
+    config = _config()
+
+    with pytest.raises(ValueError, match="invalid --endpoint role"):
+        _parse_endpoints(["http://a:11434,m,super-duper"], config=config)

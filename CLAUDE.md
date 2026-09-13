@@ -76,7 +76,11 @@ core design, not just style.
   viewer (the GUI's dependency graph) can tell "still retrying, possibly
   paused" apart from "genuinely done"; a bare `verify` event alone can't,
   since a failed attempt with retries left looks identical in the log to
-  one that just gave up.
+  one that just gave up. `partition_clients_by_role` (see Status) turns
+  an endpoint list's `role` tags into `(primary, workers,
+  critic_override)`; `MultiFileLoop` itself stays unaware roles exist at
+  all -- it only ever sees a primary client, a worker pool, and one
+  optional `critic_client` override, same shape as before roles existed.
 - `harness/steps/` — one atomic LLM call per concern: `plan.py`
   (schema-constrained file list, bounded retry, a final schema-free
   attempt parsed by `_parse_free_form`; also flattens to bare filenames,
@@ -257,6 +261,85 @@ core design, not just style.
   for the critic itself opt in explicitly.
 
 ## Status
+
+**Retry a transient connection failure instead of aborting, added on
+request** ("when we get errors like 'The endpoint became unreachable
+mid-run' just retry with a different endpoint or just retry").
+`orchestrator._with_endpoint_retry(fn, attempts=_ENDPOINT_RETRY_ATTEMPTS,
+cancel_event=None)` retries a step-function call up to 3 times (a short,
+`cancel_event`-interruptible pause between attempts) before letting the
+final `OllamaError` propagate -- a deliberate, narrow exception to
+`llm_client`'s own "never loops or retries on its own" (that principle
+is about the *client* not deciding what happens next; retrying here is
+the orchestrator doing exactly that, no differently from escalating
+temperature on a content failure). Applied at every point that used to
+let a connection failure end the run immediately: the `plan` call,
+`SingleFileLoop`'s `_generate_and_fix`, and `_run_integration_with_fixes`'s
+`codegen.fix_file` call all wrap their one call outright. The per-file
+worker dispatch loop is the one place this needed real care rather than
+a blanket wrap: `_generate_files` already had a *better* fallback for a
+dead endpoint when another one is live -- hand the file to it
+immediately (`endpoint_retired` + requeue) -- and retrying in place
+first would only have delayed that. So a worker only retries its own
+endpoint when `active[0] <= 1` (it's the last one standing, so there's
+truly nothing else to fall back to) at the moment of failure, spending
+`_ENDPOINT_RETRY_ATTEMPTS - 1` further attempts there (one was already
+spent on the direct call) before falling through to the original
+retire-and-requeue path unchanged. This is "retry with a different
+endpoint if one exists, otherwise just retry" as a literal runtime
+branch, not a slogan. Tests: `tests/test_endpoint_retry.py` unit-tests
+the helper directly (recovery, exhaustion, the `attempts` override,
+cancellation mid-backoff); `test_multi_file_loop.py` and
+`test_orchestrator.py` prove a transient blip recovers at each of the
+four call sites, and that a live second endpoint still gets a file
+immediately rather than waiting out a retry on the dead one.
+`tests/conftest.py`'s autouse fixture collapses the real backoff to
+near-zero for the whole suite -- otherwise every one of these tests (and
+several pre-existing ones simulating a dead endpoint) would cost several
+real seconds each for no reason.
+
+**Model roles (smart/quick/balanced) and a clearer dependency graph,
+added on request** ("we have one model that's the smarts... and one
+that's much faster but makes more mistakes... select what kind of model
+on the endpoint... and it should assign tasks accordingly"). Each
+`Endpoint` (`config.py`) carries an optional `role`; the default,
+`"balanced"`, and an unset/typo'd role both behave identically -- an
+endpoint that does everything, exactly as before roles existed, so a
+single-endpoint or all-default setup is completely unaffected.
+`orchestrator.partition_clients_by_role(endpoints, clients)` is the one
+place that turns roles into an actual assignment: a `"smart"`-tagged
+endpoint becomes the client for `plan`/`critic`/`integration_fix` (the
+judgement calls -- get the architecture and "does this match its own
+spec" right) and is excluded from the per-file worker pool; `"quick"`
+and `"balanced"` endpoints do the per-file spec/codegen/fix grind. Only
+one thing needed to change inside the orchestrator itself:
+`MultiFileLoop`'s critic check previously always ran on *whichever
+worker built that file* (`client`, the dispatcher's per-file parameter)
+-- fine when every endpoint is equally capable, wrong once one is
+specifically the "careful" one. `_build_one_file` now uses
+`self._critic_client or client`, so with no smart endpoint configured
+(`critic_client=None`) it's byte-for-byte the old behaviour, and with
+one it's funneled there regardless of which quick worker wrote the code.
+`plan`/`integration_fix` didn't need an orchestrator change at all --
+they already ran on the loop's positional `client`, so routing them to
+the smart endpoint is just the caller (CLI's `main()`, GUI's
+`RunManager._run`) passing the role-resolved `primary` client instead of
+always `endpoints[0]`. CLI: `--endpoint HOST,MODEL,ROLE` (role optional).
+GUI: a compact role `<select>` next to every endpoint row (primary and
+each "+ add endpoint"), defaulting to Balanced.
+
+The **dependency graph** (see the pause/resume entry below for how it
+started) got genuinely hard to read once a real multi-file plan showed
+up: `var(--line)` edges are near-invisible against the app's own
+borders, there was no arrowhead, and 5+ files meant guessing which curve
+belonged to which box. Fixed: edges are `var(--muted)`, thicker, and
+carry an SVG `<marker>` arrowhead pointing from a dependency to the file
+that needs it; hovering a node (`renderGraph`'s new `mouseenter`
+handler) adds `.hl`/`.dim` classes to its own edges/neighbours and
+everything else, so tracing one file's relationships no longer means
+untangling the whole graph by eye. Each node's tooltip now also spells
+out "depends on: ..." / "needed by: ..." in plain text, for a viewer
+without hover precision.
 
 **Pause/resume, a live dependency graph, and an unbounded endpoint pool,
 added on request.** Pause is cooperative, mirroring `cancel_event`

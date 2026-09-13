@@ -7,9 +7,9 @@ import sys
 from pathlib import Path
 
 from . import progress, summary
-from .config import Config, Endpoint
+from .config import ROLES, Config, Endpoint
 from .llm_client import OllamaClient, OllamaError
-from .orchestrator import MultiFileLoop, SingleFileLoop
+from .orchestrator import MultiFileLoop, SingleFileLoop, partition_clients_by_role
 from .session import Session
 from .steps.plan import PlanError
 
@@ -56,9 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--endpoint",
         action="append",
-        metavar="HOST,MODEL",
+        metavar="HOST,MODEL[,ROLE]",
         help="Extra Ollama backend for parallel multi-file generation (repeatable). "
-        "First --endpoint replaces the default primary; use it twice for two.",
+        "First --endpoint replaces the default primary; use it twice for two. "
+        "Optional third field tags its role: smart (plan/critic/integration-fix), "
+        "quick (the per-file spec/codegen/fix grind), or balanced (does either, "
+        "the default) -- see the Model roles section of the README.",
     )
     run.add_argument(
         "--filename",
@@ -110,9 +113,12 @@ def _run_multi_file(
     session: Session,
     args,
     pool_clients: list[OllamaClient] | None = None,
+    critic_client: OllamaClient | None = None,
 ) -> int:
     try:
-        loop = MultiFileLoop(client, config, session, pool_clients=pool_clients)
+        loop = MultiFileLoop(
+            client, config, session, pool_clients=pool_clients, critic_client=critic_client
+        )
         result = loop.run(args.goal)
     except (OllamaError, PlanError) as exc:
         print(f"ERROR: {exc}")
@@ -147,9 +153,17 @@ def _run_multi_file(
 def _parse_endpoints(specs: list[str], *, config: Config) -> tuple[Endpoint, ...]:
     endpoints = []
     for spec in specs:
-        host, _, model = spec.partition(",")
+        host, _, rest = spec.partition(",")
+        model, _, role = rest.partition(",")
+        role = role.strip() or "balanced"
+        if role not in ROLES:
+            raise ValueError(
+                f"invalid --endpoint role {role!r} in {spec!r}: expected one of {', '.join(ROLES)}"
+            )
         endpoints.append(
-            Endpoint(host.strip(), model.strip() or config.model, config.timeout_seconds)
+            Endpoint(
+                host.strip(), model.strip() or config.model, config.timeout_seconds, role=role
+            )
         )
     return tuple(endpoints)
 
@@ -194,10 +208,16 @@ def main(argv: list[str] | None = None) -> int:
             critic_enabled=False if args.no_critic else None,
         )
         if args.endpoint:
-            config = config.with_overrides(endpoints=_parse_endpoints(args.endpoint, config=config))
+            try:
+                config = config.with_overrides(
+                    endpoints=_parse_endpoints(args.endpoint, config=config)
+                )
+            except ValueError as exc:
+                print(f"ERROR: {exc}")
+                return 2
         endpoints = config.resolved_endpoints()
-        pool_clients = [OllamaClient(e.host, e.model, e.timeout_seconds) for e in endpoints]
-        client = pool_clients[0]
+        all_clients = [OllamaClient(e.host, e.model, e.timeout_seconds) for e in endpoints]
+        client, pool_clients, critic_client = partition_clients_by_role(endpoints, all_clients)
         reporter = None if args.quiet else progress.console_reporter()
         session = Session.create(config.workspace_root, on_event=reporter)
 
@@ -205,12 +225,14 @@ def main(argv: list[str] | None = None) -> int:
         if len(endpoints) == 1:
             print(f"Model: {endpoints[0].model} @ {endpoints[0].host}", flush=True)
         else:
-            joined = ", ".join(f"{e.model}@{e.host}" for e in endpoints)
+            joined = ", ".join(f"{e.model}@{e.host} ({e.role})" for e in endpoints)
             print(f"Endpoints: {joined}", flush=True)
 
         if args.multi_file:
-            return _run_multi_file(client, config, session, args, pool_clients=pool_clients)
-        return _run_single_file(client, config, session, args)
+            return _run_multi_file(
+                client, config, session, args, pool_clients=pool_clients, critic_client=critic_client
+            )
+        return _run_single_file(all_clients[0], config, session, args)
 
     return 1
 

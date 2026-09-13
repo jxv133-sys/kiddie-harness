@@ -241,10 +241,46 @@ harness run --multi-file --goal "..." \
 
 or set an `endpoints:` list in `config/default.yaml`. With one endpoint
 this is the same serial walk as before. If an endpoint goes unreachable
-mid-run, its file is requeued to the other; the run only aborts when no
-endpoint can finish. `plan` and the integration check always run on the
-first endpoint. The realistic speed-up is ~1.5–2× — a file that depends
-on every earlier one gets no parallelism.
+mid-run and another one is live, its file is requeued there immediately;
+if it's the only endpoint (or the last one still standing), the harness
+retries that same connection a few times with a short pause first,
+rather than aborting the run over what's often a transient blip (Ollama
+restarting, a brief network drop) — the run only truly aborts once
+retries are exhausted and no endpoint can finish. `plan` and the
+integration check run on the primary endpoint (the first one, unless
+roles say otherwise — see below). The realistic speed-up is ~1.5–2× — a
+file that depends on every earlier one gets no parallelism.
+
+## Model roles
+
+If your endpoints aren't equally capable — one's a bigger, slower,
+"thinking" model and another is smaller and faster but makes more
+mistakes — tag each with a role so the harness assigns work accordingly,
+instead of treating every endpoint as interchangeable:
+
+```bash
+harness run --multi-file --goal "..." \
+  --endpoint http://192.168.50.142:7869,deepseek-r1:14b,smart \
+  --endpoint http://localhost:11434,qwen2.5-coder:7b,quick \
+  --endpoint http://localhost:11435,qwen2.5-coder:7b,quick
+```
+
+- **`smart`** handles the judgement calls — `plan` (the file list and
+  dependency graph) and `critic` (does this file actually hold up
+  against its own spec?) — and is excluded from per-file generation, so
+  the careful/slow model isn't spent on high-volume work.
+- **`quick`** does the per-file spec → codegen → fix grind — the calls
+  that happen many times per run and get corrected by the fix loop
+  anyway if they're wrong.
+- **`balanced`** (the default if you don't set a role, or the only
+  option before roles existed) does both. An endpoint with no role, or
+  every endpoint on `balanced`, behaves exactly as if roles didn't
+  exist — nothing changes until you actually tag one `smart` or `quick`.
+
+The GUI has the same three options as a small dropdown next to each
+endpoint's model/host. `role` is also a field in `config/default.yaml`'s
+`endpoints:` list, and a third comma-separated field on `--endpoint`
+(`HOST,MODEL,ROLE` — omit it for `balanced`).
 
 ## GUI
 
@@ -273,11 +309,14 @@ the window updates itself and closes on its own when the call ends. A
 **Files** panel renders the whole plan as a **dependency graph**: every
 planned file is a node from the moment planning finishes (not just once
 it's built), laid out in rows by how deep its `depends_on` chain runs,
-with arrows to what it depends on and a color per status (queued /
-building / ok / failed / advisory / flagged / skipped) — a to-do list
-and a dependency map in one picture. Clicking a node (or the **view
-plan** / **spec** links) opens its content in a small window over the
-page, kept live while it's open. **Pause** freezes a run before its next
+with arrows pointing from a dependency to the file that needs it and a
+color per status (queued / building / ok / failed / advisory / flagged
+/ skipped) — a to-do list and a dependency map in one picture. **Hover a
+node** to trace it: its own edges and everything it touches light up
+while the rest of the graph dims, and its tooltip spells out "depends
+on" / "needed by" in plain text. Clicking a node (or the **view plan** /
+**spec** links) opens its content in a small window over the page, kept
+live while it's open. **Pause** freezes a run before its next
 file or fix attempt (never mid-call) so you can open the gear icon,
 change a setting, and have it apply the moment you hit **Resume** —
 useful when a run is visibly struggling and you want to raise the fix
