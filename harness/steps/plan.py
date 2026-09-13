@@ -67,14 +67,14 @@ class FileTask:
     depends_on: tuple[str, ...] = ()
 
 
-_PY_NAME_RE = re.compile(r"([A-Za-z_][\w-]*\.py)")
+_CODE_NAME_RE = re.compile(r"([A-Za-z_][\w-]*\.(?:py|html|css|js))")
 
 
 def _parse_free_form(text: str) -> dict:
     """Turn an unconstrained planner response into `{"files": [...]}`.
 
     Tries, in order: the whole thing as JSON, a `{...}` object embedded in
-    prose, then a markdown/numbered list of `*.py` filenames (a reasoning
+    prose, then a markdown/numbered list of filenames (a reasoning
     model's natural format when it isn't grammar-constrained).
     """
     candidate = strip_code_fences(text)  # also drops a leading <think> block
@@ -93,7 +93,7 @@ def _parse_free_form(text: str) -> dict:
     files: list[dict] = []
     seen: set[str] = set()
     for i, line in enumerate(lines):
-        match = _PY_NAME_RE.search(line)
+        match = _CODE_NAME_RE.search(line)
         if not match:
             continue
         name = match.group(1)
@@ -105,7 +105,7 @@ def _parse_free_form(text: str) -> dict:
             # a common layout is `1. **name.py**` then `- Purpose: ...`
             # on one of the next couple of lines
             for follow in lines[i + 1 : i + 3]:
-                if _PY_NAME_RE.search(follow):
+                if _CODE_NAME_RE.search(follow):
                     break
                 stripped = follow.strip(" \t-*`")
                 if ":" in stripped:
@@ -125,12 +125,16 @@ def _first_brace_object(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+_ALLOWED_EXTENSIONS = (".py", ".html", ".css", ".js")
+
+
 def _tasks_from_plan(data: dict) -> list[FileTask]:
     """Validate and normalise a parsed plan into file tasks.
 
     Normalisation handles what a weak planner hands back:
-     - drop non-Python entries (a README, a requirements.txt) -- this
-       harness only generates and verifies Python;
+     - drop entries outside the allowed extensions (a README, a
+       requirements.txt, an image) -- this harness only generates and
+       verifies Python/HTML/CSS/JS;
      - flatten any subdirectory path to a bare filename -- every file
        lives in one flat run directory, and a `pkg/core.py` would break
        its import-check (wrong cwd) and any sibling that imports it;
@@ -149,13 +153,13 @@ def _tasks_from_plan(data: dict) -> list[FileTask]:
             purpose = f["purpose"]
         except (TypeError, KeyError) as exc:
             raise PlanError(f"Malformed file entry in plan: {f!r}") from exc
-        if not name.endswith(".py") or name in seen:
+        if not name.endswith(_ALLOWED_EXTENSIONS) or name in seen:
             continue
         seen.add(name)
         entries.append((name, purpose, f.get("depends_on")))
 
     if not entries:
-        raise PlanError(f"Planner returned no Python files: {data}")
+        raise PlanError(f"Planner returned no files with an allowed extension: {data}")
 
     names = [name for name, _, _ in entries]
     tasks: list[FileTask] = []

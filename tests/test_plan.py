@@ -139,6 +139,42 @@ def test_plan_files_raises_when_no_python_files_remain():
         plan_files(client, "x", temperature=0.2, max_tokens=512, max_attempts=1)
 
 
+def test_plan_files_accepts_html_css_and_js_alongside_python():
+    payload = json.dumps(
+        {
+            "files": [
+                {"path": "index.html", "purpose": "the page"},
+                {"path": "style.css", "purpose": "styling"},
+                {"path": "app.js", "purpose": "client behaviour"},
+                {"path": "server.py", "purpose": "serves the page"},
+                {"path": "favicon.ico", "purpose": "icon"},
+            ]
+        }
+    )
+    client = FakeClient([payload])
+
+    tasks = plan_files(client, "a web page", temperature=0.2, max_tokens=512)
+
+    assert [t.path for t in tasks] == ["index.html", "style.css", "app.js", "server.py"]
+
+
+def test_plan_files_recovers_html_and_js_filenames_from_a_markdown_list():
+    client = FakeClient(
+        [
+            json.dumps({"files": []}),  # schema attempt 0, degenerate
+            (
+                "Here is the plan:\n"
+                "1. **index.html** - the page markup\n"
+                "2. **app.js** - handles the button click\n"
+            ),  # final, unconstrained attempt
+        ]
+    )
+
+    tasks = plan_files(client, "x", temperature=0.2, max_tokens=512, max_attempts=2)
+
+    assert [t.path for t in tasks] == ["index.html", "app.js"]
+
+
 def test_plan_files_flattens_subdirectory_paths_to_bare_filenames():
     payload = json.dumps(
         {

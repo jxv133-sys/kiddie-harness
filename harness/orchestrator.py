@@ -144,6 +144,7 @@ def _generate_and_fix(
         gen = codegen.generate_file(
             client,
             instruction,
+            path=str(file_path),
             temperature=config.temperature,
             max_tokens=max_tokens,
             on_chunk=update,
@@ -202,6 +203,7 @@ def _generate_and_fix(
                 code=code,
                 error=error,
                 stage=result.stage,
+                path=str(file_path),
                 temperature=_retry_temperature(config.temperature, attempts + 1),
                 max_tokens=max_tokens,
                 on_chunk=update,
@@ -413,7 +415,10 @@ class MultiFileLoop:
             # pytest is the right integration check; otherwise fall back
             # to running an entry file.
             has_tests = any(
-                Path(f.path).name.startswith("test_") and f.success for f in file_results
+                Path(f.path).suffix == ".py"
+                and Path(f.path).name.startswith("test_")
+                and f.success
+                for f in file_results
             )
             generated_paths = [Path(f.path) for f in required]
             try:
@@ -617,8 +622,11 @@ class MultiFileLoop:
             f"Specification:\n{spec_text}"
             f"{self._sibling_context(task, built_so_far)}"
         )
-        is_test_file = Path(task.path).name.startswith("test_")
-        verify_fn = verify.verify_test_file if is_test_file else verify.verify_python_file_static
+        # test_*.py is a Python-only convention -- pytest can't run a
+        # "test_button.js", so that verify path only ever applies to an
+        # actual Python file named that way.
+        is_test_file = Path(task.path).suffix == ".py" and Path(task.path).name.startswith("test_")
+        verify_fn = verify.verify_test_file if is_test_file else verify.verify_generated_file
         critic_calls = [0]
         if self.config.critic_enabled and not is_test_file:
             # Not applied to test files: a test's own pass/fail against
@@ -723,6 +731,7 @@ class MultiFileLoop:
                     code=target.read_text(),
                     error=result.output,
                     stage=result.stage,
+                    path=str(target),
                     temperature=_retry_temperature(self.config.temperature, rounds + 1),
                     max_tokens=self.config.max_tokens,
                     on_chunk=update,
@@ -760,10 +769,17 @@ class MultiFileLoop:
         return result
 
     def _pick_entry_path(self, tasks: list[FileTask]) -> Path | None:
-        for task in tasks:
+        """The file `run_script`/`import_check` treats as the program's
+        entry point -- always a `.py` file, since that's the only thing
+        this harness can actually execute. A goal that's pure HTML/CSS/JS
+        (a static page with no Python server) has no entry point at all;
+        returning None here means `_run_integration` just skips the
+        integration check rather than trying to `python file.html`."""
+        py_tasks = [t for t in tasks if Path(t.path).suffix == ".py"]
+        for task in py_tasks:
             if Path(task.path).name == "main.py":
                 return _safe_relative_path(task.path)
-        return _safe_relative_path(tasks[0].path) if tasks else None
+        return _safe_relative_path(py_tasks[0].path) if py_tasks else None
 
     def _find_implicated_file(self, error_text: str, candidate_paths: list[Path]) -> Path | None:
         """Best-effort: a traceback almost always names the file it failed

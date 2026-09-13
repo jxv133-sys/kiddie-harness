@@ -68,28 +68,49 @@ core design, not just style.
 - `harness/steps/` — one atomic LLM call per concern: `plan.py`
   (schema-constrained file list, bounded retry, a final schema-free
   attempt parsed by `_parse_free_form`; also flattens to bare filenames,
-  drops non-`.py`, dedups), `spec.py` (per-file bullet spec, reasoning
-  stripped), `codegen.py` (`generate_file` / `fix_file` — a file body in,
-  a file body out, nothing else), `critic.py` (`critique_file` — a file's
-  spec + contents in, a `{follows_spec, issues}` verdict out; fails open
-  -- an unparseable or errored call is treated as "follows the spec,"
-  never as grounds to fail a file on its own).
+  drops anything outside `_ALLOWED_EXTENSIONS` (`.py`/`.html`/`.css`/
+  `.js`), dedups), `spec.py` (per-file bullet spec, reasoning stripped),
+  `codegen.py` (`generate_file` / `fix_file` — a file body in, a file
+  body out, nothing else; language-aware, see below), `critic.py`
+  (`critique_file` — a file's spec + contents in, a `{follows_spec,
+  issues}` verdict out; fails open -- an unparseable or errored call is
+  treated as "follows the spec," never as grounds to fail a file on its
+  own).
+- `harness/steps/codegen.py` — `_LANGUAGE_BY_SUFFIX` maps a target
+  file's extension to a language name; `_LANGUAGE_RULES` holds that
+  language's rule block (Python's main-guard/no-module-state
+  conventions mean nothing for a stylesheet, so each language gets its
+  own). One shared prompt structure (`codegen.md`/`fix.md`, both
+  `{language}`-parameterized) formats in whichever rules apply — no
+  per-language prompt duplication. `generate_file`/`fix_file` both take
+  `path` (keyword-only) purely to pick the language; it's never sent as
+  something to write to.
 - `harness/steps/verify.py` — deterministic checks only, **no LLM calls
-  anywhere in this file**. `compile_check`, `lint_check` (runs `ruff
-  check --fix`, so trivial nits get fixed for free instead of costing a
-  fix attempt), `main_guard_check` (AST: a module that defines
-  functions/classes must not also run control flow or bare calls at
-  module level — that would `sys.exit` under `import_check`),
-  `import_check` (actually resolves a file's imports via `runpy.run_path`,
-  without executing `if __name__ == "__main__":` blocks), `run_pytest`
-  (clears `__pycache__` + `PYTHONDONTWRITEBYTECODE` so an in-place test
-  rewrite can't hit a stale assertion-rewrite `.pyc`; `ignore=` drops
-  advisory tests from an integration run). Composed into
-  `verify_python_file` (single-file loop: compile then run),
-  `verify_python_file_static` (multi-file implementation files: compile →
-  lint → main-guard → import-check, in that order, stopping at the first
-  failure), `verify_test_file` (compile → pytest on just that one test
-  file).
+  anywhere in this file**. `verify_generated_file(path)` dispatches by
+  suffix: `.py` goes to the existing `compile_check` → `lint_check` →
+  `main_guard_check` → `import_check` pipeline (`verify_python_file_static`);
+  `.html`/`.htm`/`.css`/`.js` go to hand-rolled structural checks instead
+  -- `html_check` (a `html.parser.HTMLParser` subclass tracking a tag
+  stack, since the stdlib parser itself never raises on malformed markup
+  and can't be used for validation as-is) and `css_check`/`js_check`
+  (a shared `_check_balance` state machine: bracket/brace/paren matching
+  plus unterminated-string/comment detection, comment-aware). These are
+  real tooling, just less capable than a real parser -- no new
+  dependency was added; matches "never another LLM's opinion" even for a
+  weaker check. `compile_check`, `lint_check` (runs `ruff check --fix`,
+  so trivial nits get fixed for free instead of costing a fix attempt),
+  `main_guard_check` (AST: a module that defines functions/classes must
+  not also run control flow or bare calls at module level — that would
+  `sys.exit` under `import_check`), `import_check` (actually resolves a
+  file's imports via `runpy.run_path`, without executing `if __name__ ==
+  "__main__":` blocks), `run_pytest` (clears `__pycache__` +
+  `PYTHONDONTWRITEBYTECODE` so an in-place test rewrite can't hit a
+  stale assertion-rewrite `.pyc`; `ignore=` drops advisory tests from an
+  integration run). Composed into `verify_python_file` (single-file
+  loop: compile then run), `verify_python_file_static` (multi-file `.py`
+  implementation files: compile → lint → main-guard → import-check, in
+  that order, stopping at the first failure), `verify_test_file`
+  (compile → pytest on just that one test file).
 - `harness/llm_client.py` — thin Ollama wrapper. Surfaces truncation
   (`done_reason == "length"`) so the fix loop can grow `max_tokens` and
   tell the model its last output was cut off, instead of treating it like
@@ -185,6 +206,42 @@ core design, not just style.
   for the critic itself opt in explicitly.
 
 ## Status
+
+**Multi-language web support, added on request** (the planner only ever
+listed `.py` files, even for "make a web page" goals): the planner can
+now emit `.html`/`.css`/`.js` files too (`plan.py`'s
+`_ALLOWED_EXTENSIONS`), and `plan.md` tells it to include a small stdlib
+`http.server` Python entry point for a web goal -- this harness only
+ever runs and verifies things locally with Python, so a page needs
+something runnable to check at all. `codegen.py` picks per-language
+rules by the target file's extension (`_LANGUAGE_BY_SUFFIX`); one shared
+`{language}`-parameterized prompt template covers all four languages
+instead of duplicating `codegen.md`/`fix.md` per language.
+`verify.py`'s new `verify_generated_file` dispatches `.html`/`.css`/
+`.js` to hand-rolled, dependency-free structural checks (`html_check`,
+`css_check`, `js_check` -- see `harness/steps/verify.py` above) since no
+stdlib parser/linter exists for them; `.py` still gets the full
+compile/lint/guard/import pipeline. No new dependency was added,
+preserving "real tooling, never another LLM's opinion" even for a
+weaker check. `_pick_entry_path` (`orchestrator.py`) only considers
+`.py` files for the integration check, and returns `None` -- skipping
+integration entirely -- for a goal that's pure HTML/CSS/JS with no
+Python file at all. The GUI's Files panel (`_GENERATED_FILE_GLOBS`) and
+`/api/files` list all four extensions, not just `.py`. **Verified live
+end-to-end** against `llama3.2:latest`: goal "a simple web page with a
+styled heading and a button that shows an alert when clicked" → planner
+emitted `index.html` + `style.css` + `script.js` + a Python file; every
+file passed codegen, critic, and its verify stage (including the new
+`html_check`/`css_check`/`js_check`), and `[integration:run] -> ok` --
+`SUCCESS`, 4/4 files, 0 fixes, 9 LLM calls. The live-streaming calls bar
+and clickable call modal (see `harness/gui.py` below) both confirmed
+working for non-Python generation too. One live finding, not a bug: a
+weak model's own plan named a Python file `alert.py` with the purpose
+"handle alert functionality" instead of using it as the server the
+prompt asked for, and `script.js`'s `<script src>` in the generated HTML
+didn't match the planned filename -- expected small-model unreliability
+documented throughout this file, not something the harness pipeline
+itself got wrong (every file still individually verified correctly).
 
 **Critic check, added on request** ("make sure the file follows what the
 spec was"): once a file passes every real check (compile/lint/guard/

@@ -666,6 +666,36 @@ def test_files_endpoint_reports_a_spec_flagged_file_as_flagged_not_failed(tmp_pa
         t.join(timeout=5)
 
 
+def test_files_endpoint_lists_html_css_and_js_alongside_python(tmp_path: Path):
+    import threading
+    import urllib.request
+
+    config = make_config(tmp_path)
+    run_dir = config.workspace_root / "20260101-000000-webproj1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "index.html").write_text("<p>hi</p>")
+    (run_dir / "style.css").write_text("body {}")
+    (run_dir / "app.js").write_text("function f() {}")
+    (run_dir / "server.py").write_text("x = 1\n")
+
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        body = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/files/20260101-000000-webproj1", timeout=5
+            ).read()
+        )
+        assert {f["name"] for f in body["files"]} == {
+            "index.html", "style.css", "app.js", "server.py"
+        }
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
 def test_the_index_page_and_config_endpoint_serve(tmp_path: Path):
     import urllib.request
 

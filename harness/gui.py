@@ -514,13 +514,17 @@ class _Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 continue
 
+    _GENERATED_FILE_GLOBS = ("*.py", "*.html", "*.css", "*.js")
+
     def _files_response(self, run_id: str) -> dict:
-        """The `.py` files on disk for a run, each tagged with its latest
-        known verify outcome from the log (or "pending" while it hasn't
-        been verified yet, e.g. mid-generation) and whether a spec was
-        written for it -- single-file runs never have one. `has_plan`
-        says whether the run went through the planner at all (multi-file
-        only), so the page knows whether to offer a Plan window."""
+        """The generated files on disk for a run (`.py`/`.html`/`.css`/
+        `.js` -- everything the planner is allowed to produce, see
+        steps/plan.py), each tagged with its latest known verify outcome
+        from the log (or "pending" while it hasn't been verified yet,
+        e.g. mid-generation) and whether a spec was written for it --
+        single-file runs never have one. `has_plan` says whether the run
+        went through the planner at all (multi-file only), so the page
+        knows whether to offer a Plan window."""
         run_dir = self._runs.log_path(run_id).parent
         if not run_dir.is_dir():
             return {"files": [], "has_plan": False}
@@ -549,8 +553,9 @@ class _Handler(BaseHTTPRequestHandler):
                     # its whole build, so this is set once and stays --
                     # last-write-wins is only relevant if it ever isn't.
                     endpoint_by_name[Path(record.get("path", "")).name] = record["endpoint"]
+        found = (p for pattern in self._GENERATED_FILE_GLOBS for p in run_dir.glob(pattern))
         files = []
-        for p in sorted(run_dir.glob("*.py")):
+        for p in sorted(found):
             files.append(
                 {
                     "name": p.name,

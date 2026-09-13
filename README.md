@@ -142,11 +142,24 @@ orchestrator and prompts are otherwise unchanged in spirit:
   size was hitting a stale assertion-rewrite `.pyc`); `pyproject.toml`
   pins `testpaths` so this repo's own `pytest` ignores generated
   `workspace/` projects.
-- **Planner hygiene.** Non-`.py` entries (a README, a `requirements.txt`)
-  and duplicate paths are dropped from the plan.
-
-Multi-language support is a later phase (see the architecture doc) and
-not implemented yet.
+- **Planner hygiene.** Entries outside the allowed extensions (a README,
+  a `requirements.txt`) and duplicate paths are dropped from the plan.
+- **Multi-language web support.** The planner can emit `.html`/`.css`/
+  `.js` files alongside `.py`, for goals that describe a web page or
+  site -- it's told to include a small stdlib `http.server`-based Python
+  entry point to serve them, since this harness only ever runs and
+  verifies things locally with Python. Codegen picks per-language rules
+  from the target filename (`harness/steps/codegen.py`); verification
+  dispatches by extension (`harness/steps/verify.py`) to dependency-free,
+  hand-rolled structural checks -- `html_check` (tag-balance via a
+  `html.parser.HTMLParser` subclass), `css_check`/`js_check` (bracket/
+  brace/paren and quote-termination balance) -- since no parser/linter
+  for those languages is available without a new dependency. `.py` files
+  still get the full compile/lint/main-guard/import-check pipeline.
+  Verified live end-to-end against a real model: a "styled heading and a
+  button" goal planned `index.html` + `style.css` + `script.js` +  a
+  Python entry point, all four passed their verify + critic checks, and
+  the integration check ran clean.
 
 ## Setup
 
