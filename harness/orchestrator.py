@@ -32,6 +32,25 @@ class RunCancelled(Exception):
     """
 
 
+def _wait_if_paused(
+    pause_event: threading.Event | None, cancel_event: threading.Event | None
+) -> None:
+    """Blocks here while paused -- the exact same "between calls, never
+    mid-request" checkpoint `cancel_event` uses (see `RunCancelled`).
+
+    A file's config is read fresh at every use, never snapshotted, so a
+    settings change applied while paused (`Config.apply_overrides`) is
+    guaranteed to be in effect by the time this returns and the next LLM
+    call goes out. Still honours `cancel_event` while blocked, so Stop
+    works even mid-pause."""
+    if pause_event is None:
+        return
+    while pause_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            raise RunCancelled("cancelled by user")
+        pause_event.wait(timeout=0.5)
+
+
 @dataclasses.dataclass
 class RunResult:
     success: bool
@@ -126,6 +145,7 @@ def _generate_and_fix(
     verify_fn: Callable[[Path], VerifyResult],
     *,
     cancel_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
 ) -> tuple[VerifyResult, int]:
     """Shared bounded-retry loop: generate once, verify, fix on failure.
 
@@ -182,6 +202,7 @@ def _generate_and_fix(
         if result.success or attempts >= config.max_fix_attempts:
             return result, attempts
 
+        _wait_if_paused(pause_event, cancel_event)
         if cancel_event is not None and cancel_event.is_set():
             raise RunCancelled("cancelled by user")
 
@@ -289,11 +310,13 @@ class SingleFileLoop:
         session: Session,
         *,
         cancel_event: threading.Event | None = None,
+        pause_event: threading.Event | None = None,
     ):
         self.client = client
         self.config = config
         self.session = session
         self._cancel = cancel_event
+        self._pause = pause_event
 
     def run(self, goal: str, filename: str = "main.py") -> RunResult:
         self.session.log("goal", goal=goal)
@@ -316,6 +339,7 @@ class SingleFileLoop:
                 goal,
                 verify_fn,
                 cancel_event=self._cancel,
+                pause_event=self._pause,
             )
         except (OllamaError, RunCancelled) as exc:
             reason = "cancelled by user" if isinstance(exc, RunCancelled) else str(exc)
@@ -379,12 +403,14 @@ class MultiFileLoop:
         *,
         pool_clients: list[OllamaClient] | None = None,
         cancel_event: threading.Event | None = None,
+        pause_event: threading.Event | None = None,
     ):
         self.client = client
         self.config = config
         self.session = session
         self._pool = list(pool_clients) if pool_clients else [client]
         self._cancel = cancel_event
+        self._pause = pause_event
 
     def run(self, goal: str) -> MultiFileRunResult:
         self.session.log("goal", goal=goal)
@@ -427,6 +453,8 @@ class MultiFileLoop:
                 )
             except OllamaError as exc:
                 abort_reason = str(exc)
+            except RunCancelled:
+                abort_reason = "cancelled by user"
 
         overall_success = (
             abort_reason is None
@@ -491,6 +519,15 @@ class MultiFileLoop:
                 done.add(name)
             else:
                 hard_failed.add(name)
+            # The one place that knows a file's build loop has actually
+            # concluded (success, exhausted its retries, or skipped) --
+            # as opposed to a `verify` event that merely failed one of
+            # possibly several attempts still to come. Lets a live
+            # viewer (the GUI's dependency graph) tell "still retrying"
+            # apart from "genuinely done", which a bare verify-event scan
+            # can't -- especially with a paused run holding a failed
+            # attempt open indefinitely before its next retry.
+            self.session.log("file_result", path=result.path, success=result.success)
 
         def claim() -> FileTask | None:
             i = 0
@@ -536,6 +573,16 @@ class MultiFileLoop:
                                 abort_reason[0] = "cancelled by user"
                                 cv.notify_all()
                                 return
+                            if self._pause is not None and self._pause.is_set():
+                                # Don't claim a new file while paused -- but
+                                # don't touch `pending`/`active`/`busy` either,
+                                # so the "real stall" check below never fires
+                                # just because everyone's sitting here waiting.
+                                # A file another worker already has stays
+                                # mid-build; it hits its own pause checkpoint
+                                # in `_generate_and_fix` between fix attempts.
+                                cv.wait(timeout=0.5)
+                                continue
                             task = claim()
                             if task is not None:
                                 busy[0] += 1
@@ -644,6 +691,7 @@ class MultiFileLoop:
             instruction,
             verify_fn,
             cancel_event=self._cancel,
+            pause_event=self._pause,
         )
         advisory = is_test_file and not result.success
         if advisory:
@@ -719,6 +767,7 @@ class MultiFileLoop:
             and iterations < self.config.max_total_iterations
             and not (self._cancel is not None and self._cancel.is_set())
         ):
+            _wait_if_paused(self._pause, self._cancel)
             target = self._find_implicated_file(result.output, generated_paths)
             if target is None:
                 break

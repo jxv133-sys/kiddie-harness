@@ -149,7 +149,70 @@ def test_cancel_frees_the_gui_to_start_a_new_run_immediately(tmp_path: Path):
     t1.join(timeout=5)
     t2.join(timeout=5)
     # t1 finishing late must not clobber run2's own "done" transition.
-    assert manager.status() == {"state": "done", "run_id": run2}
+    assert manager.status() == {"state": "done", "run_id": run2, "paused": False}
+
+
+def test_pause_and_resume_toggle_status(tmp_path: Path):
+    config = make_config(tmp_path)
+    import threading
+
+    gate = threading.Event()
+
+    class _Blocking:
+        host = "http://blocking"
+
+        def generate(self, *a, **k):
+            gate.wait(timeout=5)
+            raise AssertionError("unblocked")
+
+    manager = gui.RunManager(config, client_factory=lambda *a, **k: _Blocking())
+
+    assert manager.pause() is False  # nothing running yet
+    assert manager.resume() is False
+
+    manager.start(goal="x", model="m", host="h", multi_file=True)
+    assert manager.status()["paused"] is False
+
+    assert manager.pause() is True
+    assert manager.status()["paused"] is True
+
+    assert manager.resume() is True
+    assert manager.status()["paused"] is False
+    assert manager.resume() is False  # already not paused
+
+    gate.set()
+    manager.wait(timeout=5)
+    assert manager.status()["paused"] is False  # cleared on completion too
+
+
+def test_update_config_only_reaches_the_active_run_while_paused(tmp_path: Path):
+    config = make_config(tmp_path)
+    import threading
+
+    gate = threading.Event()
+
+    class _Blocking:
+        host = "http://blocking"
+
+        def generate(self, *a, **k):
+            gate.wait(timeout=5)
+            raise AssertionError("unblocked")
+
+    manager = gui.RunManager(config, client_factory=lambda *a, **k: _Blocking())
+    manager.start(goal="x", model="m", host="h", multi_file=True)
+
+    # Not paused: only the "next run" pool is updated.
+    manager.update_config(max_fix_attempts=9)
+    active = manager._active_config
+    assert active is not None
+    assert active.max_fix_attempts != 9
+
+    manager.pause()
+    manager.update_config(max_fix_attempts=9)
+    assert active.max_fix_attempts == 9  # same object, mutated in place
+
+    gate.set()
+    manager.wait(timeout=5)
 
 
 def test_run_manager_records_a_crash_as_a_failed_run(tmp_path: Path):
@@ -542,6 +605,44 @@ def test_cancel_endpoint_stops_a_run_and_frees_the_gui(tmp_path: Path):
         t.join(timeout=5)
 
 
+def test_pause_and_resume_endpoints(tmp_path: Path):
+    import threading
+
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    gate = threading.Event()
+
+    class _Blocking:
+        host = "http://blocking"
+
+        def generate(self, *a, **k):
+            gate.wait(timeout=5)
+            raise AssertionError("unblocked")
+
+    server.run_manager._client_factory = lambda *a, **k: _Blocking()
+    try:
+        server.run_manager.start(goal="x", model="m", host="h", multi_file=True)
+
+        status, body = _post_json(f"http://127.0.0.1:{port}/api/run/pause", {})
+        assert status == 200
+        assert body == {"paused": True}
+        assert server.run_manager.status()["paused"] is True
+
+        status, body = _post_json(f"http://127.0.0.1:{port}/api/run/resume", {})
+        assert status == 200
+        assert body == {"resumed": True}
+        assert server.run_manager.status()["paused"] is False
+
+        gate.set()
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
 def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
     import threading
     import urllib.request
@@ -557,6 +658,7 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
          "truncated": False, "endpoint": "http://second:11434"},
         {"event": "verify", "path": str(run_dir / "core.py"), "attempt": 0,
          "stage": "compile", "success": True, "output": ""},
+        {"event": "file_result", "path": str(run_dir / "core.py"), "success": True},
     ]
     (run_dir / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
 
@@ -571,9 +673,12 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
             ).read()
         )
         assert body["has_plan"] is True
+        assert body["phase"] == "building"  # no run_result event in this fixture
         assert body["files"] == [
             {
                 "name": "core.py",
+                "purpose": "x",
+                "depends_on": [],
                 "status": "ok",
                 "size": 6,
                 "has_spec": True,
@@ -629,6 +734,104 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
             raise AssertionError("expected an error response")
         except urllib.error.HTTPError as exc:
             assert exc.code == 404
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_files_endpoint_lists_planned_files_that_have_not_started_yet(tmp_path: Path):
+    """A to-do list needs to show what's *queued*, not just what's already
+    on disk -- a file the planner listed but no worker has claimed is
+    "pending", one with a spec/codegen event but no verdict yet is
+    "building", and each entry carries its own purpose/depends_on
+    straight from the plan for the dependency view."""
+    import threading
+    import urllib.request
+
+    config = make_config(tmp_path)
+    run_dir = config.workspace_root / "20260101-000000-pending1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "core.py").write_text("x = 1\n")
+    records = [
+        {
+            "event": "plan",
+            "files": [
+                {"path": "core.py", "purpose": "the core module", "depends_on": []},
+                {"path": "main.py", "purpose": "entry point", "depends_on": ["core.py"]},
+                {"path": "helper.py", "purpose": "a helper", "depends_on": ["core.py"]},
+            ],
+        },
+        {"event": "spec", "path": "core.py", "spec": "- set x to 1"},
+        {"event": "codegen", "path": str(run_dir / "core.py"), "code": "x = 1\n",
+         "truncated": False, "endpoint": "http://a:11434"},
+        {"event": "verify", "path": str(run_dir / "core.py"), "attempt": 0,
+         "stage": "compile", "success": True, "output": ""},
+        {"event": "file_result", "path": str(run_dir / "core.py"), "success": True},
+        {"event": "skipped", "path": str(run_dir / "helper.py"),
+         "reason": "a dependency did not build"},
+        {"event": "file_result", "path": str(run_dir / "helper.py"), "success": False},
+    ]
+    (run_dir / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        body = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/files/20260101-000000-pending1", timeout=5
+            ).read()
+        )
+        by_name = {f["name"]: f for f in body["files"]}
+        assert by_name["core.py"]["status"] == "ok"
+        assert by_name["main.py"]["status"] == "pending"  # planned, never started
+        assert by_name["main.py"]["depends_on"] == ["core.py"]
+        assert by_name["main.py"]["purpose"] == "entry point"
+        assert by_name["helper.py"]["status"] == "skipped"
+        # plan order preserved, not filesystem/alphabetical order
+        assert [f["name"] for f in body["files"]] == ["core.py", "main.py", "helper.py"]
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_files_endpoint_does_not_report_a_still_retrying_file_as_failed(tmp_path: Path):
+    """A verify failure isn't the last word while the fix loop still has
+    attempts left (or is sitting paused between two of them) -- only a
+    `file_result` event means the file's build has actually concluded.
+    Found live: pausing a run mid-fix-loop showed a file as FAILED in the
+    graph purely because its most recent verify attempt had failed, even
+    though the fix loop was simply paused, not given up."""
+    import threading
+    import urllib.request
+
+    config = make_config(tmp_path)
+    run_dir = config.workspace_root / "20260101-000000-stillretry1"
+    run_dir.mkdir(parents=True)
+    records = [
+        {"event": "plan", "files": [{"path": "main.py", "purpose": "x", "depends_on": []}]},
+        {"event": "spec", "path": "main.py", "spec": "- x"},
+        {"event": "codegen", "path": str(run_dir / "main.py"), "code": "bad(",
+         "truncated": False, "endpoint": "http://a:11434"},
+        {"event": "verify", "path": str(run_dir / "main.py"), "attempt": 0,
+         "stage": "compile", "success": False, "output": "SyntaxError"},
+        {"event": "run_paused"},
+        # No file_result yet -- the fix loop is paused, not finished.
+    ]
+    (run_dir / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        body = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/files/20260101-000000-stillretry1", timeout=5
+            ).read()
+        )
+        assert body["files"][0]["status"] == "building"  # not "failed"
     finally:
         server.shutdown()
         t.join(timeout=5)

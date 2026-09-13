@@ -85,6 +85,13 @@ class RunManager:
         self._run_id: str | None = None
         self._state = "idle"  # idle | running | done
         self._cancel_event: threading.Event | None = None
+        self._pause_event: threading.Event | None = None
+        # The exact Config object the active run's loop holds (a
+        # different instance than `self._config`, which is only "defaults
+        # for the next run" -- see `start()`). Set only while a run is in
+        # progress; `update_config()` mutates it in place, live, while
+        # paused (see `Config.apply_overrides`).
+        self._active_config: Config | None = None
         self._session: Session | None = None
 
     @property
@@ -109,14 +116,46 @@ class RunManager:
 
     def update_config(self, **overrides) -> Config:
         """Apply settings-screen overrides for every run started from now
-        on. Never touches a run already in progress -- its own Config was
-        captured at `start()` time."""
+        on. Also applied live, in place, to the *active* run's own Config
+        -- but only while that run is paused; a change made while it's
+        still going would silently affect whichever call happens to fire
+        next, with no clear moment the user asked for that. Paused, there
+        is no call in flight to be surprised by one."""
         with self._lock:
             self._config = self._config.with_overrides(**overrides)
+            if (
+                self._active_config is not None
+                and self._pause_event is not None
+                and self._pause_event.is_set()
+            ):
+                self._active_config.apply_overrides(**overrides)
             return self._config
 
+    def pause(self) -> bool:
+        """Ask the active run to stop claiming new work at its next
+        checkpoint (see `orchestrator._wait_if_paused`) and block there --
+        a call already in flight still has to finish, same as `cancel()`."""
+        with self._lock:
+            if self._state != "running" or self._pause_event is None:
+                return False
+            self._pause_event.set()
+        if self._session is not None:
+            self._session.log("run_paused")
+        return True
+
+    def resume(self) -> bool:
+        with self._lock:
+            if self._pause_event is None or not self._pause_event.is_set():
+                return False
+            self._pause_event.clear()
+        if self._session is not None:
+            self._session.log("run_resumed")
+        return True
+
     def status(self) -> dict:
-        return {"state": self._state, "run_id": self._run_id}
+        with self._lock:
+            paused = self._pause_event.is_set() if self._pause_event else False
+            return {"state": self._state, "run_id": self._run_id, "paused": paused}
 
     def start(
         self,
@@ -137,9 +176,11 @@ class RunManager:
             self._session = session
             self._state = "running"
             self._cancel_event = threading.Event()
+            self._pause_event = threading.Event()
+            self._active_config = config
             self._thread = threading.Thread(
                 target=self._run,
-                args=(config, session, goal, multi_file, eps, self._cancel_event),
+                args=(config, session, goal, multi_file, eps, self._cancel_event, self._pause_event),
                 daemon=True,
             )
             self._thread.start()
@@ -155,6 +196,12 @@ class RunManager:
             if self._state != "running" or self._cancel_event is None:
                 return False
             self._cancel_event.set()
+            if self._pause_event is not None:
+                # A paused worker is asleep waiting on this event, not on
+                # cancel_event directly -- clear it so `_wait_if_paused`'s
+                # loop wakes on its next 0.5s poll and sees cancel is set,
+                # rather than staying parked until something resumes it.
+                self._pause_event.clear()
             self._state = "idle"
             return True
 
@@ -173,6 +220,7 @@ class RunManager:
         multi_file: bool,
         endpoints: list[dict],
         cancel_event: threading.Event,
+        pause_event: threading.Event,
     ) -> None:
         run_id = session.run_id
         try:
@@ -184,10 +232,17 @@ class RunManager:
             ]
             if multi_file:
                 MultiFileLoop(
-                    pool[0], config, session, pool_clients=pool, cancel_event=cancel_event
+                    pool[0],
+                    config,
+                    session,
+                    pool_clients=pool,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
                 ).run(goal)
             else:
-                SingleFileLoop(pool[0], config, session, cancel_event=cancel_event).run(goal)
+                SingleFileLoop(
+                    pool[0], config, session, cancel_event=cancel_event, pause_event=pause_event
+                ).run(goal)
         except Exception as exc:  # noqa: BLE001 -- a GUI run must never crash silently
             try:
                 session.log("run_aborted", reason=f"{type(exc).__name__}: {exc}")
@@ -201,6 +256,9 @@ class RunManager:
                 # not clobber whatever run superseded it.
                 if self._run_id == run_id:
                     self._state = "done"
+                    self._active_config = None
+                    if self._pause_event is not None:
+                        self._pause_event.clear()
 
 
 def stream_events(
@@ -435,6 +493,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._post_run()
             elif path == "/api/run/cancel":
                 self._send_json({"cancelled": self._runs.cancel()})
+            elif path == "/api/run/pause":
+                self._send_json({"paused": self._runs.pause()})
+            elif path == "/api/run/resume":
+                self._send_json({"resumed": self._runs.resume()})
             elif path == "/api/settings":
                 self._post_settings()
             else:
@@ -517,55 +579,120 @@ class _Handler(BaseHTTPRequestHandler):
     _GENERATED_FILE_GLOBS = ("*.py", "*.html", "*.css", "*.js")
 
     def _files_response(self, run_id: str) -> dict:
-        """The generated files on disk for a run (`.py`/`.html`/`.css`/
-        `.js` -- everything the planner is allowed to produce, see
-        steps/plan.py), each tagged with its latest known verify outcome
-        from the log (or "pending" while it hasn't been verified yet,
-        e.g. mid-generation) and whether a spec was written for it --
-        single-file runs never have one. `has_plan` says whether the run
-        went through the planner at all (multi-file only), so the page
-        knows whether to offer a Plan window."""
+        """Every file this run is building, `.py`/`.html`/`.css`/`.js`
+        (everything the planner may produce, see steps/plan.py) -- not
+        just the ones that exist on disk yet. When the run went through
+        the planner (`has_plan`), the plan's own file list is the source
+        of truth, in plan order: a file the planner listed but no worker
+        has claimed yet shows up as "pending" rather than being absent,
+        which is the whole point for a to-do list -- and each entry
+        carries `purpose`/`depends_on` straight from the plan, so the
+        page can render the dependency graph without a second fetch. A
+        single-file run has no plan at all; falls back to whatever's on
+        disk, as before. `phase` is a coarse "where is this run right
+        now" for an at-a-glance header: planning -> building ->
+        integration -> done."""
         run_dir = self._runs.log_path(run_id).parent
         if not run_dir.is_dir():
-            return {"files": [], "has_plan": False}
+            return {"files": [], "has_plan": False, "phase": "planning"}
         status_by_name: dict[str, str] = {}
         spec_names: set[str] = set()
         endpoint_by_name: dict[str, str] = {}
+        started_names: set[str] = set()  # has a spec or codegen event -- "building", not "pending"
+        finished_names: set[str] = set()  # its build loop has actually concluded, see file_result
+        plan_entries: list[dict] = []
         has_plan = False
         log_path = run_dir / "log.jsonl"
+        run_summary = None
         if log_path.exists():
-            for f in summary.load_run_summary(log_path).files:
+            run_summary = summary.load_run_summary(log_path)
+            for f in run_summary.files:
                 name = Path(f.path).name
                 if f.spec_flagged:
                     status_by_name[name] = "flagged"
                 elif f.advisory:
                     status_by_name[name] = "advisory"
+                elif f.last_error.startswith("skipped:"):
+                    status_by_name[name] = "skipped"
                 else:
                     status_by_name[name] = "ok" if f.success else "failed"
             for record in self._iter_log_events(run_id):
                 event = record.get("event")
                 if event == "plan":
                     has_plan = True
+                    plan_entries = [
+                        {
+                            "name": Path(pf.get("path", "")).name,
+                            "purpose": pf.get("purpose", ""),
+                            "depends_on": pf.get("depends_on") or [],
+                        }
+                        for pf in record.get("files", [])
+                    ]
                 elif event == "spec":
-                    spec_names.add(Path(record.get("path", "")).name)
-                elif event == "codegen" and record.get("endpoint"):
-                    # The same worker (client/endpoint) owns a file for
-                    # its whole build, so this is set once and stays --
-                    # last-write-wins is only relevant if it ever isn't.
-                    endpoint_by_name[Path(record.get("path", "")).name] = record["endpoint"]
+                    name = Path(record.get("path", "")).name
+                    spec_names.add(name)
+                    started_names.add(name)
+                elif event == "codegen":
+                    name = Path(record.get("path", "")).name
+                    started_names.add(name)
+                    if record.get("endpoint"):
+                        # The same worker (client/endpoint) owns a file for
+                        # its whole build, so this is set once and stays --
+                        # last-write-wins is only relevant if it ever isn't.
+                        endpoint_by_name[name] = record["endpoint"]
+                elif event == "file_result":
+                    finished_names.add(Path(record.get("path", "")).name)
+
+        phase = "planning"
+        if has_plan:
+            phase = "building"
+            if run_summary is not None and run_summary.integration is not None:
+                phase = "integration"
+        if run_summary is not None and run_summary.finished:
+            phase = "done"
+
+        if plan_entries:
+            files = []
+            for pf in plan_entries:
+                name = pf["name"]
+                # A verify event's own success/fail isn't final by itself
+                # -- the fix loop may still have retries left (and, while
+                # paused, may be sitting on a just-failed attempt for a
+                # while before trying again). Only trust status_by_name
+                # once file_result says this file's build has actually
+                # concluded; until then it's still "building".
+                status = status_by_name.get(name) if name in finished_names else None
+                if status is None:
+                    status = "building" if name in started_names else "pending"
+                disk_path = run_dir / name
+                files.append(
+                    {
+                        "name": name,
+                        "purpose": pf["purpose"],
+                        "depends_on": pf["depends_on"],
+                        "status": status,
+                        "size": disk_path.stat().st_size if disk_path.exists() else 0,
+                        "has_spec": name in spec_names,
+                        "endpoint": endpoint_by_name.get(name, ""),
+                    }
+                )
+            return {"files": files, "has_plan": True, "phase": phase}
+
         found = (p for pattern in self._GENERATED_FILE_GLOBS for p in run_dir.glob(pattern))
         files = []
         for p in sorted(found):
             files.append(
                 {
                     "name": p.name,
+                    "purpose": "",
+                    "depends_on": [],
                     "status": status_by_name.get(p.name, "pending"),
                     "size": p.stat().st_size,
                     "has_spec": p.name in spec_names,
                     "endpoint": endpoint_by_name.get(p.name, ""),
                 }
             )
-        return {"files": files, "has_plan": has_plan}
+        return {"files": files, "has_plan": has_plan, "phase": phase}
 
     def _read_plan_text(self, run_id: str) -> str | None:
         """The most recent `plan` event, rendered as plain text -- None
@@ -674,7 +801,7 @@ _INDEX_HTML = """<!doctype html>
   [hidden] { display:none !important; }
   body { margin:0; background:var(--bg); color:var(--fg);
          font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  main { max-width:680px; margin:0 auto; padding:44px 20px 80px; }
+  main { max-width:760px; margin:0 auto; padding:44px 20px 80px; }
   h1 { font-size:19px; font-weight:600; letter-spacing:-.01em; margin:0 0 24px;
        display:flex; align-items:baseline; gap:0; }
   h1 span { color:var(--muted); font-weight:400; }
@@ -770,6 +897,71 @@ _INDEX_HTML = """<!doctype html>
                border-radius:8px; background:color-mix(in srgb, var(--bad) 8%, transparent);
                color:var(--fg); font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
                white-space:pre-wrap; word-break:break-word; max-height:280px; overflow:auto; }
+
+  /* -- phase stepper: "where is this run right now", at a glance -- */
+  .phase-stepper { display:flex; margin:0 0 22px; border:1px solid var(--line);
+                    border-radius:8px; overflow:hidden; }
+  .phase-step { flex:1; text-align:center; padding:8px 6px; font-size:10.5px; font-weight:700;
+                text-transform:uppercase; letter-spacing:.05em; color:var(--muted);
+                background:color-mix(in srgb, var(--fg) 3%, transparent);
+                border-right:1px solid var(--line); transition:background .25s,color .25s; }
+  .phase-step:last-child { border-right:0; }
+  .phase-step.past { color:var(--ok); background:color-mix(in srgb, var(--ok) 12%, transparent); }
+  .phase-step.current { color:#fff; background:var(--accent); }
+  .phase-step.aborted { color:#fff; background:var(--bad); }
+
+  /* -- run controls: Stop / Pause / Resume side by side -- */
+  .run-actions { display:flex; gap:8px; }
+  .run-actions button { flex:1; width:auto; }
+  #pause { background:var(--warn); }
+  #resume { background:var(--ok); }
+  .pause-note { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--warn);
+                 margin-top:10px; }
+  .pause-note .dot { width:6px; height:6px; border-radius:50%; background:var(--warn);
+                       animation:pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+
+  /* -- endpoint pool: primary + any number of extras -- */
+  .endpoint-row { position:relative; padding-right:22px; }
+  .endpoint-row .endpoint-remove { position:absolute; top:0; right:0; background:none; width:auto;
+                margin:16px 0 0; padding:4px 2px; color:var(--muted); font-size:16px; line-height:1; }
+  .endpoint-row .endpoint-remove:hover { color:var(--bad); }
+
+  /* -- dependency graph: doubles as the to-do list -- */
+  .graph-wrap { overflow-x:auto; padding:2px 0 4px; }
+  .graph-empty { color:var(--muted); font-size:13px; padding:4px 0; }
+  .dep-svg { display:block; margin:0 auto; }
+  .dep-node-rect { fill:var(--bg); stroke:var(--line); stroke-width:1.5; cursor:pointer; }
+  .dep-node-rect:hover { stroke:var(--accent); }
+  .dep-node-rect.pending { stroke-dasharray:4 3; }
+  .dep-node-rect.building { stroke:var(--accent); stroke-width:2; }
+  .dep-node-rect.ok { stroke:var(--ok); }
+  .dep-node-rect.failed { stroke:var(--bad); }
+  .dep-node-rect.advisory { stroke:var(--warn); }
+  .dep-node-rect.flagged { stroke:var(--accent); stroke-dasharray:2 2; }
+  .dep-node-rect.skipped { stroke:var(--muted); stroke-dasharray:2 2; }
+  .dep-node-group { cursor:pointer; }
+  .dep-node-name { font:600 11px ui-monospace,SFMono-Regular,Menlo,monospace; fill:var(--fg);
+                    pointer-events:none; }
+  .dep-node-status { font:600 9px ui-monospace,SFMono-Regular,Menlo,monospace; pointer-events:none;
+                       text-transform:uppercase; letter-spacing:.03em; }
+  .dep-node-status.ok { fill:var(--ok); }
+  .dep-node-status.failed { fill:var(--bad); }
+  .dep-node-status.advisory { fill:var(--warn); }
+  .dep-node-status.flagged { fill:var(--accent); }
+  .dep-node-status.building { fill:var(--accent); }
+  .dep-node-status.pending, .dep-node-status.skipped { fill:var(--muted); }
+  .dep-edge { fill:none; stroke:var(--line); stroke-width:1.3; }
+  .graph-legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin-top:8px; font-size:10.5px;
+                   color:var(--muted); }
+  .graph-legend span { display:inline-flex; align-items:center; gap:4px; }
+  .graph-legend i { width:8px; height:8px; border-radius:2px; display:inline-block;
+                     border:1.5px solid var(--muted); }
+  .graph-legend i.ok { border-color:var(--ok); } .graph-legend i.failed { border-color:var(--bad); }
+  .graph-legend i.advisory { border-color:var(--warn); }
+  .graph-legend i.flagged { border-color:var(--accent); }
+  .graph-legend i.building { border-color:var(--accent); border-width:2px; }
+  .graph-legend i.pending { border-style:dashed; }
 </style>
 </head>
 <body>
@@ -778,6 +970,12 @@ _INDEX_HTML = """<!doctype html>
     <button type="button" id="settings-btn" class="gear" title="settings">&#9881;</button>
   </h1>
   <div id="calls-list" class="calls-list" hidden></div>
+  <div id="phase-stepper" class="phase-stepper" hidden>
+    <div class="phase-step" data-phase="planning">Plan</div>
+    <div class="phase-step" data-phase="building">Build</div>
+    <div class="phase-step" data-phase="integration">Integrate</div>
+    <div class="phase-step" data-phase="done">Done</div>
+  </div>
   <div id="settings-panel" class="settings-panel" hidden>
     <div class="row">
       <div><label for="s-temperature">Temperature</label><input type="text" id="s-temperature"></div>
@@ -808,15 +1006,8 @@ _INDEX_HTML = """<!doctype html>
   </div>
   <button type="button" id="refresh" class="link">&#8635; re-fetch models</button>
 
-  <div id="ep2" hidden>
-    <label for="model2">Second endpoint <span style="text-transform:none;letter-spacing:0">(parallel, multi-file only)</span></label>
-    <div class="row">
-      <div><select id="model2"></select></div>
-      <div><input type="text" id="host2" placeholder="http://localhost:11434"></div>
-    </div>
-    <button type="button" id="refresh2" class="link">&#8635; re-fetch models</button>
-  </div>
-  <button type="button" id="add-ep" class="link">+ second endpoint</button>
+  <div id="endpoints-extra"></div>
+  <button type="button" id="add-ep" class="link">+ add endpoint <span style="text-transform:none;letter-spacing:0">(parallel, multi-file only)</span></button>
 
   <label for="goal">Goal</label>
   <textarea id="goal" placeholder="a command-line to-do list with add / list / done subcommands"></textarea>
@@ -827,14 +1018,29 @@ _INDEX_HTML = """<!doctype html>
   </div>
 
   <button id="go">Generate</button>
-  <button type="button" id="stop" hidden>Stop</button>
+  <div class="run-actions" id="run-actions" hidden>
+    <button type="button" id="pause">Pause</button>
+    <button type="button" id="resume" hidden>Resume</button>
+    <button type="button" id="stop">Stop</button>
+  </div>
+  <div class="pause-note" id="pause-note" hidden>
+    <span class="dot"></span> Paused -- change settings above, they'll apply on Resume.
+  </div>
   <div class="err" id="err" hidden></div>
 
   <div class="stats" id="stats"></div>
   <pre id="log"></pre>
   <div class="files-panel" id="files-panel" hidden>
-    <label>Files</label>
-    <div class="file-list" id="file-list"></div>
+    <label>Files <span id="plan-link-wrap" style="text-transform:none;letter-spacing:0;font-size:11px"></span></label>
+    <div class="graph-wrap" id="graph-wrap"></div>
+    <div class="graph-legend" id="graph-legend" hidden>
+      <span><i class="pending"></i>pending</span>
+      <span><i class="building"></i>building</span>
+      <span><i class="ok"></i>ok</span>
+      <span><i class="failed"></i>failed</span>
+      <span><i class="advisory"></i>advisory</span>
+      <span><i class="flagged"></i>flagged</span>
+    </div>
   </div>
   <div id="summary"></div>
 </main>
@@ -852,7 +1058,7 @@ _INDEX_HTML = """<!doctype html>
 <script>
 const $ = s => document.querySelector(s);
 const logEl = $("#log"), statsEl = $("#stats"), goBtn = $("#go"), errEl = $("#err");
-const stopBtn = $("#stop");
+const stopBtn = $("#stop"), pauseBtn = $("#pause"), resumeBtn = $("#resume");
 let started = 0, calls = 0, fixes = 0, filesDone = 0, filesTotal = 0, tick = null, es = null;
 let defaultModel = "";
 let currentRunId = null;
@@ -866,7 +1072,41 @@ function tagUrl(url) {
   const id = "r" + (++reqSeq) + "-" + Date.now().toString(36);
   return { url: url + (url.includes("?") ? "&" : "?") + "_r=" + id, id };
 }
-const rowReq = { "": 0, "2": 0 };
+const rowReq = { "": 0 };
+
+// Any number of extra endpoints beyond the primary -- each row gets its
+// own suffixed ids ("-1", "-2", ...) so refreshRow(p) (built for the
+// original fixed host/host2 pair) works unchanged for a dynamic row too.
+let extraEpSeq = 0;
+const extraEpIds = [];
+
+function addEndpointRow() {
+  extraEpSeq++;
+  const suffix = "-" + extraEpSeq;
+  extraEpIds.push(suffix);
+  const row = document.createElement("div");
+  row.className = "endpoint-row";
+  row.innerHTML =
+    `<label>Endpoint <span style="text-transform:none;letter-spacing:0">(parallel, multi-file only)</span></label>` +
+    `<div class="row"><div><select id="model${suffix}"></select></div>` +
+    `<div><input type="text" id="host${suffix}" placeholder="http://localhost:11434"></div></div>` +
+    `<button type="button" id="refresh${suffix}" class="link">&#8635; re-fetch models</button>` +
+    `<button type="button" class="endpoint-remove" title="remove this endpoint">&times;</button>`;
+  $("#endpoints-extra").appendChild(row);
+  const hostInput = $("#host" + suffix);
+  // Default to localhost, not a copy of the primary host -- an endpoint
+  // pointed at the same host as another isn't a separate endpoint at
+  // all, just two workers queuing on one server.
+  hostInput.value = "http://localhost:11434";
+  hostInput.addEventListener("change", () => refreshRow(suffix));
+  $("#refresh" + suffix).addEventListener("click", () => refreshRow(suffix));
+  row.querySelector(".endpoint-remove").addEventListener("click", () => {
+    row.remove();
+    const i = extraEpIds.indexOf(suffix);
+    if (i !== -1) extraEpIds.splice(i, 1);
+  });
+  refreshRow(suffix);
+}
 
 async function loadConfig() {
   const { url } = tagUrl("/api/config");
@@ -876,14 +1116,7 @@ async function loadConfig() {
   await refreshRow("");
   $("#host").addEventListener("change", () => refreshRow(""));
   $("#refresh").addEventListener("click", () => refreshRow(""));
-  $("#host2").addEventListener("change", () => refreshRow("2"));
-  $("#refresh2").addEventListener("click", () => refreshRow("2"));
-  $("#add-ep").addEventListener("click", () => {
-    $("#ep2").hidden = false;
-    $("#add-ep").hidden = true;
-    if (!$("#host2").value) $("#host2").value = c.host;
-    refreshRow("2");
-  });
+  $("#add-ep").addEventListener("click", () => addEndpointRow());
   pollCalls();
   setInterval(pollCalls, 3000);
   loadSettings();
@@ -893,6 +1126,7 @@ async function loadConfig() {
   // that silently rejects "Generate" with "already in progress".
   if (c.state && c.state.state === "running" && c.state.run_id) {
     beginTracking();
+    setPausedUI(!!c.state.paused);
     watchRun(c.state.run_id);
   }
 }
@@ -935,10 +1169,48 @@ $("#settings-save").addEventListener("click", async () => {
     if (!res.ok) { msg.textContent = data.error || "save failed"; return; }
     SETTINGS_KEYS.forEach(k => { if (k in data) $("#s-" + k).value = data[k]; });
     BOOL_SETTINGS_KEYS.forEach(k => { if (k in data) $("#s-" + k).checked = data[k]; });
-    msg.textContent = "saved \\u2014 applies to the next run";
+    msg.textContent = "saved \\u2014 "
+      + (isPaused() ? "applied to the paused run" : "applies to the next run");
     setTimeout(() => { if (msg.textContent.startsWith("saved")) msg.textContent = ""; }, 3000);
   } catch (e) { msg.textContent = "could not reach the server"; }
 });
+
+function isPaused() {
+  return !resumeBtn.hidden;
+}
+
+function setPausedUI(paused) {
+  pauseBtn.hidden = paused; pauseBtn.disabled = false;
+  resumeBtn.hidden = !paused; resumeBtn.disabled = false;
+  $("#pause-note").hidden = !paused;
+}
+
+pauseBtn.addEventListener("click", async () => {
+  pauseBtn.disabled = true;
+  try {
+    const { url } = tagUrl("/api/run/pause");
+    await fetch(url, { method: "POST" });
+  } catch (e) { /* the SSE stream will still carry run_paused when it lands */ }
+});
+
+resumeBtn.addEventListener("click", async () => {
+  resumeBtn.disabled = true;
+  try {
+    const { url } = tagUrl("/api/run/resume");
+    await fetch(url, { method: "POST" });
+  } catch (e) { /* the SSE stream will still carry run_resumed when it lands */ }
+});
+
+const PHASE_ORDER = ["planning", "building", "integration", "done"];
+function updatePhaseStepper(phase, aborted) {
+  const idx = PHASE_ORDER.indexOf(phase);
+  $("#phase-stepper").querySelectorAll(".phase-step").forEach(el => {
+    const i = PHASE_ORDER.indexOf(el.dataset.phase);
+    el.classList.remove("past", "current", "aborted");
+    if (i < idx) el.classList.add("past");
+    else if (i === idx) el.classList.add(aborted ? "aborted" : (phase === "done" ? "past" : "current"));
+  });
+}
 async function refreshRow(p) {
   const host = $("#host" + p).value.trim();
   const sel = $("#model" + p);
@@ -1044,46 +1316,26 @@ function showCallWindow(call) {
 
 async function refreshFiles(runId) {
   if (!runId) return;
-  let files = [], hasPlan = false;
+  let files = [], hasPlan = false, phase = "planning";
   try {
     const { url } = tagUrl("/api/files/" + runId);
-    ({ files, has_plan: hasPlan } = await (await fetch(url)).json());
+    ({ files, has_plan: hasPlan, phase } = await (await fetch(url)).json());
   } catch (e) { return; }
-  const panel = $("#files-panel"), list = $("#file-list");
+  updatePhaseStepper(phase, false);
+  const panel = $("#files-panel");
   if (!files.length && !hasPlan) { panel.hidden = true; return; }
   panel.hidden = false;
 
-  // Only worth a badge once there's actually more than one endpoint in
-  // play for this run -- the common single-endpoint case would just see
-  // the same host repeated on every row.
-  const showEndpoints = new Set(files.map(f => f.endpoint).filter(Boolean)).size > 1;
+  const planWrap = $("#plan-link-wrap");
+  if (hasPlan) {
+    planWrap.innerHTML = `<span class="fspec" style="text-decoration:underline;cursor:pointer">view plan</span>`;
+    planWrap.firstChild.addEventListener("click", () => openFileWindow(runId, "plan", ""));
+  } else {
+    planWrap.innerHTML = "";
+  }
 
-  let html = hasPlan
-    ? `<div data-kind="plan"><span class="file-dot"></span><span class="fname">Plan</span></div>`
-    : "";
-  html += files.map(f => {
-    const spec = f.has_spec
-      ? `<span class="fspec" data-kind="spec" data-name="${esc(f.name)}">spec</span>`
-      : "";
-    const ep = showEndpoints && f.endpoint
-      ? `<span class="fep" title="${esc(f.endpoint)}">${esc(shortHost(f.endpoint))}</span>`
-      : "";
-    return `<div data-kind="code" data-name="${esc(f.name)}">`
-      + `<span class="file-dot ${f.status}"></span>`
-      + `<span class="fname">${esc(f.name)}</span>${spec}${ep}`
-      + `<span class="fsize">${f.size}b</span></div>`;
-  }).join("");
-  list.innerHTML = html;
-
-  list.querySelectorAll("[data-kind='plan'], [data-kind='code']").forEach(el => {
-    el.addEventListener("click", () => openFileWindow(runId, el.dataset.kind, el.dataset.name));
-  });
-  list.querySelectorAll("[data-kind='spec']").forEach(el => {
-    el.addEventListener("click", e => {
-      e.stopPropagation();
-      openFileWindow(runId, "spec", el.dataset.name);
-    });
-  });
+  $("#graph-legend").hidden = false;
+  renderGraph(files, runId);
 
   // A window left open while its file is still being rewritten stays
   // live -- refetch it on the same poll instead of freezing on the
@@ -1096,6 +1348,81 @@ async function refreshFiles(runId) {
   ) {
     openFileWindow(runId, openWindow.kind, openWindow.name);
   }
+}
+
+const _STATUS_LABEL = {
+  pending: "queued", building: "\\u2026", ok: "ok", failed: "failed",
+  advisory: "advisory", flagged: "flagged", skipped: "skipped",
+};
+
+// Renders every planned file as a node in a layered dependency graph --
+// layer = 1 + the deepest dependency's layer (0 for a file with none),
+// so the graph reads top-to-bottom in build order and doubles as a
+// to-do list: a "pending" node is one nobody has claimed yet. Plain SVG,
+// laid out here rather than via flexbox-then-measure, so edges can be
+// drawn as simple paths between known coordinates in one pass.
+function renderGraph(files, runId) {
+  const wrap = $("#graph-wrap");
+  if (!files.length) {
+    wrap.innerHTML = `<div class="graph-empty">waiting for the plan\\u2026</div>`;
+    return;
+  }
+
+  const layerOf = {};
+  files.forEach(f => {
+    const deps = f.depends_on || [];
+    layerOf[f.name] = deps.length ? 1 + Math.max(...deps.map(d => layerOf[d] ?? 0)) : 0;
+  });
+  const maxLayer = Math.max(0, ...files.map(f => layerOf[f.name]));
+  const rows = [];
+  for (let i = 0; i <= maxLayer; i++) rows.push([]);
+  files.forEach(f => rows[layerOf[f.name]].push(f));
+
+  const NODE_W = 132, NODE_H = 40, GAP_X = 18, GAP_Y = 38, PAD = 16;
+  const maxCols = Math.max(...rows.map(r => r.length));
+  const width = PAD * 2 + maxCols * NODE_W + Math.max(0, maxCols - 1) * GAP_X;
+  const height = PAD * 2 + rows.length * NODE_H + Math.max(0, rows.length - 1) * GAP_Y;
+
+  const pos = {};
+  rows.forEach((row, r) => {
+    const rowWidth = row.length * NODE_W + (row.length - 1) * GAP_X;
+    const startX = (width - rowWidth) / 2;
+    row.forEach((f, c) => {
+      const x = startX + c * (NODE_W + GAP_X);
+      const y = PAD + r * (NODE_H + GAP_Y);
+      pos[f.name] = { x, cx: x + NODE_W / 2, top: y, bottom: y + NODE_H };
+    });
+  });
+
+  let edges = "";
+  files.forEach(f => {
+    (f.depends_on || []).forEach(dep => {
+      const from = pos[dep], to = pos[f.name];
+      if (!from || !to) return;
+      const midY = (from.bottom + to.top) / 2;
+      edges += `<path class="dep-edge" d="M${from.cx},${from.bottom} `
+        + `C${from.cx},${midY} ${to.cx},${midY} ${to.cx},${to.top}" />`;
+    });
+  });
+
+  let nodes = "";
+  files.forEach(f => {
+    const p = pos[f.name];
+    const title = esc(f.purpose ? `${f.name} \\u2014 ${f.purpose}` : f.name);
+    const label = f.name.length > 16 ? f.name.slice(0, 14) + "\\u2026" : f.name;
+    nodes += `<g class="dep-node-group" data-name="${esc(f.name)}">`
+      + `<rect class="dep-node-rect ${f.status}" x="${p.x}" y="${p.top}" `
+      + `width="${NODE_W}" height="${NODE_H}" rx="7"><title>${title}</title></rect>`
+      + `<text class="dep-node-name" x="${p.cx}" y="${p.top + 17}" text-anchor="middle">${esc(label)}</text>`
+      + `<text class="dep-node-status ${f.status}" x="${p.cx}" y="${p.top + 30}" text-anchor="middle">`
+      + `${_STATUS_LABEL[f.status] || esc(f.status)}</text></g>`;
+  });
+
+  wrap.innerHTML = `<svg class="dep-svg" viewBox="0 0 ${width} ${height}" `
+    + `width="${width}" height="${height}">${edges}${nodes}</svg>`;
+  wrap.querySelectorAll(".dep-node-group").forEach(el => {
+    el.addEventListener("click", () => openFileWindow(runId, "code", el.dataset.name));
+  });
 }
 
 let openWindow = null; // { kind: "code" | "spec" | "plan", name }
@@ -1135,6 +1462,8 @@ function onEvent(d) {
   if (d.event === "fix") fixes++;
   if (d.event === "plan") filesTotal = (d.fields.files || []).length;
   if (d.event === "verify" && d.fields.success) filesDone++;
+  if (d.event === "run_paused") setPausedUI(true);
+  if (d.event === "run_resumed") setPausedUI(false);
   renderStats(false);
 }
 
@@ -1184,6 +1513,7 @@ async function showSummary(runId) {
   const why = whyFailed(s);
   const reason = why ? `<pre class="reason">${esc(why)}</pre>` : "";
   $("#summary").innerHTML = (rows ? `<table>${rows}</table>` : "") + reason;
+  return s;
 }
 
 // Shared by both a fresh "Generate" click and resuming a run that was
@@ -1192,9 +1522,13 @@ async function showSummary(runId) {
 function beginTracking() {
   errEl.hidden = true;
   goBtn.disabled = true;
-  stopBtn.hidden = false; stopBtn.disabled = false;
+  $("#run-actions").hidden = false;
+  stopBtn.disabled = false;
+  setPausedUI(false);
   logEl.textContent = ""; $("#summary").innerHTML = "";
-  $("#files-panel").hidden = true; $("#file-list").innerHTML = "";
+  $("#files-panel").hidden = true; $("#graph-wrap").innerHTML = ""; $("#graph-legend").hidden = true;
+  $("#phase-stepper").hidden = false;
+  updatePhaseStepper("planning", false);
   closeFileWindow();
   calls = fixes = filesDone = filesTotal = 0; started = Date.now();
   renderStats(false);
@@ -1209,9 +1543,14 @@ function watchRun(runId) {
   currentRunId = runId;
   const finish = async () => {
     es.close(); clearInterval(tick);
-    stopBtn.hidden = true;
-    await showSummary(runId);
+    $("#run-actions").hidden = true;
+    const s = await showSummary(runId);
     await refreshFiles(runId);
+    if (s && s.aborted) {
+      $("#phase-stepper").querySelectorAll(".phase-step.current").forEach(el => {
+        el.classList.replace("current", "aborted");
+      });
+    }
     await pollCalls();  // clears the calls bar right away, not up to 3s late
     goBtn.disabled = false;
   };
@@ -1240,11 +1579,11 @@ $("#go").addEventListener("click", async () => {
     goal, model: $("#model").value, host: $("#host").value.trim(),
     multi_file: $("#multi").checked,
   };
-  if (!$("#ep2").hidden && $("#host2").value.trim()) {
-    body.endpoints = [
-      { host: body.host, model: body.model },
-      { host: $("#host2").value.trim(), model: $("#model2").value },
-    ];
+  const extras = extraEpIds
+    .map(suffix => ({ host: $("#host" + suffix).value.trim(), model: $("#model" + suffix).value }))
+    .filter(e => e.host);
+  if (extras.length) {
+    body.endpoints = [{ host: body.host, model: body.model }, ...extras];
   }
   const { url: runUrl } = tagUrl("/api/run");
   let res;
@@ -1268,7 +1607,7 @@ stopBtn.addEventListener("click", async () => {
 });
 
 function fail(msg) {
-  clearInterval(tick); goBtn.disabled = false; stopBtn.hidden = true;
+  clearInterval(tick); goBtn.disabled = false; $("#run-actions").hidden = true;
   errEl.textContent = msg; errEl.hidden = false;
 }
 

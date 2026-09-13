@@ -65,6 +65,18 @@ core design, not just style.
   disagreement becomes a `stage="critic"` verify failure, so it gets the
   same bounded fix attempts as any other stage, and if still unresolved
   at the end, the file is `spec_flagged` rather than failed (see Status).
+  `_wait_if_paused` is the pause equivalent of `RunCancelled` -- a
+  `pause_event` checked at the exact same three checkpoints as
+  `cancel_event` (between fix attempts in `_generate_and_fix`, before a
+  worker claims its next file in `_generate_files`, before each
+  integration-fix round), blocking there until cleared, still honouring
+  `cancel_event` while blocked so Stop works mid-pause. `record()` (the
+  dispatcher's single choke point for "a file's build loop has actually
+  concluded") logs a `file_result` event there -- the one place a live
+  viewer (the GUI's dependency graph) can tell "still retrying, possibly
+  paused" apart from "genuinely done"; a bare `verify` event alone can't,
+  since a failed attempt with retries left looks identical in the log to
+  one that just gave up.
 - `harness/steps/` — one atomic LLM call per concern: `plan.py`
   (schema-constrained file list, bounded retry, a final schema-free
   attempt parsed by `_parse_free_form`; also flattens to bare filenames,
@@ -183,17 +195,56 @@ core design, not just style.
   `max_fix_attempts`/`max_total_iterations`/`timeout_seconds` for runs
   started after the change; saved to `config/gui_settings.json`
   (gitignored -- default.yaml keeps its comments) and merged on top of
-  it at server start. A **Files panel** lists a run's generated `.py`
-  files with their latest verify status, plus a top `Plan` row (when the
-  run went through the planner) and a `spec` link on files that got one
-  (single-file runs skip both). Clicking any of these opens a small
-  modal window over the page (`#file-modal`) rather than an inline pane
-  -- `/api/files/<run_id>` (list + `has_plan`/`has_spec` flags),
-  `/api/file/<run_id>/<name>` (source), `/api/plan/<run_id>` (the
-  planner's file list rendered as text), `/api/spec/<run_id>/<name>`
-  (that file's spec). A window left open stays live as the run
-  continues -- refreshed on the same poll as progress. `_read_run_file`
-  confines reads to that run's own directory.
+  it at server start. Saving **while the active run is paused** also
+  applies live: `RunManager._active_config` is the exact `Config`
+  instance the running loop holds (a separate object from `self._config`,
+  which is only "defaults for the next run"), and `update_config` calls
+  `Config.apply_overrides` (mutates fields on `self` in place, unlike
+  `with_overrides`'s fresh copy) on it when paused -- since every read
+  site in `orchestrator.py` reads `config.<field>` live rather than a
+  snapshot taken once, the change is in effect the moment the run
+  resumes, no extra plumbing needed. **Pause/Resume** buttons
+  (`RunManager.pause()`/`resume()`, `/api/run/pause`/`/api/run/resume`)
+  set/clear a `pause_event` alongside the existing `cancel_event`, passed
+  into the loop the same way; `/api/config`'s `state.paused` and the
+  `run_paused`/`run_resumed` log events (the SSE stream already carries
+  these live) drive the button swap and a "paused, changes apply on
+  Resume" note. Verified live: pausing mid-fix-loop produces a
+  `[paused] waiting to resume...` log line between two fix attempts, a
+  `max_fix_attempts` bump applied while paused let a file survive past
+  what the original budget would have allowed, and Resume picked the
+  same file back up and finished the run. A **Files panel** renders every
+  file the plan lists (not just ones already on disk) as a **layered SVG
+  dependency graph** doubling as a to-do list -- `renderGraph` groups
+  files into rows by `1 + max(dependency's row)` (0 for a leaf), draws
+  `<path>` edges between them, and colors each node by status: `pending`
+  (planned, unclaimed), `building` (has a spec/codegen event but no
+  `file_result` yet -- *not* the same as "its last verify failed", see
+  below), `ok`/`failed`/`advisory`/`flagged`/`skipped`. `_files_response`
+  computes this from the `plan` event's own file list (falling back to a
+  disk glob only for single-file runs, which have no plan) plus a
+  `phase` field (`planning`/`building`/`integration`/`done`) a small
+  stepper at the top renders. **Found live, fixed same session:** a
+  verify failure isn't final by itself -- the fix loop may have retries
+  left, or (with pause) be sitting on a just-failed attempt indefinitely
+  -- so trusting the *last* verify event's success/fail showed a paused,
+  still-retrying file as FAILED. `orchestrator.record()` now logs a
+  `file_result` event exactly when a file's build loop actually
+  concludes; `_files_response` only trusts a terminal status once that's
+  been seen for the file, "building" otherwise. Clicking a node opens the
+  same small modal window over the page (`#file-modal`) the calls bar and
+  everything else use -- `/api/files/<run_id>` (the graph data +
+  `has_plan`/`phase`), `/api/file/<run_id>/<name>` (source),
+  `/api/plan/<run_id>` (the planner's file list rendered as text),
+  `/api/spec/<run_id>/<name>` (that file's spec). A window left open
+  stays live as the run continues -- refreshed on the same poll as
+  progress. `_read_run_file` confines reads to that run's own directory.
+  The **endpoint pool** in the form is an unbounded list, not a fixed
+  primary+one: "+ add endpoint" (`addEndpointRow`) appends a row with its
+  own suffixed ids and its own re-fetch/remove, any number of times --
+  the backend already took an arbitrary `endpoints: list[dict]`, so this
+  was a frontend-only change. Verified live with three endpoints (the
+  primary plus two extras) configured at once.
 - `config/default.yaml` — model, host, temperature (the *base*; retries
   step up from it), token limits/ceiling, retry budgets, timeout, and an
   optional `endpoints:` list (`Config.Endpoint` / `resolved_endpoints()`)
@@ -206,6 +257,41 @@ core design, not just style.
   for the critic itself opt in explicitly.
 
 ## Status
+
+**Pause/resume, a live dependency graph, and an unbounded endpoint pool,
+added on request.** Pause is cooperative, mirroring `cancel_event`
+exactly: a `pause_event` checked at the same three checkpoints
+(`orchestrator._wait_if_paused`), blocking between calls, never
+mid-request. Its point is letting settings changes reach an *already
+running* multi-file run -- `RunManager._active_config` is the loop's own
+live `Config` object; `Config.apply_overrides` mutates it in place
+(rather than `with_overrides`'s fresh copy) so a change made while
+paused is visible to the loop's very next read, no extra plumbing. The
+GUI's Files panel became a layered SVG dependency graph (doubles as a
+to-do list: a planned-but-unclaimed file shows as `pending`, not
+absent) plus a `planning -> building -> integration -> done` phase
+stepper, both driven by an enriched `/api/files/<run_id>`. The "+ second
+endpoint" row became "+ add endpoint", unbounded -- the dispatcher
+already took an arbitrary `endpoints: list[dict]`, so supporting a third
+(or more) box on the network was a frontend-only change (asked for
+specifically: "I have a laptop I want to get in the generation pool").
+**A real bug found live, in this same pass, testing pause itself:**
+pausing a run mid-fix-loop showed the paused file as `FAILED` in the new
+graph, because status was inferred from the *last* `verify` event's
+success/fail alone -- indistinguishable in the log from a file that
+had actually exhausted its retries and given up. Fixed by having
+`orchestrator.record()` (the dispatcher's one choke point for "this
+file's build loop concluded") log a dedicated `file_result` event;
+`_files_response` now shows `building` for any file that hasn't gotten
+one yet, however its last verify attempt went. Verified live end to end
+against `llama3.2:latest`: paused a run mid-fix-loop (log line
+`[paused] waiting to resume...` sitting between two `[fix]` attempts,
+the graph correctly showing `building` rather than `FAILED` throughout),
+confirmed the settings panel's "applies to the next run" message swaps
+to "applied to the paused run" while paused, resumed, and watched the
+same run finish to `SUCCESS` with the graph settling on all-green nodes
+matching the final summary table. Also confirmed three endpoints (primary
++ two "+ add endpoint" rows) can be configured on one run at once.
 
 **Multi-language web support, added on request** (the planner only ever
 listed `.py` files, even for "make a web page" goals): the planner can

@@ -110,6 +110,11 @@ def test_format_event_budget_exhausted():
     assert line == "[budget] exhausted before main.py (25 iteration(s) used)"
 
 
+def test_format_event_run_paused_and_resumed():
+    assert format_event("run_paused", {}) == "[paused] waiting to resume…"
+    assert format_event("run_resumed", {}) == "[resumed]"
+
+
 def test_console_reporter_prints_only_non_silent_events():
     printed = []
     reporter = console_reporter(print_fn=printed.append)

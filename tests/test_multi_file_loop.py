@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from pathlib import Path
 
 from harness.llm_client import OllamaError
@@ -605,6 +606,79 @@ def test_a_cancelled_run_aborts_before_claiming_any_file(tmp_path: Path):
     assert result.aborted
     assert result.abort_reason == "cancelled by user"
     assert len(client.calls) == 1  # just the plan call
+
+
+def test_a_paused_run_does_not_claim_a_file_until_resumed(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "a.py", "purpose": "x", "depends_on": []}]})
+    client = FakeClient([plan, *_GENERIC])
+    pause_event = threading.Event()
+    pause_event.set()
+
+    loop = MultiFileLoop(client, config, session, pause_event=pause_event)
+    outcome: dict = {}
+    t = threading.Thread(target=lambda: outcome.update(result=loop.run("goal")))
+    t.start()
+    try:
+        # Give the worker loop plenty of chances to (wrongly) claim a.py
+        # while paused -- only the plan call should have happened.
+        time.sleep(0.6)
+        assert len(client.calls) == 1
+    finally:
+        pause_event.clear()
+        t.join(timeout=5)
+
+    assert outcome["result"].success
+    assert len(client.calls) == 3  # plan, spec, codegen
+
+
+def test_settings_changed_while_paused_take_effect_on_the_next_fix_attempt(tmp_path: Path):
+    # max_fix_attempts=1 alone would stop after exactly one fix attempt --
+    # proves the bump to 3, applied while paused, is what lets a second
+    # attempt (and the eventual success) happen at all. pause_event isn't
+    # set until the initial codegen call has already landed: setting it
+    # any earlier would trip the *dispatcher's* own pause checkpoint and
+    # stop the file from ever being claimed, never reaching a fix attempt
+    # at all (see test_a_paused_run_does_not_claim_a_file_until_resumed).
+    config = make_config(tmp_path, max_fix_attempts=1)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "a.py", "purpose": "x", "depends_on": []}]})
+    client = FakeClient(
+        [
+            plan,
+            "- do a thing",  # spec
+            "not python(",  # codegen: invalid syntax
+            "still not python(",  # fix attempt 1: also invalid
+            "def thing():\n    return 1\n",  # fix attempt 2: valid
+        ],
+        delay=0.05,
+    )
+    pause_event = threading.Event()
+
+    loop = MultiFileLoop(client, config, session, pause_event=pause_event)
+    outcome: dict = {}
+    t = threading.Thread(target=lambda: outcome.update(result=loop.run("goal")))
+    t.start()
+    try:
+        deadline = time.monotonic() + 5
+        while len(client.calls) < 3 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        pause_event.set()
+        assert len(client.calls) == 3  # plan, spec, codegen -- no fix call yet
+
+        # Give the (paused) worker every chance to wrongly sneak a fix
+        # call through before trusting that it hasn't.
+        time.sleep(0.3)
+        assert len(client.calls) == 3
+
+        config.apply_overrides(max_fix_attempts=3)
+    finally:
+        pause_event.clear()
+        t.join(timeout=5)
+
+    assert outcome["result"].success
+    assert len(client.calls) == 5  # plan, spec, codegen, fix 1, fix 2
 
 
 def test_multi_file_loop_tracks_each_llm_call_with_its_kind(tmp_path: Path):

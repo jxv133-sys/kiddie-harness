@@ -90,6 +90,12 @@ def format_event(event: str, fields: dict) -> str | None:
     if event == "budget_exhausted":
         return f"[budget] exhausted before {fields['before']} ({fields['iterations']} iteration(s) used)"
 
+    if event == "run_paused":
+        return "[paused] waiting to resume…"
+
+    if event == "run_resumed":
+        return "[resumed]"
+
     return None
 
 

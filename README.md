@@ -254,33 +254,44 @@ harness gui          # opens a browser at http://127.0.0.1:8765
 
 A single minimalist page: pick a model (the list is pulled live from the
 Ollama host; **↻ re-fetch models** after you pull one), point at a host,
-type a goal, hit **Generate**. **+ second endpoint** adds a parallel
-backend. The progress log streams in as it happens (`[plan]`,
-`[codegen]`, `[verify:*]`, `[fix]`, ...), a small strip tracks files /
-fix attempts / LLM calls / elapsed time, and the final verdict and
-per-file table drop in when the run finishes (with two endpoints, the
-log lines and each file's row show which one built it, e.g. `[codegen]
-b.py @ http://localhost:11434`). A live bar under the title shows every
-LLM call actually in flight right now — which step (`plan`/`spec`/
-`codegen`/`fix`/`critic`/`integration_fix`), which file, which endpoint,
-and how long it's been running — the real thing to watch with two
-endpoints going at once. **Click a call** to watch it write in real
-time — the actual text streaming in from Ollama token by token, not a
-placeholder that appears once the call finishes; the window updates
-itself and closes on its own when the call ends. A **Files** panel lists each generated
-file with its pass/fail status as it's built, plus the overall **Plan**
-and each file's **spec** for a multi-file run; clicking any of them
-opens its content in a small window over the page, kept live while it's
-open. **Stop** cancels a run in progress — the GUI
-is free to start a new one right away even if the model is still mid-call
-underneath. The gear icon opens a **settings** panel for the retry/token/
-temperature/timeout knobs (and the critic check toggle) that are otherwise
-only in `config/default.yaml`; changes apply to runs started after that
-point and persist across a GUI restart. Reloading the page while a run is active picks its stream back
-up instead of showing a blank form. One run at a time; stdlib
-`http.server`, no new dependencies, binds to localhost only. `--port`
-and `--no-browser` are
-available.
+type a goal, hit **Generate**. **+ add endpoint** adds another parallel
+backend — click it as many times as you have machines; there's no cap.
+A **phase stepper** (Plan → Build → Integrate → Done) under the title
+shows where the run is at a glance. The progress log streams in as it
+happens (`[plan]`, `[codegen]`, `[verify:*]`, `[fix]`, ...), a small
+strip tracks files / fix attempts / LLM calls / elapsed time, and the
+final verdict and per-file table drop in when the run finishes (with
+more than one endpoint, the log lines and each file's row show which one
+built it, e.g. `[codegen] b.py @ http://localhost:11434`). A live bar
+under the title shows every LLM call actually in flight right now —
+which step (`plan`/`spec`/`codegen`/`fix`/`critic`/`integration_fix`),
+which file, which endpoint, and how long it's been running — the real
+thing to watch with several endpoints going at once. **Click a call** to
+watch it write in real time — the actual text streaming in from Ollama
+token by token, not a placeholder that appears once the call finishes;
+the window updates itself and closes on its own when the call ends. A
+**Files** panel renders the whole plan as a **dependency graph**: every
+planned file is a node from the moment planning finishes (not just once
+it's built), laid out in rows by how deep its `depends_on` chain runs,
+with arrows to what it depends on and a color per status (queued /
+building / ok / failed / advisory / flagged / skipped) — a to-do list
+and a dependency map in one picture. Clicking a node (or the **view
+plan** / **spec** links) opens its content in a small window over the
+page, kept live while it's open. **Pause** freezes a run before its next
+file or fix attempt (never mid-call) so you can open the gear icon,
+change a setting, and have it apply the moment you hit **Resume** —
+useful when a run is visibly struggling and you want to raise the fix
+budget or temperature without losing what it's already built. **Stop**
+cancels a run in progress (works even while paused) — the GUI is free to
+start a new one right away even if the model is still mid-call
+underneath. The gear icon opens a **settings** panel for the retry/
+token/temperature/timeout knobs (and the critic check toggle) that are
+otherwise only in `config/default.yaml`; changes normally apply to runs
+started after that point, or immediately to the current run if it's
+paused. Settings persist across a GUI restart. Reloading the page while
+a run is active picks its stream back up instead of showing a blank
+form. One run at a time; stdlib `http.server`, no new dependencies,
+binds to localhost only. `--port` and `--no-browser` are available.
 
 ```bash
 pytest

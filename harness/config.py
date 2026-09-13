@@ -111,3 +111,19 @@ class Config:
             ),
             critic_enabled=self.critic_enabled if critic_enabled is None else critic_enabled,
         )
+
+    def apply_overrides(self, **overrides) -> None:
+        """Same fields and semantics as `with_overrides`, but mutates
+        `self` in place instead of returning a new instance.
+
+        `with_overrides` is what every *new* run gets: a fresh, separate
+        Config. This is for a run already in progress -- the orchestrator
+        loop holds this exact object and reads `config.<field>` fresh at
+        every use site (never a snapshot taken once at the start), so
+        mutating it here is picked up on the loop's very next read, with
+        no extra plumbing to push a replacement Config through a running
+        thread. Used by the GUI's pause/resume: settings changed while
+        paused take effect the moment the run resumes."""
+        updated = self.with_overrides(**overrides)
+        for field in dataclasses.fields(self):
+            setattr(self, field.name, getattr(updated, field.name))

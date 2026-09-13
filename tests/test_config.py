@@ -46,6 +46,26 @@ def test_with_overrides_applies_an_explicit_zero():
     assert config.max_total_iterations == 0
 
 
+def test_apply_overrides_mutates_the_same_object_in_place():
+    config = _config()
+    same_object = config
+
+    config.apply_overrides(max_fix_attempts=9, temperature=0.9)
+
+    assert config is same_object
+    assert config.max_fix_attempts == 9
+    assert config.temperature == 0.9
+    assert config.ollama_host == "http://h"  # untouched fields survive
+
+
+def test_apply_overrides_ignores_none_like_with_overrides():
+    config = _config()
+
+    config.apply_overrides(max_fix_attempts=None)
+
+    assert config.max_fix_attempts == 5
+
+
 def test_config_load_reads_the_default_yaml():
     config = Config.load()
 
