@@ -680,7 +680,10 @@ _INDEX_HTML = """<!doctype html>
   .calls-list, .settings-panel { margin:2px 0 20px; padding:7px 10px; border:1px solid var(--line);
                border-radius:8px; background:color-mix(in srgb, var(--fg) 4%, transparent); }
   .calls-list { font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--muted); }
-  .calls-list div { display:flex; justify-content:space-between; gap:10px; }
+  .calls-list div { display:flex; justify-content:space-between; gap:10px; cursor:pointer;
+                     border-radius:4px; padding:0 4px; margin:0 -4px; }
+  .calls-list div:hover { background:color-mix(in srgb, var(--fg) 7%, transparent); }
+  .calls-list div.active { background:color-mix(in srgb, var(--accent) 16%, transparent); }
   .calls-list .kind { color:var(--fg); font-weight:600; }
   .calls-list .t { color:var(--fg); opacity:.7; flex:0 0 auto; }
   .settings-panel { padding:12px 14px 4px; }
@@ -998,11 +1001,40 @@ async function pollCalls() {
       .map(c => {
         const kind = `<span class="kind">${esc(c.kind)}</span>`;
         const where = c.path ? `${kind} ${esc(c.path.split("/").pop())}` : kind;
-        return `<div><span>${where}</span>`
+        const active_cls = openWindow && openWindow.kind === "call" && openWindow.id === c.id
+          ? "active" : "";
+        return `<div class="${active_cls}" data-call-id="${c.id}"><span>${where}</span>`
           + `<span class="t">${esc(shortHost(c.endpoint))} \\u00b7 ${c.elapsed}s</span></div>`;
       })
       .join("");
+    list.querySelectorAll("[data-call-id]").forEach(el => {
+      el.addEventListener("click", () => {
+        const call = active.find(c => String(c.id) === el.dataset.callId);
+        if (call) showCallWindow(call);
+      });
+    });
+    // A live view left open for a call still running gets the same
+    // treatment as the Files panel's open-window refresh below: show
+    // the new text as it streams in, not what it had when first opened.
+    if (openWindow && openWindow.kind === "call") {
+      const still = active.find(c => c.id === openWindow.id);
+      if (still) showCallWindow(still);
+      else closeFileWindow();  // the call finished or vanished
+    }
   } catch (e) { /* not worth surfacing */ }
+}
+
+// Live view of one in-flight call -- reuses the same modal the Files
+// panel uses for static code/spec/plan content, distinguished by
+// openWindow.kind === "call". Unlike those, no fetch: the calls bar's
+// own poll already carries the full partial text.
+function showCallWindow(call) {
+  openWindow = { kind: "call", id: call.id };
+  $("#file-modal").hidden = false;
+  const name = call.path ? call.path.split("/").pop() : "";
+  const label = name ? `${call.kind} ${name}` : call.kind;
+  $("#file-modal-name").textContent = `${label} \\u2014 generating\\u2026`;
+  $("#file-modal-body").textContent = call.partial || "(waiting for the first chunk\\u2026)";
 }
 
 async function refreshFiles(runId) {
@@ -1050,8 +1082,13 @@ async function refreshFiles(runId) {
 
   // A window left open while its file is still being rewritten stays
   // live -- refetch it on the same poll instead of freezing on the
-  // content it had when it was first opened.
-  if (openWindow && (openWindow.kind !== "code" || files.some(f => f.name === openWindow.name))) {
+  // content it had when it was first opened. A "call" window (a live
+  // in-flight generation) is refreshed by pollCalls() instead -- it has
+  // no file on disk to refetch yet.
+  if (
+    openWindow && openWindow.kind !== "call" &&
+    (openWindow.kind !== "code" || files.some(f => f.name === openWindow.name))
+  ) {
     openFileWindow(runId, openWindow.kind, openWindow.name);
   }
 }

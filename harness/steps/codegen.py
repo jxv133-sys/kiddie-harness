@@ -8,6 +8,7 @@ what happens next -- that's the orchestrator's job.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from pathlib import Path
 
 from ..llm_client import OllamaClient
@@ -24,10 +25,25 @@ class GeneratedCode:
     truncated: bool
 
 
-def generate_file(client: OllamaClient, goal: str, *, temperature: float, max_tokens: int) -> GeneratedCode:
-    """Goal -> full file content. One-shot, no prior code, no error context."""
+def generate_file(
+    client: OllamaClient,
+    goal: str,
+    *,
+    temperature: float,
+    max_tokens: int,
+    on_chunk: Callable[[str], None] | None = None,
+) -> GeneratedCode:
+    """Goal -> full file content. One-shot, no prior code, no error context.
+
+    `on_chunk`, if given, is passed straight through to the client -- the
+    raw text streams in as-is (reasoning block and fences included, if
+    the model emits them); `strip_code_fences` only ever runs once, here,
+    on the finished response.
+    """
     prompt = _CODEGEN_TEMPLATE.format(goal=goal)
-    response = client.generate(prompt, temperature=temperature, max_tokens=max_tokens)
+    response = client.generate(
+        prompt, temperature=temperature, max_tokens=max_tokens, on_chunk=on_chunk
+    )
     return GeneratedCode(code=strip_code_fences(response.text), truncated=response.truncated)
 
 
@@ -39,8 +55,11 @@ def fix_file(
     stage: str,
     temperature: float,
     max_tokens: int,
+    on_chunk: Callable[[str], None] | None = None,
 ) -> GeneratedCode:
     """Current file + exact error -> corrected full file. Nothing else in context."""
     prompt = _FIX_TEMPLATE.format(code=code, error=error, stage=stage)
-    response = client.generate(prompt, temperature=temperature, max_tokens=max_tokens)
+    response = client.generate(
+        prompt, temperature=temperature, max_tokens=max_tokens, on_chunk=on_chunk
+    )
     return GeneratedCode(code=strip_code_fences(response.text), truncated=response.truncated)

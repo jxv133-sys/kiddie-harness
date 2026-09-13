@@ -251,7 +251,10 @@ b.py @ http://localhost:11434`). A live bar under the title shows every
 LLM call actually in flight right now — which step (`plan`/`spec`/
 `codegen`/`fix`/`critic`/`integration_fix`), which file, which endpoint,
 and how long it's been running — the real thing to watch with two
-endpoints going at once. A **Files** panel lists each generated
+endpoints going at once. **Click a call** to watch it write in real
+time — the actual text streaming in from Ollama token by token, not a
+placeholder that appears once the call finishes; the window updates
+itself and closes on its own when the call ends. A **Files** panel lists each generated
 file with its pass/fail status as it's built, plus the overall **Plan**
 and each file's **spec** for a multi-file run; clicking any of them
 opens its content in a small window over the page, kept live while it's

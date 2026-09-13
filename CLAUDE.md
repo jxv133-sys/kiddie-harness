@@ -93,7 +93,16 @@ core design, not just style.
 - `harness/llm_client.py` — thin Ollama wrapper. Surfaces truncation
   (`done_reason == "length"`) so the fix loop can grow `max_tokens` and
   tell the model its last output was cut off, instead of treating it like
-  an ordinary syntax error.
+  an ordinary syntax error. `generate()`'s default (`on_chunk=None`) is
+  one blocking call, unchanged; passing `on_chunk` switches to Ollama's
+  streaming mode (confirmed live: schema-constrained decoding streams
+  fine too) and calls it with the cumulative text after every line of
+  the response -- `_generate_once` and `_generate_streaming` share the
+  same `LLMResponse` contract, so nothing downstream needs to know which
+  path ran. A broken `on_chunk` is swallowed (a live-view display bug
+  must never abort a real generation); a dropped connection mid-stream
+  or a stream that ends without a final `done` line both raise a normal
+  `OllamaError`, same as any other call failure.
 - `harness/session.py` — per-run JSONL transcript (`log.jsonl`), plus an
   optional `on_event` callback fired right after each write (used for
   live progress output; never lets a broken callback break a run). A
@@ -138,6 +147,16 @@ core design, not just style.
   cooperative, so the old thread's call can genuinely still be running
   in the background after the GUI has moved on and shown a verdict, and
   it must not keep reporting that stray leftover as "active" once it has.
+  `track_call` yields `update(text)`, threaded through as every step
+  function's `on_chunk` (`plan.plan_files`, `spec.write_spec`,
+  `codegen.generate_file`/`fix_file`, `critic.critique_file` all take it
+  and pass it straight to `client.generate`) -- each in-flight entry
+  carries a live `partial` field, so `active_calls()`/`/api/calls/` (and
+  a click on a calls-bar row, reusing the Files panel's `#file-modal`)
+  show the actual text streaming in from Ollama, not just that a call is
+  running. Verified live against a real model: the modal updated with
+  real generated code appearing line by line, and closed on its own the
+  moment the call finished.
   A **settings screen**
   (gear icon) edits `temperature`/`max_tokens`/`max_tokens_ceiling`/
   `max_fix_attempts`/`max_total_iterations`/`timeout_seconds` for runs

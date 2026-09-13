@@ -7,6 +7,7 @@ exactly the kind of compound instruction that causes unreliable output.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from ..llm_client import OllamaClient
@@ -24,8 +25,11 @@ def write_spec(
     *,
     temperature: float,
     max_tokens: int,
+    on_chunk: Callable[[str], None] | None = None,
 ) -> str:
     """Goal + one file's purpose -> a short bullet-point spec for that file only."""
     prompt = _SPEC_TEMPLATE.format(goal=goal, path=file_task.path, purpose=file_task.purpose)
-    response = client.generate(prompt, temperature=temperature, max_tokens=max_tokens)
+    response = client.generate(
+        prompt, temperature=temperature, max_tokens=max_tokens, on_chunk=on_chunk
+    )
     return strip_reasoning(response.text)

@@ -51,7 +51,16 @@ class FakeClient:
         self.max_tokens_calls: list[int] = []
         self.temperature_calls: list[float] = []
 
-    def generate(self, prompt: str, *, system=None, json_schema=None, temperature=0.2, max_tokens=2048):
+    def generate(
+        self,
+        prompt: str,
+        *,
+        system=None,
+        json_schema=None,
+        temperature=0.2,
+        max_tokens=2048,
+        on_chunk=None,
+    ):
         if self._barrier is not None and not self._seen_first:
             self._seen_first = True
             self._barrier.wait()
@@ -67,8 +76,14 @@ class FakeClient:
             raise item
         if isinstance(item, tuple):
             text, done_reason = item
-            return FakeResponse(text, done_reason=done_reason)
-        return FakeResponse(item)
+        else:
+            text, done_reason = item, None
+        if on_chunk is not None:
+            # Not a real incremental stream (that's covered directly
+            # against OllamaClient in test_llm_client.py) -- just proves
+            # the callable was threaded all the way through and works.
+            on_chunk(text)
+        return FakeResponse(text, done_reason=done_reason)
 
 
 def make_config(

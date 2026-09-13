@@ -344,6 +344,57 @@ def test_calls_endpoint_reports_an_in_flight_llm_call(tmp_path: Path):
         t.join(timeout=5)
 
 
+def test_calls_endpoint_reports_streamed_partial_text_live(tmp_path: Path):
+    import threading
+    import urllib.request
+
+    from harness.llm_client import LLMResponse
+
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    first_chunk_sent = threading.Event()
+    release_second_chunk = threading.Event()
+
+    class _StreamingClient:
+        host = "http://streaming"
+
+        def generate(self, *a, on_chunk=None, **k):
+            on_chunk("def f")
+            first_chunk_sent.set()
+            release_second_chunk.wait(timeout=5)
+            on_chunk("def f():\n    return 1\n")
+            return LLMResponse(text="def f():\n    return 1\n", raw={}, done_reason=None)
+
+    server.run_manager._client_factory = lambda *a, **k: _StreamingClient()
+    try:
+        run_id = server.run_manager.start(goal="x", model="m", host="h", multi_file=False)
+        assert first_chunk_sent.wait(timeout=5)
+
+        active = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/calls/{run_id}", timeout=5).read()
+        )["active"]
+        assert len(active) == 1
+        assert active[0]["partial"] == "def f"
+        assert isinstance(active[0]["id"], int)
+
+        release_second_chunk.set()
+        server.run_manager.wait(timeout=5)
+
+        # the call finished, so the run itself moved past "running" --
+        # nothing left to poll for even though it did stream a 2nd chunk
+        active_after = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/calls/{run_id}", timeout=5).read()
+        )["active"]
+        assert active_after == []
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
 def test_calls_endpoint_goes_quiet_for_a_cancelled_run_even_if_its_call_lingers(tmp_path: Path):
     # Regression: cancel() is cooperative -- the old thread's in-flight
     # call can genuinely keep running in the background for a while.

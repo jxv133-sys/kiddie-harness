@@ -62,8 +62,37 @@ def test_track_call_reports_and_clears_an_in_flight_call(tmp_path: Path):
         assert active[0]["path"] == "core.py"
         assert active[0]["endpoint"] == "http://h:11434"
         assert active[0]["elapsed"] >= 0
+        assert active[0]["partial"] == ""  # nothing streamed in yet
 
     assert session.active_calls() == []
+
+
+def test_track_call_reports_streamed_partial_text_as_it_updates(tmp_path: Path):
+    session = Session.create(tmp_path)
+
+    with session.track_call("codegen", "a.py", "http://h") as update:
+        assert session.active_calls()[0]["partial"] == ""
+        update("def f")
+        assert session.active_calls()[0]["partial"] == "def f"
+        update("def f(x):\n    return x\n")
+        assert session.active_calls()[0]["partial"] == "def f(x):\n    return x\n"
+
+    assert session.active_calls() == []
+
+
+def test_active_calls_each_have_a_distinct_stable_id(tmp_path: Path):
+    session = Session.create(tmp_path)
+
+    with (
+        session.track_call("codegen", "a.py", "http://x") as update_a,
+        session.track_call("codegen", "b.py", "http://y") as update_b,
+    ):
+        update_a("partial a")
+        update_b("partial b")
+        active = {c["path"]: c for c in session.active_calls()}
+        assert active["a.py"]["partial"] == "partial a"
+        assert active["b.py"]["partial"] == "partial b"
+        assert active["a.py"]["id"] != active["b.py"]["id"]
 
 
 def test_track_call_clears_on_an_exception_inside_the_block(tmp_path: Path):

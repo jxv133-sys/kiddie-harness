@@ -140,9 +140,13 @@ def _generate_and_fix(
     just a generic "here's the error" retry.
     """
     max_tokens = config.max_tokens
-    with session.track_call("codegen", str(file_path), client.host):
+    with session.track_call("codegen", str(file_path), client.host) as update:
         gen = codegen.generate_file(
-            client, instruction, temperature=config.temperature, max_tokens=max_tokens
+            client,
+            instruction,
+            temperature=config.temperature,
+            max_tokens=max_tokens,
+            on_chunk=update,
         )
     code = gen.code
     session.log(
@@ -192,7 +196,7 @@ def _generate_and_fix(
             error = _TRUNCATION_NOTE + error
 
         failed_code = code
-        with session.track_call("fix", str(file_path), client.host):
+        with session.track_call("fix", str(file_path), client.host) as update:
             gen = codegen.fix_file(
                 client,
                 code=code,
@@ -200,6 +204,7 @@ def _generate_and_fix(
                 stage=result.stage,
                 temperature=_retry_temperature(config.temperature, attempts + 1),
                 max_tokens=max_tokens,
+                on_chunk=update,
             )
         code = gen.code
         attempts += 1
@@ -247,7 +252,7 @@ def _with_critic(
         if not result.success:
             return result
         calls[0] += 1
-        with session.track_call("critic", str(path), client.host):
+        with session.track_call("critic", str(path), client.host) as update:
             verdict = critic.critique_file(
                 client,
                 spec_text,
@@ -255,6 +260,7 @@ def _with_critic(
                 str(path.name),
                 temperature=config.temperature,
                 max_tokens=config.max_tokens,
+                on_chunk=update,
             )
         session.log(
             "critic_check", path=str(path), follows_spec=verdict.follows_spec, issues=verdict.issues
@@ -381,12 +387,13 @@ class MultiFileLoop:
     def run(self, goal: str) -> MultiFileRunResult:
         self.session.log("goal", goal=goal)
 
-        with self.session.track_call("plan", "", self.client.host):
+        with self.session.track_call("plan", "", self.client.host) as update:
             tasks = plan.plan_files(
                 self.client,
                 goal,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
+                on_chunk=update,
             )
         self.session.log("plan", files=[dataclasses.asdict(t) for t in tasks])
 
@@ -591,13 +598,14 @@ class MultiFileLoop:
     def _build_one_file(
         self, client: OllamaClient, goal: str, task: FileTask, built_so_far: list[FileRunResult]
     ) -> tuple[FileRunResult, int]:
-        with self.session.track_call("spec", task.path, client.host):
+        with self.session.track_call("spec", task.path, client.host) as update:
             spec_text = spec.write_spec(
                 client,
                 goal,
                 task,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
+                on_chunk=update,
             )
         self.session.log("spec", path=task.path, spec=spec_text, endpoint=client.host)
 
@@ -707,7 +715,9 @@ class MultiFileLoop:
             if target is None:
                 break
 
-            with self.session.track_call("integration_fix", str(target), self.client.host):
+            with self.session.track_call(
+                "integration_fix", str(target), self.client.host
+            ) as update:
                 gen = codegen.fix_file(
                     self.client,
                     code=target.read_text(),
@@ -715,6 +725,7 @@ class MultiFileLoop:
                     stage=result.stage,
                     temperature=_retry_temperature(self.config.temperature, rounds + 1),
                     max_tokens=self.config.max_tokens,
+                    on_chunk=update,
                 )
             target.write_text(gen.code)
             iterations += 1

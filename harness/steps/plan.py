@@ -15,6 +15,7 @@ import dataclasses
 import json
 import posixpath
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 from ..llm_client import OllamaClient
@@ -187,6 +188,7 @@ def plan_files(
     temperature: float,
     max_tokens: int,
     max_attempts: int = 3,
+    on_chunk: Callable[[str], None] | None = None,
 ) -> list[FileTask]:
     """Goal -> ordered list of (path, purpose).
 
@@ -220,6 +222,7 @@ def plan_files(
                 json_schema=None if free_form else PLAN_SCHEMA,
                 temperature=temp,
                 max_tokens=max_tokens,
+                on_chunk=on_chunk,
             )
             data = _parse_free_form(response.text) if free_form else json.loads(response.text)
             return _tasks_from_plan(data)

@@ -82,12 +82,20 @@ class Session:
                     pass
 
     @contextlib.contextmanager
-    def track_call(self, kind: str, path: str, endpoint: str) -> Iterator[None]:
+    def track_call(self, kind: str, path: str, endpoint: str) -> Iterator[Callable[[str], None]]:
         """Marks one LLM call (`kind`: "plan"/"spec"/"codegen"/"fix"/
         "critic"/"integration_fix") as in-flight for the duration of the
         `with` block. `active_calls()` reads this back -- it's how the GUI
         shows what's actually happening right now, not just that some
-        request to the GUI itself is open."""
+        request to the GUI itself is open.
+
+        Yields `update(text)`: a caller passes it straight through as an
+        `OllamaClient.generate()` call's `on_chunk` hook, so the in-flight
+        entry also carries what's been generated so far -- a live view of
+        the response as it streams in, not just once the whole call
+        returns. A caller that isn't streaming just never calls it, and
+        the entry's `partial` stays empty the whole time.
+        """
         call_id = next(self._call_ids)
         with self._calls_lock:
             self._active_calls[call_id] = {
@@ -95,9 +103,17 @@ class Session:
                 "path": path,
                 "endpoint": endpoint,
                 "started": time.monotonic(),
+                "partial": "",
             }
+
+        def update(text: str) -> None:
+            with self._calls_lock:
+                entry = self._active_calls.get(call_id)
+                if entry is not None:
+                    entry["partial"] = text
+
         try:
-            yield
+            yield update
         finally:
             with self._calls_lock:
                 self._active_calls.pop(call_id, None)
@@ -108,10 +124,12 @@ class Session:
             now = time.monotonic()
             return [
                 {
+                    "id": call_id,
                     "kind": v["kind"],
                     "path": v["path"],
                     "endpoint": v["endpoint"],
                     "elapsed": round(now - v["started"], 1),
+                    "partial": v["partial"],
                 }
-                for v in self._active_calls.values()
+                for call_id, v in self._active_calls.items()
             ]

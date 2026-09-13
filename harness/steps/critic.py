@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 from ..llm_client import OllamaClient, OllamaError
@@ -49,6 +50,7 @@ def critique_file(
     *,
     temperature: float,
     max_tokens: int,
+    on_chunk: Callable[[str], None] | None = None,
 ) -> CriticResult:
     """Judge `code` against `spec`. Fails open: a call that errors or
     comes back unparseable is treated as "follows the spec" -- an
@@ -57,7 +59,11 @@ def critique_file(
     prompt = _CRITIC_TEMPLATE.format(path=path, spec=spec, code=code)
     try:
         response = client.generate(
-            prompt, json_schema=CRITIC_SCHEMA, temperature=temperature, max_tokens=max_tokens
+            prompt,
+            json_schema=CRITIC_SCHEMA,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            on_chunk=on_chunk,
         )
         data = json.loads(response.text)
         return CriticResult(

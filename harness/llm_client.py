@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Callable
 from typing import Any
 
 import requests
@@ -47,17 +48,25 @@ class OllamaClient:
         json_schema: dict[str, Any] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 2048,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> LLMResponse:
         """Run one single-purpose generation call.
 
         If json_schema is given, Ollama constrains decoding to that schema
         (format compliance guaranteed by the inference layer, not by asking
-        nicely in the prompt).
+        nicely in the prompt). Confirmed live: schema constraint and
+        streaming work together fine.
+
+        If `on_chunk` is given, the call streams -- `on_chunk` is invoked
+        with the cumulative text so far after every chunk Ollama sends, so
+        a caller can show generation happening live instead of only the
+        final result once the whole call returns. Without it, behaves
+        exactly as before: one blocking call, one response.
         """
         payload: dict[str, Any] = {
             "model": self.model,
             "prompt": prompt,
-            "stream": False,
+            "stream": on_chunk is not None,
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
@@ -68,6 +77,11 @@ class OllamaClient:
         if json_schema is not None:
             payload["format"] = json_schema
 
+        if on_chunk is None:
+            return self._generate_once(payload)
+        return self._generate_streaming(payload, on_chunk)
+
+    def _generate_once(self, payload: dict[str, Any]) -> LLMResponse:
         try:
             resp = requests.post(
                 f"{self.host}/api/generate",
@@ -94,6 +108,55 @@ class OllamaClient:
             raise OllamaError(f"Ollama response missing 'response' field: {data}")
 
         return LLMResponse(text=text, raw=data, done_reason=data.get("done_reason"))
+
+    def _generate_streaming(
+        self, payload: dict[str, Any], on_chunk: Callable[[str], None]
+    ) -> LLMResponse:
+        """Same contract as `_generate_once` (one `LLMResponse`, once the
+        whole call finishes) but reads Ollama's streaming response
+        line-by-line (one JSON object per line, each carrying the next
+        text fragment; the last line carries `done`/`done_reason` and the
+        usual stats instead of a fragment) and calls `on_chunk` with the
+        cumulative text after every line."""
+        try:
+            resp = requests.post(
+                f"{self.host}/api/generate",
+                json=payload,
+                timeout=self.timeout_seconds,
+                stream=True,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise OllamaError(f"Could not reach Ollama at {self.host}: {exc}") from exc
+        except ValueError as exc:
+            raise OllamaError(f"Invalid call to Ollama at {self.host}: {exc}") from exc
+
+        text = ""
+        final: dict[str, Any] | None = None
+        try:
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise OllamaError(
+                        f"Ollama returned a non-JSON stream line: {line[:200]!r}"
+                    ) from exc
+                text += chunk.get("response") or ""
+                try:
+                    on_chunk(text)
+                except Exception:  # noqa: BLE001, S110 -- a broken live-view must never abort a real generation
+                    pass
+                if chunk.get("done"):
+                    final = chunk
+        except requests.RequestException as exc:
+            raise OllamaError(f"Lost connection to Ollama at {self.host}: {exc}") from exc
+
+        if final is None:
+            raise OllamaError(f"Ollama stream from {self.host} ended without a final 'done' line")
+
+        return LLMResponse(text=text, raw=final, done_reason=final.get("done_reason"))
 
     def generate_json(
         self,

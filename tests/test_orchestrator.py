@@ -5,7 +5,7 @@ from pathlib import Path
 from harness.orchestrator import SingleFileLoop
 from harness.session import Session
 
-from .fakes import FakeClient, make_config
+from .fakes import FakeClient, FakeResponse, make_config
 
 
 def test_succeeds_on_first_generation(tmp_path: Path):
@@ -241,3 +241,27 @@ def test_single_file_loop_tracks_each_llm_call_with_its_kind(tmp_path: Path):
         ("fix", "http://fake"),
         ("critic", "http://fake"),
     ]
+
+
+def test_a_streaming_calls_partial_text_is_visible_while_it_runs(tmp_path: Path):
+    # End-to-end proof of the live-view mechanism: as a call streams in
+    # chunks, session.active_calls() reflects them progressively *during*
+    # the call -- exactly what the GUI polls to show live generation,
+    # not just the final text once the call has already returned.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    seen_partials: list[str] = []
+
+    class _StreamingClient:
+        host = "http://fake"
+
+        def generate(self, prompt, *, on_chunk=None, **kw):
+            for fragment in ("def f", "def f():\n", "def f():\n    return 1\n"):
+                on_chunk(fragment)
+                seen_partials.append(session.active_calls()[0]["partial"])
+            return FakeResponse("def f():\n    return 1\n")
+
+    result = SingleFileLoop(_StreamingClient(), config, session).run("goal")
+
+    assert seen_partials == ["def f", "def f():\n", "def f():\n    return 1\n"]
+    assert result.success
