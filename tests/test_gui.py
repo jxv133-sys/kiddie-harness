@@ -99,6 +99,8 @@ def test_run_manager_rejects_a_second_run_while_one_is_active(tmp_path: Path):
     gate = threading.Event()
 
     class _Blocking:
+        host = "http://blocking"
+
         def generate(self, *a, **k):
             gate.wait()
             raise AssertionError("unblocked")
@@ -120,6 +122,8 @@ def test_cancel_frees_the_gui_to_start_a_new_run_immediately(tmp_path: Path):
     gate = threading.Event()
 
     class _Blocking:
+        host = "http://blocking"
+
         def generate(self, *a, **k):
             gate.wait(timeout=5)
             raise AssertionError("unblocked")
@@ -152,6 +156,8 @@ def test_run_manager_records_a_crash_as_a_failed_run(tmp_path: Path):
     config = make_config(tmp_path)
 
     class _Broken:
+        host = "http://broken"
+
         def generate(self, *a, **k):
             raise RuntimeError("kaboom")
 
@@ -284,6 +290,109 @@ def test_requests_endpoint_reports_a_request_while_it_is_in_flight(tmp_path: Pat
         t.join(timeout=5)
 
 
+def test_calls_endpoint_reports_an_in_flight_llm_call(tmp_path: Path):
+    import threading
+    import urllib.request
+
+    from harness.llm_client import LLMResponse
+
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    gate = threading.Event()
+    release = threading.Event()
+
+    class _SlowClient:
+        host = "http://slow:11434"
+
+        def generate(self, *a, **k):
+            gate.set()
+            release.wait(timeout=5)
+            return LLMResponse(text="print(1)\n", raw={}, done_reason=None)
+
+    server.run_manager._client_factory = lambda *a, **k: _SlowClient()
+    try:
+        run_id = server.run_manager.start(goal="print 1", model="m", host="h", multi_file=False)
+        assert gate.wait(timeout=5)
+
+        active = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/calls/{run_id}", timeout=5).read()
+        )["active"]
+        assert len(active) == 1
+        assert active[0]["kind"] == "codegen"
+        assert active[0]["endpoint"] == "http://slow:11434"
+        assert active[0]["elapsed"] >= 0
+
+        # a different (or bogus) run_id must never see another run's calls
+        other = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/calls/not-this-run", timeout=5).read()
+        )["active"]
+        assert other == []
+
+        release.set()
+        server.run_manager.wait(timeout=5)
+
+        active_after = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/calls/{run_id}", timeout=5).read()
+        )["active"]
+        assert active_after == []
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_calls_endpoint_goes_quiet_for_a_cancelled_run_even_if_its_call_lingers(tmp_path: Path):
+    # Regression: cancel() is cooperative -- the old thread's in-flight
+    # call can genuinely keep running in the background for a while.
+    # Once the GUI has shown a verdict for a cancelled run, it must not
+    # keep reporting that stray leftover call as "still active".
+    import threading
+    import urllib.request
+
+    from harness.llm_client import LLMResponse
+
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    gate = threading.Event()
+    release = threading.Event()
+
+    class _SlowClient:
+        host = "http://slow:11434"
+
+        def generate(self, *a, **k):
+            gate.set()
+            release.wait(timeout=5)
+            return LLMResponse(text="print(1)\n", raw={}, done_reason=None)
+
+    server.run_manager._client_factory = lambda *a, **k: _SlowClient()
+    try:
+        run_id = server.run_manager.start(goal="print 1", model="m", host="h", multi_file=False)
+        assert gate.wait(timeout=5)
+        assert server.run_manager.active_calls(run_id) != []  # genuinely in flight
+
+        assert server.run_manager.cancel() is True
+
+        # the call hasn't returned yet (release() not called) -- still
+        # physically running -- but the GUI must already report quiet.
+        assert server.run_manager.active_calls(run_id) == []
+        assert json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/calls/{run_id}", timeout=5).read()
+        )["active"] == []
+
+        release.set()
+        server.run_manager.wait(timeout=5)
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
 def _post_json(url: str, payload: dict):
     import urllib.error
     import urllib.request
@@ -355,6 +464,8 @@ def test_cancel_endpoint_stops_a_run_and_frees_the_gui(tmp_path: Path):
     gate = threading.Event()
 
     class _Blocking:
+        host = "http://blocking"
+
         def generate(self, *a, **k):
             gate.wait(timeout=5)
             raise AssertionError("unblocked")

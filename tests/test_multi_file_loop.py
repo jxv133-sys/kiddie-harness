@@ -605,3 +605,66 @@ def test_a_cancelled_run_aborts_before_claiming_any_file(tmp_path: Path):
     assert result.aborted
     assert result.abort_reason == "cancelled by user"
     assert len(client.calls) == 1  # just the plan call
+
+
+def test_multi_file_loop_tracks_each_llm_call_with_its_kind(tmp_path: Path):
+    config = make_config(tmp_path, critic_enabled=True)
+    session = Session.create(config.workspace_root)
+    seen: list[tuple[str, str, str]] = []
+    real_track_call = session.track_call
+
+    def spy(kind, path, endpoint):
+        seen.append((kind, path, endpoint))
+        return real_track_call(kind, path, endpoint)
+
+    session.track_call = spy
+    agree = '{"follows_spec": true, "issues": ""}'
+    client = FakeClient(
+        [
+            _PLAN_TWO_FILES,
+            "- add two numbers",  # spec for helper.py
+            "def add(a, b):\n    return a + b\n",  # codegen for helper.py
+            agree,  # critic for helper.py
+            "- call add and print it",  # spec for main.py
+            (
+                "from helper import add\n\n\n"
+                "def main():\n    print(add(2, 3))\n\n\n"
+                'if __name__ == "__main__":\n    main()\n'
+            ),  # codegen for main.py
+            agree,  # critic for main.py
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("a script that adds two numbers")
+
+    assert result.success
+    kinds = [kind for kind, _path, _ep in seen]
+    assert kinds == ["plan", "spec", "codegen", "critic", "spec", "codegen", "critic"]
+    assert all(ep == "http://fake" for _k, _p, ep in seen)
+    # spec logs the bare task path; codegen/critic log the full file path
+    assert seen[4] == ("spec", "main.py", "http://fake")
+    assert seen[5][1].endswith("main.py")
+    assert seen[6][1].endswith("main.py")
+
+
+def test_integration_fix_is_tracked_as_its_own_kind(tmp_path: Path):
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    seen: list[str] = []
+    real_track_call = session.track_call
+
+    def spy(kind, path, endpoint):
+        seen.append(kind)
+        return real_track_call(kind, path, endpoint)
+
+    session.track_call = spy
+    loop = MultiFileLoop(FakeClient(["def test_thing():\n    assert True\n"]), config, session)
+
+    test_path = session.run_dir / "test_thing.py"
+    test_path.write_text("def test_thing():\n    assert False\n")
+
+    loop._run_integration_with_fixes(
+        [FileTask(path="thing.py", purpose="x")], [test_path], has_tests=True, iterations=1
+    )
+
+    assert seen == ["integration_fix"]

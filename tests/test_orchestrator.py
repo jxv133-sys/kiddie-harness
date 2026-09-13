@@ -212,3 +212,32 @@ def test_a_file_the_critic_disagrees_with_is_flagged_not_failed(tmp_path: Path):
     events = [json.loads(line) for line in session.log_path.read_text().splitlines()]
     assert any(e["event"] == "spec_flagged" for e in events)
     assert events[-1]["event"] == "run_result" and events[-1]["success"] is True
+
+
+def test_single_file_loop_tracks_each_llm_call_with_its_kind(tmp_path: Path):
+    config = make_config(tmp_path, critic_enabled=True, max_fix_attempts=1)
+    session = Session.create(config.workspace_root)
+    seen: list[tuple[str, str]] = []
+    real_track_call = session.track_call
+
+    def spy(kind, path, endpoint):
+        seen.append((kind, endpoint))
+        return real_track_call(kind, path, endpoint)
+
+    session.track_call = spy
+    client = FakeClient(
+        [
+            "def broken(:\n",  # codegen -- syntax error, no critic reached
+            "print('hi')\n",  # fix attempt 1
+            '{"follows_spec": true, "issues": ""}',  # critic on the fixed code
+        ]
+    )
+
+    result = SingleFileLoop(client, config, session).run("goal")
+
+    assert result.success
+    assert seen == [
+        ("codegen", "http://fake"),
+        ("fix", "http://fake"),
+        ("critic", "http://fake"),
+    ]

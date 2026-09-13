@@ -12,6 +12,8 @@ class RaisingClient:
     """A client whose .generate() always raises, simulating an
     unreachable Ollama host without touching real network code."""
 
+    host = "http://unreachable"
+
     def __init__(self, exc: Exception):
         self._exc = exc
 

@@ -247,7 +247,11 @@ backend. The progress log streams in as it happens (`[plan]`,
 fix attempts / LLM calls / elapsed time, and the final verdict and
 per-file table drop in when the run finishes (with two endpoints, the
 log lines and each file's row show which one built it, e.g. `[codegen]
-b.py @ http://localhost:11434`). A **Files** panel lists each generated
+b.py @ http://localhost:11434`). A live bar under the title shows every
+LLM call actually in flight right now — which step (`plan`/`spec`/
+`codegen`/`fix`/`critic`/`integration_fix`), which file, which endpoint,
+and how long it's been running — the real thing to watch with two
+endpoints going at once. A **Files** panel lists each generated
 file with its pass/fail status as it's built, plus the overall **Plan**
 and each file's **spec** for a multi-file run; clicking any of them
 opens its content in a small window over the page, kept live while it's

@@ -123,9 +123,22 @@ core design, not just style.
   mid-call) and immediately flips the manager back to `idle` so the GUI
   can start a new run without waiting for the old thread to notice; a
   `run_id` check in that thread's `finally` stops it from clobbering
-  whatever run superseded it. `RequestTracker` (server-side) backs a
-  small live "N requests active" readout on the page, keyed by a `_r=`
-  id every client request tags its own URL with. A **settings screen**
+  whatever run superseded it. `RequestTracker` (server-side) tracks the
+  browser's own HTTP requests to the GUI, keyed by a `_r=` id every
+  client request tags its own URL with (`/api/requests`) -- used for
+  stale-response guarding on the model re-fetch rows, not shown in the
+  page itself. What *is* shown in the header is a live LLM-call bar,
+  backed by a separate mechanism: `Session.track_call(kind, path,
+  endpoint)` (a context manager wrapping every `client.generate()` call
+  site in `orchestrator.py` -- plan/spec/codegen/fix/critic/
+  integration_fix) marks a call in-flight for `Session.active_calls()`
+  to report while it runs. `RunManager.active_calls(run_id)` exposes the
+  current run's session for this (`/api/calls/<run_id>`), but only while
+  `state == "running"` for that exact run_id -- `cancel()` is
+  cooperative, so the old thread's call can genuinely still be running
+  in the background after the GUI has moved on and shown a verdict, and
+  it must not keep reporting that stray leftover as "active" once it has.
+  A **settings screen**
   (gear icon) edits `temperature`/`max_tokens`/`max_tokens_ceiling`/
   `max_fix_attempts`/`max_total_iterations`/`timeout_seconds` for runs
   started after the change; saved to `config/gui_settings.json`

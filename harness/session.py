@@ -7,12 +7,15 @@ debugging why a small model went wrong is guesswork.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
+import itertools
 import json
 import threading
+import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +35,21 @@ class Session:
     # one lock keeps each event's file write + on_event callback atomic.
     _lock: threading.Lock = dataclasses.field(
         default_factory=threading.Lock, compare=False, repr=False
+    )
+    # In-flight LLM calls (plan/spec/codegen/fix/critic/...), so a live
+    # viewer can show what's actually happening right now -- which step,
+    # which file, which endpoint, for how long -- not just that *a*
+    # request to the GUI is open. Separate lock from `_lock`: this is
+    # touched far more often (every call, not every log line) and never
+    # needs to be atomic with a log write.
+    _calls_lock: threading.Lock = dataclasses.field(
+        default_factory=threading.Lock, compare=False, repr=False
+    )
+    _active_calls: dict[int, dict] = dataclasses.field(
+        default_factory=dict, compare=False, repr=False
+    )
+    _call_ids: Iterator[int] = dataclasses.field(
+        default_factory=itertools.count, compare=False, repr=False
     )
 
     @classmethod
@@ -62,3 +80,38 @@ class Session:
                     self.on_event(event, fields)
                 except Exception:  # noqa: S110, BLE001 -- a broken reporter must never take down a run
                     pass
+
+    @contextlib.contextmanager
+    def track_call(self, kind: str, path: str, endpoint: str) -> Iterator[None]:
+        """Marks one LLM call (`kind`: "plan"/"spec"/"codegen"/"fix"/
+        "critic"/"integration_fix") as in-flight for the duration of the
+        `with` block. `active_calls()` reads this back -- it's how the GUI
+        shows what's actually happening right now, not just that some
+        request to the GUI itself is open."""
+        call_id = next(self._call_ids)
+        with self._calls_lock:
+            self._active_calls[call_id] = {
+                "kind": kind,
+                "path": path,
+                "endpoint": endpoint,
+                "started": time.monotonic(),
+            }
+        try:
+            yield
+        finally:
+            with self._calls_lock:
+                self._active_calls.pop(call_id, None)
+
+    def active_calls(self) -> list[dict]:
+        """Snapshot of in-flight LLM calls, most recently started last."""
+        with self._calls_lock:
+            now = time.monotonic()
+            return [
+                {
+                    "kind": v["kind"],
+                    "path": v["path"],
+                    "endpoint": v["endpoint"],
+                    "elapsed": round(now - v["started"], 1),
+                }
+                for v in self._active_calls.values()
+            ]

@@ -140,9 +140,10 @@ def _generate_and_fix(
     just a generic "here's the error" retry.
     """
     max_tokens = config.max_tokens
-    gen = codegen.generate_file(
-        client, instruction, temperature=config.temperature, max_tokens=max_tokens
-    )
+    with session.track_call("codegen", str(file_path), client.host):
+        gen = codegen.generate_file(
+            client, instruction, temperature=config.temperature, max_tokens=max_tokens
+        )
     code = gen.code
     session.log(
         "codegen", path=str(file_path), code=code, truncated=gen.truncated, endpoint=client.host
@@ -191,14 +192,15 @@ def _generate_and_fix(
             error = _TRUNCATION_NOTE + error
 
         failed_code = code
-        gen = codegen.fix_file(
-            client,
-            code=code,
-            error=error,
-            stage=result.stage,
-            temperature=_retry_temperature(config.temperature, attempts + 1),
-            max_tokens=max_tokens,
-        )
+        with session.track_call("fix", str(file_path), client.host):
+            gen = codegen.fix_file(
+                client,
+                code=code,
+                error=error,
+                stage=result.stage,
+                temperature=_retry_temperature(config.temperature, attempts + 1),
+                max_tokens=max_tokens,
+            )
         code = gen.code
         attempts += 1
         session.log(
@@ -245,14 +247,15 @@ def _with_critic(
         if not result.success:
             return result
         calls[0] += 1
-        verdict = critic.critique_file(
-            client,
-            spec_text,
-            path.read_text(),
-            str(path.name),
-            temperature=config.temperature,
-            max_tokens=config.max_tokens,
-        )
+        with session.track_call("critic", str(path), client.host):
+            verdict = critic.critique_file(
+                client,
+                spec_text,
+                path.read_text(),
+                str(path.name),
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+            )
         session.log(
             "critic_check", path=str(path), follows_spec=verdict.follows_spec, issues=verdict.issues
         )
@@ -378,9 +381,13 @@ class MultiFileLoop:
     def run(self, goal: str) -> MultiFileRunResult:
         self.session.log("goal", goal=goal)
 
-        tasks = plan.plan_files(
-            self.client, goal, temperature=self.config.temperature, max_tokens=self.config.max_tokens
-        )
+        with self.session.track_call("plan", "", self.client.host):
+            tasks = plan.plan_files(
+                self.client,
+                goal,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+            )
         self.session.log("plan", files=[dataclasses.asdict(t) for t in tasks])
 
         file_results, stopped_early, abort_reason, iterations = self._generate_files(goal, tasks)
@@ -584,13 +591,14 @@ class MultiFileLoop:
     def _build_one_file(
         self, client: OllamaClient, goal: str, task: FileTask, built_so_far: list[FileRunResult]
     ) -> tuple[FileRunResult, int]:
-        spec_text = spec.write_spec(
-            client,
-            goal,
-            task,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-        )
+        with self.session.track_call("spec", task.path, client.host):
+            spec_text = spec.write_spec(
+                client,
+                goal,
+                task,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+            )
         self.session.log("spec", path=task.path, spec=spec_text, endpoint=client.host)
 
         file_path = self.session.run_dir / _safe_relative_path(task.path)
@@ -699,14 +707,15 @@ class MultiFileLoop:
             if target is None:
                 break
 
-            gen = codegen.fix_file(
-                self.client,
-                code=target.read_text(),
-                error=result.output,
-                stage=result.stage,
-                temperature=_retry_temperature(self.config.temperature, rounds + 1),
-                max_tokens=self.config.max_tokens,
-            )
+            with self.session.track_call("integration_fix", str(target), self.client.host):
+                gen = codegen.fix_file(
+                    self.client,
+                    code=target.read_text(),
+                    error=result.output,
+                    stage=result.stage,
+                    temperature=_retry_temperature(self.config.temperature, rounds + 1),
+                    max_tokens=self.config.max_tokens,
+                )
             target.write_text(gen.code)
             iterations += 1
             rounds += 1

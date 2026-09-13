@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 from harness.session import Session
@@ -43,3 +44,62 @@ def test_log_swallows_exceptions_from_on_event(tmp_path: Path):
     session.log("goal", goal="do a thing")
 
     assert len(session.log_path.read_text().splitlines()) == 1
+
+
+def test_active_calls_is_empty_when_nothing_is_in_flight(tmp_path: Path):
+    session = Session.create(tmp_path)
+
+    assert session.active_calls() == []
+
+
+def test_track_call_reports_and_clears_an_in_flight_call(tmp_path: Path):
+    session = Session.create(tmp_path)
+
+    with session.track_call("spec", "core.py", "http://h:11434"):
+        active = session.active_calls()
+        assert len(active) == 1
+        assert active[0]["kind"] == "spec"
+        assert active[0]["path"] == "core.py"
+        assert active[0]["endpoint"] == "http://h:11434"
+        assert active[0]["elapsed"] >= 0
+
+    assert session.active_calls() == []
+
+
+def test_track_call_clears_on_an_exception_inside_the_block(tmp_path: Path):
+    session = Session.create(tmp_path)
+
+    try:
+        with session.track_call("codegen", "a.py", "http://h"):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+
+    assert session.active_calls() == []
+
+
+def test_two_concurrent_calls_both_show_up_independently(tmp_path: Path):
+    session = Session.create(tmp_path)
+    entered1, entered2 = threading.Event(), threading.Event()
+    release = threading.Event()
+
+    def worker(kind, path, endpoint, entered):
+        with session.track_call(kind, path, endpoint):
+            entered.set()
+            release.wait(timeout=5)
+
+    t1 = threading.Thread(target=worker, args=("codegen", "a.py", "http://x", entered1))
+    t2 = threading.Thread(target=worker, args=("codegen", "b.py", "http://y", entered2))
+    t1.start()
+    t2.start()
+    assert entered1.wait(timeout=5)
+    assert entered2.wait(timeout=5)
+
+    active = session.active_calls()
+    assert {c["path"] for c in active} == {"a.py", "b.py"}
+    assert {c["endpoint"] for c in active} == {"http://x", "http://y"}
+
+    release.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert session.active_calls() == []

@@ -85,11 +85,27 @@ class RunManager:
         self._run_id: str | None = None
         self._state = "idle"  # idle | running | done
         self._cancel_event: threading.Event | None = None
+        self._session: Session | None = None
 
     @property
     def config(self) -> Config:
         with self._lock:
             return self._config
+
+    def active_calls(self, run_id: str) -> list[dict]:
+        """In-flight LLM calls for `run_id` -- empty for any run that
+        isn't the current *running* one. Requiring `state == "running"`
+        (not just a matching run_id) matters after `cancel()`: it flips
+        the state to "idle" right away, but the old thread's in-flight
+        call is cooperative-only and can genuinely still be running in
+        the background for a while. Once the GUI has moved on and shown
+        a verdict for this run, it must not keep reporting that run's
+        stray leftover call as if it were still part of an active run."""
+        with self._lock:
+            if run_id != self._run_id or self._session is None or self._state != "running":
+                return []
+            session = self._session
+        return session.active_calls()
 
     def update_config(self, **overrides) -> Config:
         """Apply settings-screen overrides for every run started from now
@@ -118,6 +134,7 @@ class RunManager:
             eps = endpoints or [{"host": host, "model": model}]
             session = Session.create(config.workspace_root)
             self._run_id = session.run_id
+            self._session = session
             self._state = "running"
             self._cancel_event = threading.Event()
             self._thread = threading.Thread(
@@ -368,6 +385,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"models": available_models(host)})
             elif path == "/api/requests":
                 self._send_json({"active": self._tracker.active(exclude=req_id)})
+            elif path.startswith("/api/calls/"):
+                run_id = path[len("/api/calls/") :]
+                self._send_json({"active": self._runs.active_calls(run_id)})
             elif path == "/api/settings":
                 c = self._config
                 self._send_json({k: getattr(c, k) for k in _ALL_SETTINGS_KEYS})
@@ -653,15 +673,16 @@ _INDEX_HTML = """<!doctype html>
   h1 { font-size:19px; font-weight:600; letter-spacing:-.01em; margin:0 0 24px;
        display:flex; align-items:baseline; gap:0; }
   h1 span { color:var(--muted); font-weight:400; }
-  h1 .reqs { font-size:11px; }
+  h1 .calls { font-size:11px; }
   .gear { margin-left:auto; background:none; border:0; padding:0 0 0 6px; width:auto;
           color:var(--muted); font-size:14px; cursor:pointer; }
   .gear:hover { color:var(--accent); }
-  .reqs-list, .settings-panel { margin:2px 0 20px; padding:7px 10px; border:1px solid var(--line);
+  .calls-list, .settings-panel { margin:2px 0 20px; padding:7px 10px; border:1px solid var(--line);
                border-radius:8px; background:color-mix(in srgb, var(--fg) 4%, transparent); }
-  .reqs-list { font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--muted); }
-  .reqs-list div { display:flex; justify-content:space-between; gap:10px; }
-  .reqs-list .t { color:var(--fg); opacity:.7; flex:0 0 auto; }
+  .calls-list { font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--muted); }
+  .calls-list div { display:flex; justify-content:space-between; gap:10px; }
+  .calls-list .kind { color:var(--fg); font-weight:600; }
+  .calls-list .t { color:var(--fg); opacity:.7; flex:0 0 auto; }
   .settings-panel { padding:12px 14px 4px; }
   .settings-panel .row > div { margin-bottom:10px; }
   .settings-panel label { margin:0 0 4px; font-size:10px; }
@@ -745,10 +766,10 @@ _INDEX_HTML = """<!doctype html>
 </head>
 <body>
 <main>
-  <h1>kiddie-harness <span>&mdash; generate a project</span> <span id="reqs" class="reqs"></span>
+  <h1>kiddie-harness <span>&mdash; generate a project</span> <span id="calls" class="calls"></span>
     <button type="button" id="settings-btn" class="gear" title="settings">&#9881;</button>
   </h1>
-  <div id="reqs-list" class="reqs-list" hidden></div>
+  <div id="calls-list" class="calls-list" hidden></div>
   <div id="settings-panel" class="settings-panel" hidden>
     <div class="row">
       <div><label for="s-temperature">Temperature</label><input type="text" id="s-temperature"></div>
@@ -855,8 +876,8 @@ async function loadConfig() {
     if (!$("#host2").value) $("#host2").value = c.host;
     refreshRow("2");
   });
-  pollActive();
-  setInterval(pollActive, 3000);
+  pollCalls();
+  setInterval(pollCalls, 3000);
   loadSettings();
 
   // A run started before this page load (or before a reload) is still
@@ -948,34 +969,38 @@ function renderStats(done, verdict) {
   statsEl.innerHTML = s;
 }
 
-function shortPath(p) {
-  try {
-    const u = new URL(p, location.origin);
-    u.searchParams.delete("_r");
-    return u.pathname + u.search;
-  } catch (e) { return p; }
-}
-
 function shortHost(h) {
   return h.replace("https://", "").replace("http://", "");
 }
 
-async function pollActive() {
+async function pollCalls() {
+  // Nothing to show outside a run -- and no run_id to even ask about.
+  if (!currentRunId) {
+    $("#calls").textContent = "";
+    $("#calls-list").hidden = true;
+    $("#calls-list").innerHTML = "";
+    return;
+  }
   try {
-    const { url } = tagUrl("/api/requests");
+    const { url } = tagUrl("/api/calls/" + currentRunId);
     const { active } = await (await fetch(url)).json();
-    const badge = $("#reqs"), list = $("#reqs-list");
+    const badge = $("#calls"), list = $("#calls-list");
     if (!active.length) {
       badge.textContent = "";
       list.hidden = true;
       list.innerHTML = "";
       return;
     }
-    badge.textContent = `\\u00b7 ${active.length} request${active.length === 1 ? "" : "s"} active`;
+    badge.textContent = `\\u00b7 ${active.length} call${active.length === 1 ? "" : "s"} active`;
     list.hidden = false;
     list.innerHTML = active
       .sort((a, b) => b.elapsed - a.elapsed)
-      .map(r => `<div><span>${esc(r.method)} ${esc(shortPath(r.path))}</span><span class="t">${r.elapsed}s</span></div>`)
+      .map(c => {
+        const kind = `<span class="kind">${esc(c.kind)}</span>`;
+        const where = c.path ? `${kind} ${esc(c.path.split("/").pop())}` : kind;
+        return `<div><span>${where}</span>`
+          + `<span class="t">${esc(shortHost(c.endpoint))} \\u00b7 ${c.elapsed}s</span></div>`;
+      })
       .join("");
   } catch (e) { /* not worth surfacing */ }
 }
@@ -1131,7 +1156,7 @@ function beginTracking() {
   closeFileWindow();
   calls = fixes = filesDone = filesTotal = 0; started = Date.now();
   renderStats(false);
-  tick = setInterval(() => { renderStats(false); pollActive(); refreshFiles(currentRunId); }, 1000);
+  tick = setInterval(() => { renderStats(false); pollCalls(); refreshFiles(currentRunId); }, 1000);
 }
 
 // Opens the SSE stream for `runId` and wires it up to the log/stats/
@@ -1145,6 +1170,7 @@ function watchRun(runId) {
     stopBtn.hidden = true;
     await showSummary(runId);
     await refreshFiles(runId);
+    await pollCalls();  // clears the calls bar right away, not up to 3s late
     goBtn.disabled = false;
   };
   const { url: evUrl } = tagUrl("/api/events/" + runId);
