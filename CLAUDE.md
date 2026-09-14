@@ -267,6 +267,29 @@ core design, not just style.
 
 ## Status
 
+**A file currently writing its spec gets a live pulsing icon in the
+graph, added on request** ("have a icon when a file is being specced").
+The existing violet dot for "has a spec" only lands once the spec call
+returns and gets logged -- there was no signal for "this is happening
+right now", even though the spec step (a reasoning model thinking
+through the file's requirements) is often the slowest part of a file's
+build. `_files_response` cross-references the run's live
+`active_calls()` (the same feed already driving the calls bar) for any
+in-flight call with `kind == "spec"` and reports a per-file `speccing`
+flag; fixed a related gap while at it -- a file whose spec call had
+just started but hadn't logged anything yet still showed as "pending"
+(dashed, untouched-looking) underneath its own pulsing dot, so
+`started_names` is now seeded from `speccing_names` too. Renders as a
+small pulsing dot (the existing `pulse` keyframe) in the graph node --
+put in the same top-right corner as the static has-a-spec dot, not the
+opposite corner, per a live follow-up ("make both the dots for specing
+be on the right side"): the two are mutually exclusive per file, so
+sharing the spot keeps both indicators on one side rather than
+splitting attention across the node. Verified live: multiple files
+showed the pulsing dot simultaneously while their spec calls were in
+flight, each one flipping to the static dot the moment its own call
+completed. Test: `test_files_endpoint_reports_a_file_as_speccing_while_its_spec_call_is_in_flight`.
+
 **GUI endpoint setup can be saved as the default, added on request**
 ("Set my current endpoint setup as the default") -- until now only the
 numeric/bool settings (temperature, fix attempts, critic on/off, ...)
