@@ -267,6 +267,20 @@ core design, not just style.
 
 ## Status
 
+**Per-file fix count shown live on the graph, added on request** ("show
+# of fixes on each file"). The final run-summary table already showed
+this ("N fixes" per file), sourced from `summary.load_run_summary`'s
+per-path `attempts` tally -- that tally turned out to already update
+live as `fix` events land, not just once a file's build concludes
+(`load_run_summary` creates each file's entry lazily on its first
+`codegen`/`fix`/`verify` event), so `_files_response` just reads the
+same number out of the `run_summary.files` loop it already runs for
+`status_by_name`, no new event-counting logic needed. Rendered as a
+small amber `↻N` badge, bottom-left corner -- opposite the
+spec/critic/fix dots, and only shown once a file has actually needed a
+fix, so the common (0 fixes) case stays uncluttered. Test:
+`test_files_endpoint_reports_the_running_fix_count_per_file`.
+
 **Live icons for "critic reviewing" and "fixing", added on request**
 ("add a indicator of when a file is being crititiced and when its
 being fixed") -- the same mechanism as the speccing dot, extended.
