@@ -318,9 +318,11 @@ color per status (queued / building / ok / failed / advisory / flagged
 / skipped) — a to-do list and a dependency map in one picture. **Hover a
 node** to trace it: its own edges and everything it touches light up
 while the rest of the graph dims, and its tooltip spells out "depends
-on" / "needed by" in plain text. Clicking a node (or the **view plan** /
-**spec** links) opens its content in a small window over the page, kept
-live while it's open. **Pause** freezes a run before its next
+on" / "needed by" in plain text. A file that already has a spec gets a
+small violet dot in the corner — its own color, separate from status —
+click it to jump straight to the spec instead of the code. Clicking a
+node (or the **view plan** / **spec** links) opens its content in a
+small window over the page, kept live while it's open. **Pause** freezes a run before its next
 file or fix attempt (never mid-call) so you can open the gear icon,
 change a setting, and have it apply the moment you hit **Resume** —
 useful when a run is visibly struggling and you want to raise the fix

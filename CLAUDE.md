@@ -240,7 +240,12 @@ core design, not just style.
   everything else use -- `/api/files/<run_id>` (the graph data +
   `has_plan`/`phase`), `/api/file/<run_id>/<name>` (source),
   `/api/plan/<run_id>` (the planner's file list rendered as text),
-  `/api/spec/<run_id>/<name>` (that file's spec). A window left open
+  `/api/spec/<run_id>/<name>` (that file's spec). A file with a spec
+  also gets a small `--spec` (violet) dot in its node's corner --
+  deliberately its own color, independent of the status border -- with
+  its own click target (`.dep-spec-dot`, `stopPropagation`ed so it
+  doesn't also trigger the node's code view) straight to that spec. A
+  window left open
   stays live as the run continues -- refreshed on the same poll as
   progress. `_read_run_file` confines reads to that run's own directory.
   The **endpoint pool** in the form is an unbounded list, not a fixed

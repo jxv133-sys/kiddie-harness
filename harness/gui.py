@@ -798,10 +798,12 @@ _INDEX_HTML = """<!doctype html>
 <title>kiddie-harness</title>
 <style>
   :root { --fg:#1c1c1e; --bg:#fbfbfa; --muted:#8a8a8e; --line:#e4e4e2;
-          --accent:#3a6adf; --ok:#1f9d55; --bad:#d1453b; --warn:#c47f17; }
+          --accent:#3a6adf; --ok:#1f9d55; --bad:#d1453b; --warn:#c47f17;
+          --spec:#8a5cf6; }
   @media (prefers-color-scheme: dark) {
     :root { --fg:#eaeaea; --bg:#181818; --muted:#8a8a8e; --line:#333;
-            --accent:#6f9bff; --ok:#57c97f; --bad:#ff6b60; --warn:#e0a24a; }
+            --accent:#6f9bff; --ok:#57c97f; --bad:#ff6b60; --warn:#e0a24a;
+            --spec:#b39bfa; }
   }
   * { box-sizing:border-box; }
   [hidden] { display:none !important; }
@@ -966,13 +968,19 @@ _INDEX_HTML = """<!doctype html>
      line belongs to which box stops being obvious from color alone. */
   .dep-node-group.dim .dep-node-rect,
   .dep-node-group.dim .dep-node-name,
-  .dep-node-group.dim .dep-node-status { opacity:.3; }
+  .dep-node-group.dim .dep-node-status,
+  .dep-node-group.dim .dep-spec-dot { opacity:.3; }
   .dep-node-group.hl .dep-node-rect { stroke-width:2.5; }
   .dep-edge { fill:none; stroke:var(--muted); stroke-width:1.6; opacity:.65;
                transition:opacity .15s ease, stroke .15s ease, stroke-width .15s ease; }
   .dep-edge.hl { stroke:var(--accent); stroke-width:2.4; opacity:1; }
   .dep-edge.dim { opacity:.08; }
   .dep-arrowhead { fill:var(--muted); }
+  /* A small dot marking "this file has a spec" -- independent of status
+     (the rect's own color/border), and its own click target to jump
+     straight to the spec instead of the code. */
+  .dep-spec-dot { fill:var(--spec); cursor:pointer; transition:opacity .15s ease; }
+  .dep-spec-dot:hover { stroke:var(--spec); stroke-width:2; }
   .graph-legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin-top:8px; font-size:10.5px;
                    color:var(--muted); }
   .graph-legend span { display:inline-flex; align-items:center; gap:4px; }
@@ -983,6 +991,7 @@ _INDEX_HTML = """<!doctype html>
   .graph-legend i.flagged { border-color:var(--accent); }
   .graph-legend i.building { border-color:var(--accent); border-width:2px; }
   .graph-legend i.pending { border-style:dashed; }
+  .graph-legend i.spec { border-radius:50%; border-color:var(--spec); background:var(--spec); }
 </style>
 </head>
 <body>
@@ -1069,6 +1078,7 @@ _INDEX_HTML = """<!doctype html>
       <span><i class="failed"></i>failed</span>
       <span><i class="advisory"></i>advisory</span>
       <span><i class="flagged"></i>flagged</span>
+      <span><i class="spec"></i>has a spec</span>
     </div>
   </div>
   <div id="summary"></div>
@@ -1460,12 +1470,16 @@ function renderGraph(files, runId) {
     title += deps.length ? `\\ndepends on: ${deps.join(", ")}` : "\\ndepends on: (nothing)";
     title += dependents.length ? `\\nneeded by: ${dependents.join(", ")}` : "\\nneeded by: (nothing yet)";
     const label = f.name.length > 16 ? f.name.slice(0, 14) + "\\u2026" : f.name;
+    const specDot = f.has_spec
+      ? `<circle class="dep-spec-dot" data-spec-name="${esc(f.name)}" `
+        + `cx="${p.x + NODE_W - 8}" cy="${p.top + 8}" r="4"><title>view spec</title></circle>`
+      : "";
     nodes += `<g class="dep-node-group" data-name="${esc(f.name)}">`
       + `<rect class="dep-node-rect ${f.status}" x="${p.x}" y="${p.top}" `
       + `width="${NODE_W}" height="${NODE_H}" rx="7"><title>${esc(title)}</title></rect>`
       + `<text class="dep-node-name" x="${p.cx}" y="${p.top + 17}" text-anchor="middle">${esc(label)}</text>`
       + `<text class="dep-node-status ${f.status}" x="${p.cx}" y="${p.top + 30}" text-anchor="middle">`
-      + `${_STATUS_LABEL[f.status] || esc(f.status)}</text></g>`;
+      + `${_STATUS_LABEL[f.status] || esc(f.status)}</text>${specDot}</g>`;
   });
 
   const defs = `<defs><marker id="dep-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" `
@@ -1497,6 +1511,12 @@ function renderGraph(files, runId) {
     });
     el.addEventListener("mouseleave", clearHighlight);
     el.addEventListener("click", () => openFileWindow(runId, "code", name));
+  });
+  wrap.querySelectorAll(".dep-spec-dot").forEach(dot => {
+    dot.addEventListener("click", e => {
+      e.stopPropagation(); // don't also trigger the node's own code-view click
+      openFileWindow(runId, "spec", dot.dataset.specName);
+    });
   });
 }
 
