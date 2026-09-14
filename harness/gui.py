@@ -625,16 +625,27 @@ class _Handler(BaseHTTPRequestHandler):
         run_dir = self._runs.log_path(run_id).parent
         if not run_dir.is_dir():
             return {"files": [], "has_plan": False, "phase": "planning"}
-        # In-flight, not-yet-logged spec calls -- a file only shows up in
-        # the completed log's `spec` event once the call returns, but the
-        # graph should show "writing its spec right now" the moment the
-        # call starts, not just after. active_calls() already scopes to
-        # this exact run while it's the one actually running, so this is
-        # empty for good on a finished/other run with no extra bookkeeping.
+        # In-flight, not-yet-logged spec/critic/fix calls -- a file only
+        # shows up in the completed log's own event once a call returns,
+        # but the graph should show what's actually happening to it right
+        # now, not just after. One active_calls() snapshot so all three
+        # sets agree on the same instant. active_calls() already scopes to
+        # this exact run while it's the one actually running, so all three
+        # are empty for good on a finished/other run with no extra
+        # bookkeeping. "integration_fix" counts as fixing too -- it's the
+        # same kind of in-place repair, just triggered by an integration
+        # error instead of the file's own verify loop.
+        active_calls = self._runs.active_calls(run_id)
         speccing_names = {
+            Path(c["path"]).name for c in active_calls if c.get("kind") == "spec" and c.get("path")
+        }
+        criticizing_names = {
+            Path(c["path"]).name for c in active_calls if c.get("kind") == "critic" and c.get("path")
+        }
+        fixing_names = {
             Path(c["path"]).name
-            for c in self._runs.active_calls(run_id)
-            if c.get("kind") == "spec" and c.get("path")
+            for c in active_calls
+            if c.get("kind") in ("fix", "integration_fix") and c.get("path")
         }
         status_by_name: dict[str, str] = {}
         spec_names: set[str] = set()
@@ -720,6 +731,8 @@ class _Handler(BaseHTTPRequestHandler):
                         "size": disk_path.stat().st_size if disk_path.exists() else 0,
                         "has_spec": name in spec_names,
                         "speccing": name in speccing_names,
+                        "criticizing": name in criticizing_names,
+                        "fixing": name in fixing_names,
                         "endpoint": endpoint_by_name.get(name, ""),
                     }
                 )
@@ -737,6 +750,8 @@ class _Handler(BaseHTTPRequestHandler):
                     "size": p.stat().st_size,
                     "has_spec": p.name in spec_names,
                     "speccing": p.name in speccing_names,
+                    "criticizing": p.name in criticizing_names,
+                    "fixing": p.name in fixing_names,
                     "endpoint": endpoint_by_name.get(p.name, ""),
                 }
             )
@@ -853,11 +868,11 @@ _INDEX_HTML = """<!doctype html>
 <style>
   :root { --fg:#1c1c1e; --bg:#fbfbfa; --muted:#8a8a8e; --line:#e4e4e2;
           --accent:#3a6adf; --ok:#1f9d55; --bad:#d1453b; --warn:#c47f17;
-          --spec:#8a5cf6; }
+          --spec:#8a5cf6; --critic:#0891b2; }
   @media (prefers-color-scheme: dark) {
     :root { --fg:#eaeaea; --bg:#181818; --muted:#8a8a8e; --line:#333;
             --accent:#6f9bff; --ok:#57c97f; --bad:#ff6b60; --warn:#e0a24a;
-            --spec:#b39bfa; }
+            --spec:#b39bfa; --critic:#22d3ee; }
   }
   * { box-sizing:border-box; }
   [hidden] { display:none !important; }
@@ -1024,7 +1039,9 @@ _INDEX_HTML = """<!doctype html>
   .dep-node-group.dim .dep-node-name,
   .dep-node-group.dim .dep-node-status,
   .dep-node-group.dim .dep-spec-dot,
-  .dep-node-group.dim .dep-speccing-dot { opacity:.3; }
+  .dep-node-group.dim .dep-speccing-dot,
+  .dep-node-group.dim .dep-criticizing-dot,
+  .dep-node-group.dim .dep-fixing-dot { opacity:.3; }
   .dep-node-group.hl .dep-node-rect { stroke-width:2.5; }
   .dep-edge { fill:none; stroke:var(--muted); stroke-width:1.6; opacity:.65;
                transition:opacity .15s ease, stroke .15s ease, stroke-width .15s ease; }
@@ -1037,6 +1054,8 @@ _INDEX_HTML = """<!doctype html>
   .dep-spec-dot { fill:var(--spec); cursor:pointer; transition:opacity .15s ease; }
   .dep-spec-dot:hover { stroke:var(--spec); stroke-width:2; }
   .dep-speccing-dot { fill:var(--spec); pointer-events:none; animation:pulse 1.2s ease-in-out infinite; }
+  .dep-criticizing-dot { fill:var(--critic); pointer-events:none; animation:pulse 1.2s ease-in-out infinite; }
+  .dep-fixing-dot { fill:var(--warn); pointer-events:none; animation:pulse 1.2s ease-in-out infinite; }
   .graph-legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin-top:8px; font-size:10.5px;
                    color:var(--muted); }
   .graph-legend span { display:inline-flex; align-items:center; gap:4px; }
@@ -1050,6 +1069,10 @@ _INDEX_HTML = """<!doctype html>
   .graph-legend i.spec { border-radius:50%; border-color:var(--spec); background:var(--spec); }
   .graph-legend i.speccing { border-radius:50%; border-color:var(--spec); background:var(--spec);
                               animation:pulse 1.2s ease-in-out infinite; }
+  .graph-legend i.criticizing { border-radius:50%; border-color:var(--critic); background:var(--critic);
+                                  animation:pulse 1.2s ease-in-out infinite; }
+  .graph-legend i.fixing { border-radius:50%; border-color:var(--warn); background:var(--warn);
+                             animation:pulse 1.2s ease-in-out infinite; }
 </style>
 </head>
 <body>
@@ -1140,6 +1163,8 @@ _INDEX_HTML = """<!doctype html>
       <span><i class="flagged"></i>flagged</span>
       <span><i class="spec"></i>has a spec</span>
       <span><i class="speccing"></i>writing spec&hellip;</span>
+      <span><i class="criticizing"></i>critic reviewing&hellip;</span>
+      <span><i class="fixing"></i>fixing&hellip;</span>
     </div>
   </div>
   <div id="summary"></div>
@@ -1567,24 +1592,32 @@ function renderGraph(files, runId) {
     title += deps.length ? `\\ndepends on: ${deps.join(", ")}` : "\\ndepends on: (nothing)";
     title += dependents.length ? `\\nneeded by: ${dependents.join(", ")}` : "\\nneeded by: (nothing yet)";
     const label = f.name.length > 16 ? f.name.slice(0, 14) + "\\u2026" : f.name;
-    const specDot = f.has_spec
+    // One corner, one dot at a time. Live activity (spec/critic/fix, in
+    // that order -- they're mutually exclusive per file at any instant)
+    // always wins over the static "has a spec" dot: has_spec stays true
+    // for the rest of the file's life once logged, so without a
+    // priority order it would permanently mask whatever's actually
+    // happening to the file right now.
+    const live = f.speccing
+      ? { cls: "dep-speccing-dot", title: "writing spec\\u2026" }
+      : f.criticizing
+      ? { cls: "dep-criticizing-dot", title: "critic reviewing\\u2026" }
+      : f.fixing
+      ? { cls: "dep-fixing-dot", title: "fixing\\u2026" }
+      : null;
+    const cornerDot = live
+      ? `<circle class="${live.cls}" cx="${p.x + NODE_W - 8}" cy="${p.top + 8}" r="4">`
+        + `<title>${live.title}</title></circle>`
+      : f.has_spec
       ? `<circle class="dep-spec-dot" data-spec-name="${esc(f.name)}" `
         + `cx="${p.x + NODE_W - 8}" cy="${p.top + 8}" r="4"><title>view spec</title></circle>`
-      : "";
-    // Same corner as the (static) has-a-spec dot -- the two are mutually
-    // exclusive per file (this one only shows while the spec call is
-    // still in flight; has_spec only lands once it's logged), and it
-    // pulses so it reads as "happening now", not "done".
-    const speccingDot = f.speccing
-      ? `<circle class="dep-speccing-dot" cx="${p.x + NODE_W - 8}" cy="${p.top + 8}" r="4">`
-        + `<title>writing spec\\u2026</title></circle>`
       : "";
     nodes += `<g class="dep-node-group" data-name="${esc(f.name)}">`
       + `<rect class="dep-node-rect ${f.status}" x="${p.x}" y="${p.top}" `
       + `width="${NODE_W}" height="${NODE_H}" rx="7"><title>${esc(title)}</title></rect>`
       + `<text class="dep-node-name" x="${p.cx}" y="${p.top + 17}" text-anchor="middle">${esc(label)}</text>`
       + `<text class="dep-node-status ${f.status}" x="${p.cx}" y="${p.top + 30}" text-anchor="middle">`
-      + `${_STATUS_LABEL[f.status] || esc(f.status)}</text>${specDot}${speccingDot}</g>`;
+      + `${_STATUS_LABEL[f.status] || esc(f.status)}</text>${cornerDot}</g>`;
   });
 
   const defs = `<defs><marker id="dep-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" `
