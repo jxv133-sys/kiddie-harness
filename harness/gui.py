@@ -648,6 +648,7 @@ class _Handler(BaseHTTPRequestHandler):
             if c.get("kind") in ("fix", "integration_fix") and c.get("path")
         }
         status_by_name: dict[str, str] = {}
+        fixes_by_name: dict[str, int] = {}
         spec_names: set[str] = set()
         endpoint_by_name: dict[str, str] = {}
         # has a spec/codegen event, or a spec call in flight right now --
@@ -673,6 +674,11 @@ class _Handler(BaseHTTPRequestHandler):
                     status_by_name[name] = "skipped"
                 else:
                     status_by_name[name] = "ok" if f.success else "failed"
+                # Same source the final run-summary table's "N fixes" column
+                # already uses -- live here too, since load_run_summary
+                # tallies a file's `fix` events as soon as they're logged,
+                # not only once the file's build has concluded.
+                fixes_by_name[name] = f.attempts
             for record in self._iter_log_events(run_id):
                 event = record.get("event")
                 if event == "plan":
@@ -733,6 +739,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "speccing": name in speccing_names,
                         "criticizing": name in criticizing_names,
                         "fixing": name in fixing_names,
+                        "fixes": fixes_by_name.get(name, 0),
                         "endpoint": endpoint_by_name.get(name, ""),
                     }
                 )
@@ -752,6 +759,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "speccing": p.name in speccing_names,
                     "criticizing": p.name in criticizing_names,
                     "fixing": p.name in fixing_names,
+                    "fixes": fixes_by_name.get(p.name, 0),
                     "endpoint": endpoint_by_name.get(p.name, ""),
                 }
             )
@@ -1032,6 +1040,12 @@ _INDEX_HTML = """<!doctype html>
   .dep-node-status.flagged { fill:var(--accent); }
   .dep-node-status.building { fill:var(--accent); }
   .dep-node-status.pending, .dep-node-status.skipped { fill:var(--muted); }
+  /* Small "N fix attempts so far" badge, bottom-left -- only rendered
+     when non-zero, same amber as the live "fixing" dot since it's the
+     same underlying signal (the model needed another try), just a
+     running count instead of a moment-in-time indicator. */
+  .dep-node-fixes { font:600 9px ui-monospace,SFMono-Regular,Menlo,monospace;
+                      fill:var(--warn); pointer-events:none; }
   /* Hovering a node highlights its own edges/neighbours (set via JS) and
      dims everything else -- with more than a handful of files, which
      line belongs to which box stops being obvious from color alone. */
@@ -1041,7 +1055,8 @@ _INDEX_HTML = """<!doctype html>
   .dep-node-group.dim .dep-spec-dot,
   .dep-node-group.dim .dep-speccing-dot,
   .dep-node-group.dim .dep-criticizing-dot,
-  .dep-node-group.dim .dep-fixing-dot { opacity:.3; }
+  .dep-node-group.dim .dep-fixing-dot,
+  .dep-node-group.dim .dep-node-fixes { opacity:.3; }
   .dep-node-group.hl .dep-node-rect { stroke-width:2.5; }
   .dep-edge { fill:none; stroke:var(--muted); stroke-width:1.6; opacity:.65;
                transition:opacity .15s ease, stroke .15s ease, stroke-width .15s ease; }
@@ -1591,7 +1606,15 @@ function renderGraph(files, runId) {
     let title = f.purpose ? `${f.name} \\u2014 ${f.purpose}` : f.name;
     title += deps.length ? `\\ndepends on: ${deps.join(", ")}` : "\\ndepends on: (nothing)";
     title += dependents.length ? `\\nneeded by: ${dependents.join(", ")}` : "\\nneeded by: (nothing yet)";
+    title += `\\n${f.fixes} fix${f.fixes === 1 ? "" : "es"}`;
     const label = f.name.length > 16 ? f.name.slice(0, 14) + "\\u2026" : f.name;
+    // Bottom-left, opposite corner from the spec/critic/fix dots -- only
+    // shown once a file has actually needed a fix, so the common case
+    // (0 fixes) stays uncluttered.
+    const fixesBadge = f.fixes > 0
+      ? `<text class="dep-node-fixes" x="${p.x + 6}" y="${p.top + NODE_H - 6}" text-anchor="start">`
+        + `\\u21bb${f.fixes}<title>${f.fixes} fix${f.fixes === 1 ? "" : "es"}</title></text>`
+      : "";
     // One corner, one dot at a time. Live activity (spec/critic/fix, in
     // that order -- they're mutually exclusive per file at any instant)
     // always wins over the static "has a spec" dot: has_spec stays true
@@ -1617,7 +1640,7 @@ function renderGraph(files, runId) {
       + `width="${NODE_W}" height="${NODE_H}" rx="7"><title>${esc(title)}</title></rect>`
       + `<text class="dep-node-name" x="${p.cx}" y="${p.top + 17}" text-anchor="middle">${esc(label)}</text>`
       + `<text class="dep-node-status ${f.status}" x="${p.cx}" y="${p.top + 30}" text-anchor="middle">`
-      + `${_STATUS_LABEL[f.status] || esc(f.status)}</text>${cornerDot}</g>`;
+      + `${_STATUS_LABEL[f.status] || esc(f.status)}</text>${cornerDot}${fixesBadge}</g>`;
   });
 
   const defs = `<defs><marker id="dep-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" `

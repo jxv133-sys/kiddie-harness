@@ -807,6 +807,7 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
                 "speccing": False,
                 "criticizing": False,
                 "fixing": False,
+                "fixes": 0,
                 "endpoint": "http://second:11434",
             }
         ]
@@ -957,6 +958,51 @@ def test_files_endpoint_does_not_report_a_still_retrying_file_as_failed(tmp_path
             ).read()
         )
         assert body["files"][0]["status"] == "building"  # not "failed"
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_files_endpoint_reports_the_running_fix_count_per_file(tmp_path: Path):
+    """The graph's per-file fix count is the same tally the final
+    run-summary table's "N fixes" column already uses (load_run_summary),
+    and it's live -- available as soon as `fix` events land, not only
+    once the file's build has concluded."""
+    import threading
+    import urllib.request
+
+    config = make_config(tmp_path)
+    run_dir = config.workspace_root / "20260101-000000-fixcount1"
+    run_dir.mkdir(parents=True)
+    records = [
+        {"event": "plan", "files": [{"path": "main.py", "purpose": "x", "depends_on": []}]},
+        {"event": "spec", "path": "main.py", "spec": "- x"},
+        {"event": "codegen", "path": str(run_dir / "main.py"), "code": "bad(",
+         "truncated": False, "endpoint": "http://a:11434"},
+        {"event": "verify", "path": str(run_dir / "main.py"), "attempt": 0,
+         "stage": "compile", "success": False, "output": "SyntaxError"},
+        {"event": "fix", "path": str(run_dir / "main.py"), "attempt": 1,
+         "code": "bad(", "truncated": False},
+        {"event": "verify", "path": str(run_dir / "main.py"), "attempt": 1,
+         "stage": "compile", "success": False, "output": "SyntaxError"},
+        {"event": "fix", "path": str(run_dir / "main.py"), "attempt": 2,
+         "code": "x = 1\n", "truncated": False},
+        # No file_result yet -- fix loop still going.
+    ]
+    (run_dir / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        body = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/files/20260101-000000-fixcount1", timeout=5
+            ).read()
+        )
+        assert body["files"][0]["fixes"] == 2
+        assert body["files"][0]["status"] == "building"  # not finished yet
     finally:
         server.shutdown()
         t.join(timeout=5)
