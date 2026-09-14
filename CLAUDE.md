@@ -267,6 +267,35 @@ core design, not just style.
 
 ## Status
 
+**A Python file's non-Python dependencies were fenced as `python` and
+told to be `import`ed -- fixed, found from a hunch that turned out to
+be a real, confirmed bug** ("there can be a bug where a .py file tries
+to import an html file"). `MultiFileLoop._sibling_context` builds the
+"here's what your dependencies already contain" block every file's
+codegen instruction gets; it used to fence *every* dependency's source
+as ` ```python ` and close with "import what you need from them by
+module name (the filename without `.py`)" regardless of what language
+the dependency actually was. A Python file (e.g. `server.py`) that
+`depends_on` an `.html` file it serves would see that HTML literally
+labeled as Python source and be told to `from login_page import ...`
+it -- which Python cannot do at all; `.html` isn't an importable
+module. Likely a real contributor to this session's earlier
+`server.py` bugs (served a hardcoded stub instead of the real page).
+Fixed by grouping dependencies by suffix: `.py` deps keep the exact
+original fence and "import by module name" instruction; every other
+dependency is fenced under its own real language and closes with an
+explicit "these are NOT Python modules and must never be `import`ed;
+read, serve, or reference them by filename" instead -- still included
+as genuine reference content (a server file legitimately benefits from
+seeing the exact HTML it needs to serve), just no longer mislabeled as
+importable Python. Applies universally, not just to the Python+HTML
+case that prompted it: an HTML file depending on a CSS/JS sibling
+previously got the same wrong "import by module name" framing layered
+on top of its own (correct) per-language rules in `codegen.py`; now it
+doesn't. Test:
+`test_a_python_files_html_dependency_is_never_framed_as_importable`
+in `test_multi_file_loop.py`.
+
 **A file currently writing its spec gets a live pulsing icon in the
 graph, added on request** ("have a icon when a file is being specced").
 The existing violet dot for "has a spec" only lands once the spec call
