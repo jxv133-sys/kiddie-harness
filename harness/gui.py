@@ -441,6 +441,10 @@ class _Handler(BaseHTTPRequestHandler):
                     {
                         "host": self._config.ollama_host,
                         "model": self._config.model,
+                        "endpoints": [
+                            {"host": e.host, "model": e.model, "role": e.role}
+                            for e in self._config.endpoints
+                        ],
                         "state": self._runs.status(),
                     }
                 )
@@ -563,8 +567,28 @@ class _Handler(BaseHTTPRequestHandler):
         if bad_keys:
             self._send_json({"error": f"invalid value(s) for: {', '.join(bad_keys)}"}, status=400)
             return
+        raw_endpoints = body.get("endpoints")
+        if raw_endpoints is not None:
+            if not isinstance(raw_endpoints, list) or not all(
+                isinstance(e, dict) and e.get("host") for e in raw_endpoints
+            ):
+                self._send_json({"error": "invalid endpoints"}, status=400)
+                return
+            current = self._runs.config
+            updates["endpoints"] = tuple(
+                Endpoint(
+                    e["host"],
+                    e.get("model") or current.model,
+                    current.timeout_seconds,
+                    role=e.get("role") or "balanced",
+                )
+                for e in raw_endpoints
+            )
         new_config = self._runs.update_config(**updates)
         values = {k: getattr(new_config, k) for k in _ALL_SETTINGS_KEYS}
+        values["endpoints"] = [
+            {"host": e.host, "model": e.model, "role": e.role} for e in new_config.endpoints
+        ]
         _save_settings_overrides(values)
         self._send_json(values)
 
@@ -768,6 +792,18 @@ class _Handler(BaseHTTPRequestHandler):
 def build_server(config: Config, *, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
     overrides = _load_settings_overrides()
     if overrides:
+        raw_endpoints = overrides.pop("endpoints", None)
+        if raw_endpoints:
+            overrides["endpoints"] = tuple(
+                Endpoint(
+                    e["host"],
+                    e.get("model") or config.model,
+                    config.timeout_seconds,
+                    role=e.get("role") or "balanced",
+                )
+                for e in raw_endpoints
+                if e.get("host")
+            )
         config = config.with_overrides(**overrides)
     server = ThreadingHTTPServer((host, port), _Handler)
     server.config = config  # type: ignore[attr-defined]
@@ -1045,6 +1081,8 @@ _INDEX_HTML = """<!doctype html>
 
   <div id="endpoints-extra"></div>
   <button type="button" id="add-ep" class="link">+ add endpoint <span style="text-transform:none;letter-spacing:0">(parallel, multi-file only)</span></button>
+  <button type="button" id="save-ep" class="link">&#9733; save as default</button>
+  <span class="settings-msg" id="ep-msg"></span>
 
   <label for="goal">Goal</label>
   <textarea id="goal" placeholder="a command-line to-do list with add / list / done subcommands"></textarea>
@@ -1119,7 +1157,7 @@ const rowReq = { "": 0 };
 let extraEpSeq = 0;
 const extraEpIds = [];
 
-function addEndpointRow() {
+function addEndpointRow(seed) {
   extraEpSeq++;
   const suffix = "-" + extraEpSeq;
   extraEpIds.push(suffix);
@@ -1140,8 +1178,10 @@ function addEndpointRow() {
   const hostInput = $("#host" + suffix);
   // Default to localhost, not a copy of the primary host -- an endpoint
   // pointed at the same host as another isn't a separate endpoint at
-  // all, just two workers queuing on one server.
-  hostInput.value = "http://localhost:11434";
+  // all, just two workers queuing on one server. A seed (restoring a
+  // saved default) overrides that.
+  hostInput.value = (seed && seed.host) || "http://localhost:11434";
+  if (seed && seed.role) $("#role" + suffix).value = seed.role;
   hostInput.addEventListener("change", () => refreshRow(suffix));
   $("#refresh" + suffix).addEventListener("click", () => refreshRow(suffix));
   row.querySelector(".endpoint-remove").addEventListener("click", () => {
@@ -1149,18 +1189,26 @@ function addEndpointRow() {
     const i = extraEpIds.indexOf(suffix);
     if (i !== -1) extraEpIds.splice(i, 1);
   });
-  refreshRow(suffix);
+  refreshRow(suffix, seed && seed.model);
 }
 
 async function loadConfig() {
   const { url } = tagUrl("/api/config");
   const c = await (await fetch(url)).json();
-  $("#host").value = c.host;
-  defaultModel = c.model;
-  await refreshRow("");
+  // A saved default endpoint list (see #save-ep) takes over the whole
+  // form -- it's the primary row plus zero or more extras, same shape
+  // the "Generate" button itself sends. Falls back to the bare
+  // host/model when nothing's been saved yet.
+  const eps = c.endpoints && c.endpoints.length ? c.endpoints : null;
+  $("#host").value = eps ? eps[0].host : c.host;
+  defaultModel = eps ? eps[0].model : c.model;
+  if (eps && eps[0].role) $("#role").value = eps[0].role;
+  await refreshRow("", eps ? eps[0].model : undefined);
+  if (eps) eps.slice(1).forEach(e => addEndpointRow(e));
   $("#host").addEventListener("change", () => refreshRow(""));
   $("#refresh").addEventListener("click", () => refreshRow(""));
   $("#add-ep").addEventListener("click", () => addEndpointRow());
+  $("#save-ep").addEventListener("click", saveEndpointsAsDefault);
   pollCalls();
   setInterval(pollCalls, 3000);
   loadSettings();
@@ -1188,6 +1236,32 @@ async function loadSettings() {
     SETTINGS_KEYS.forEach(k => { if (k in s) $("#s-" + k).value = s[k]; });
     BOOL_SETTINGS_KEYS.forEach(k => { if (k in s) $("#s-" + k).checked = s[k]; });
   } catch (e) { /* settings panel just stays blank */ }
+}
+
+function currentEndpoints() {
+  return [
+    { host: $("#host").value.trim(), model: $("#model").value, role: $("#role").value },
+    ...extraEpIds.map(suffix => ({
+      host: $("#host" + suffix).value.trim(),
+      model: $("#model" + suffix).value,
+      role: $("#role" + suffix).value,
+    })),
+  ].filter(e => e.host);
+}
+
+async function saveEndpointsAsDefault() {
+  const msg = $("#ep-msg");
+  msg.textContent = "saving\\u2026";
+  try {
+    const { url } = tagUrl("/api/settings");
+    const res = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ endpoints: currentEndpoints() }),
+    });
+    const data = await res.json();
+    msg.textContent = res.ok ? "saved as default" : (data.error || "save failed");
+  } catch (e) { msg.textContent = "could not reach the server"; }
+  setTimeout(() => { if (msg.textContent.startsWith("saved")) msg.textContent = ""; }, 3000);
 }
 
 $("#settings-btn").addEventListener("click", () => {
@@ -1255,10 +1329,10 @@ function updatePhaseStepper(phase, aborted) {
     else if (i === idx) el.classList.add(aborted ? "aborted" : (phase === "done" ? "past" : "current"));
   });
 }
-async function refreshRow(p) {
+async function refreshRow(p, wantOverride) {
   const host = $("#host" + p).value.trim();
   const sel = $("#model" + p);
-  const want = sel.value || defaultModel;
+  const want = wantOverride || sel.value || defaultModel;
   const btn = $("#refresh" + p);
   sel.disabled = true; btn.disabled = true; btn.textContent = "\\u21bb fetching\\u2026";
   const { url, id } = tagUrl("/api/models?host=" + encodeURIComponent(host));
@@ -1674,17 +1748,8 @@ $("#go").addEventListener("click", async () => {
   const body = {
     goal, model: $("#model").value, host: $("#host").value.trim(),
     multi_file: $("#multi").checked,
+    endpoints: currentEndpoints(),
   };
-  const extras = extraEpIds
-    .map(suffix => ({
-      host: $("#host" + suffix).value.trim(),
-      model: $("#model" + suffix).value,
-      role: $("#role" + suffix).value,
-    }))
-    .filter(e => e.host);
-  if (extras.length) {
-    body.endpoints = [{ host: body.host, model: body.model, role: $("#role").value }, ...extras];
-  }
   const { url: runUrl } = tagUrl("/api/run");
   let res;
   try {

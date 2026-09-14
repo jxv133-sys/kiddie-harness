@@ -598,6 +598,73 @@ def test_settings_endpoint_reads_updates_and_persists_config(tmp_path: Path, mon
         t.join(timeout=5)
 
 
+def test_settings_endpoint_persists_and_applies_a_default_endpoint_list(tmp_path: Path, monkeypatch):
+    import threading
+    import urllib.request
+
+    monkeypatch.setattr(gui, "_SETTINGS_PATH", tmp_path / "gui_settings.json")
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        endpoints = [
+            {"host": "http://192.168.50.142:7869", "model": "smart-model", "role": "smart"},
+            {"host": "http://192.168.50.21:11434", "model": "laptop-model", "role": "balanced"},
+        ]
+        status, body = _post_json(
+            f"http://127.0.0.1:{port}/api/settings", {"endpoints": endpoints}
+        )
+        assert status == 200
+        assert body["endpoints"] == endpoints
+        # applies to the next run started on this server
+        live = server.run_manager.config.endpoints
+        assert [e.host for e in live] == [e["host"] for e in endpoints]
+        assert [e.role for e in live] == [e["role"] for e in endpoints]
+        # persisted so a restart picks it back up
+        persisted = json.loads((tmp_path / "gui_settings.json").read_text())
+        assert persisted["endpoints"] == endpoints
+        # and it comes back out through /api/config for the form to prefill from
+        current = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/config", timeout=5).read()
+        )
+        assert current["endpoints"] == endpoints
+
+        status, body = _post_json(
+            f"http://127.0.0.1:{port}/api/settings", {"endpoints": [{"model": "no-host"}]}
+        )
+        assert status == 400
+        assert "endpoints" in body["error"]
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_build_server_restores_a_persisted_endpoint_list(tmp_path: Path, monkeypatch):
+    settings_path = tmp_path / "gui_settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"host": "http://192.168.50.142:7869", "model": "smart-model", "role": "smart"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(gui, "_SETTINGS_PATH", settings_path)
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    try:
+        restored = server.run_manager.config.endpoints
+        assert len(restored) == 1
+        assert restored[0].host == "http://192.168.50.142:7869"
+        assert restored[0].model == "smart-model"
+        assert restored[0].role == "smart"
+    finally:
+        server.server_close()
+
+
 def test_cancel_endpoint_stops_a_run_and_frees_the_gui(tmp_path: Path):
     import threading
 
