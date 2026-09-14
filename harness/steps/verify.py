@@ -266,8 +266,13 @@ class _HTMLBalanceChecker(HTMLParser):
         super().__init__()
         self.stack: list[tuple[str, int]] = []
         self.errors: list[str] = []
+        # A real tag was actually parsed -- see html_check: a file with
+        # zero tags has nothing to unbalance, so "no errors" alone would
+        # be a vacuous pass, not a real one.
+        self.saw_a_tag = False
 
     def handle_starttag(self, tag: str, attrs) -> None:
+        self.saw_a_tag = True
         if tag.lower() not in _VOID_HTML_TAGS:
             self.stack.append((tag.lower(), self.getpos()[0]))
 
@@ -303,6 +308,8 @@ def html_check(path: Path) -> VerifyResult:
     errors = list(checker.errors)
     for tag, line in checker.stack:
         errors.append(f"line {line}: <{tag}> was never closed")
+    if not checker.saw_a_tag:
+        errors.append("no HTML tags found -- doesn't look like an HTML document")
     return VerifyResult(success=not errors, stage="compile", output="\n".join(errors))
 
 
@@ -370,12 +377,23 @@ def _check_balance(
     return errors
 
 
+def _looks_like_code(text: str, markers: tuple[str, ...]) -> bool:
+    """A file with none of these structural markers has nothing for
+    `_check_balance` to unbalance, so "no errors" would be a vacuous pass
+    -- see html_check's `saw_a_tag` for the same principle applied to
+    markup instead of braces."""
+    return any(m in text for m in markers)
+
+
 def css_check(path: Path) -> VerifyResult:
     """Structural check only: balanced braces, terminated strings. No CSS
     parser exists in the stdlib; this is deterministic and real, just
     far less capable than py_compile -- it can't catch an invalid
     property or selector, only a broken block."""
-    errors = _check_balance(path.read_text(), line_comment=None, block_comment=("/*", "*/"))
+    text = path.read_text()
+    errors = _check_balance(text, line_comment=None, block_comment=("/*", "*/"))
+    if not errors and not _looks_like_code(text, ("{",)):
+        errors.append("no CSS rules found -- doesn't look like a CSS document")
     return VerifyResult(success=not errors, stage="compile", output="\n".join(errors))
 
 
@@ -383,7 +401,10 @@ def js_check(path: Path) -> VerifyResult:
     """Structural check only -- see `_check_balance`. No JS parser exists
     in the stdlib; this catches an unclosed block or an unterminated
     string, nothing about whether the code is actually valid JS."""
-    errors = _check_balance(path.read_text(), line_comment="//", block_comment=("/*", "*/"))
+    text = path.read_text()
+    errors = _check_balance(text, line_comment="//", block_comment=("/*", "*/"))
+    if not errors and not _looks_like_code(text, ("{", "}", ";")):
+        errors.append("no JS statements found -- doesn't look like a JS document")
     return VerifyResult(success=not errors, stage="compile", output="\n".join(errors))
 
 

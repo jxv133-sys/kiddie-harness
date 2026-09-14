@@ -267,6 +267,28 @@ core design, not just style.
 
 ## Status
 
+**Verification no longer trivially "passes" a file with no real content
+in it, found from a live run and fixed as a universal check, not a
+per-language patch** (a generated `login_page.html` turned out to be
+pure LLM disclaimer prose -- no markup at all -- and `html_check` still
+reported success, because a file with zero tags has nothing for the
+tag-balance checker to unbalance; asked to fix it, the user explicitly
+rejected an HTML-only patch: "implement a universal fix that will work
+with all file types"). Checked first whether `compile_check` (Python)
+had the same hole: it doesn't -- `py_compile` gives a real `SyntaxError`
+on prose, so real compilation is already immune. The gap is specific to
+the hand-rolled `html_check`/`css_check`/`js_check`, which only check
+*balance*, never presence. Fixed with the same pattern in all three, not
+one shared function (what counts as "real content" differs by
+language): `_HTMLBalanceChecker` now tracks `saw_a_tag` (set on any
+start tag, including void/self-closing ones) and `html_check` fails when
+it's never set; `css_check`/`js_check` gained a small `_looks_like_code`
+helper checked only when `_check_balance` found no errors (so a file
+with a genuine balance error still reports *that*, not the content
+warning) -- CSS requires a `{`, JS requires one of `{`/`}`/`;`. Tests in
+`tests/test_web_verify.py` cover all three: prose-only input now fails
+with a clear message, existing balanced/unbalanced cases are unchanged.
+
 **Retry a transient connection failure instead of aborting, added on
 request** ("when we get errors like 'The endpoint became unreachable
 mid-run' just retry with a different endpoint or just retry").

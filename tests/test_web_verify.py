@@ -50,6 +50,17 @@ def test_html_check_handles_mismatched_nesting(tmp_path: Path):
     assert not result.success
 
 
+def test_html_check_fails_on_prose_with_no_tags(tmp_path: Path):
+    # A small model sometimes emits disclaimer/commentary text instead of
+    # markup. Zero tags means nothing to unbalance, so the balance check
+    # alone would trivially "pass" -- this must not be a real pass.
+    f = tmp_path / "index.html"
+    f.write_text("Sure, here's your HTML code after fixing all the problems listed above.")
+    result = html_check(f)
+    assert not result.success
+    assert "no HTML tags" in result.output
+
+
 def test_css_check_passes_on_balanced_rules(tmp_path: Path):
     f = tmp_path / "style.css"
     f.write_text("body { color: red; }\n.card { padding: 4px; }\n")
@@ -79,6 +90,14 @@ def test_css_check_ignores_comments(tmp_path: Path):
     assert result.success
 
 
+def test_css_check_fails_on_prose_with_no_rules(tmp_path: Path):
+    f = tmp_path / "style.css"
+    f.write_text("Here is a description of the styling I would apply if asked.")
+    result = css_check(f)
+    assert not result.success
+    assert "no CSS rules" in result.output
+
+
 def test_js_check_passes_on_balanced_code(tmp_path: Path):
     f = tmp_path / "app.js"
     f.write_text("function f(x) {\n  return [x, {a: 1}];\n}\n")
@@ -106,6 +125,14 @@ def test_js_check_ignores_line_and_block_comments(tmp_path: Path):
     f.write_text("// unbalanced { here\n/* also ( unbalanced */\nfunction f() {}\n")
     result = js_check(f)
     assert result.success
+
+
+def test_js_check_fails_on_prose_with_no_statements(tmp_path: Path):
+    f = tmp_path / "app.js"
+    f.write_text("Here is a summary of the JavaScript logic I would write for you.")
+    result = js_check(f)
+    assert not result.success
+    assert "no JS statements" in result.output
 
 
 def test_verify_generated_file_routes_by_extension(tmp_path: Path):
