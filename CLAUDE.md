@@ -267,6 +267,25 @@ core design, not just style.
 
 ## Status
 
+**GUI endpoint setup can be saved as the default, added on request**
+("Set my current endpoint setup as the default") -- until now only the
+numeric/bool settings (temperature, fix attempts, critic on/off, ...)
+survived a `harness gui` restart via the existing `gui_settings.json`
+overlay; the endpoint list itself (primary row + every extra row's
+host/model/role) always came back blank, so every restart meant
+re-typing hosts by hand -- a real recurring cost this session, restarting
+repeatedly to load other fixes. A new **★ save as default** button next
+to "+ add endpoint" posts the form's current endpoint list (same shape
+already sent to `/api/run`) to `/api/settings`; `/api/config` now
+returns it so `loadConfig()` can rebuild the extra rows and prefill the
+primary one on page load. `build_server()` converts the persisted raw
+dicts back into `Endpoint` objects the same way it already did for the
+scalar overrides. Verified live: saved a two-endpoint setup, killed and
+restarted the GUI process from scratch, confirmed both rows (host,
+model, role) reappeared with no manual re-entry. Tests:
+`test_settings_endpoint_persists_and_applies_a_default_endpoint_list`,
+`test_build_server_restores_a_persisted_endpoint_list`.
+
 **Verification no longer trivially "passes" a file with no real content
 in it, found from a live run and fixed as a universal check, not a
 per-language patch** (a generated `login_page.html` turned out to be
