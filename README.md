@@ -265,17 +265,21 @@ harness run --multi-file --goal "..." \
   --endpoint http://localhost:11435,qwen2.5-coder:7b,quick
 ```
 
-- **`smart`** handles the judgement calls — `plan` (the file list and
-  dependency graph) and `critic` (does this file actually hold up
-  against its own spec?) — and is excluded from per-file generation, so
-  the careful/slow model isn't spent on high-volume work.
+- **`smart`** is preferred for the judgement calls — `plan` (the file
+  list and dependency graph) and `critic` (does this file actually hold
+  up against its own spec?) — and also builds files like any other
+  endpoint; being more capable is a reason to give it more work, not
+  less.
 - **`quick`** does the per-file spec → codegen → fix grind — the calls
   that happen many times per run and get corrected by the fix loop
-  anyway if they're wrong.
+  anyway if they're wrong — and is never used for plan/critic, even if
+  no `smart` endpoint is configured.
 - **`balanced`** (the default if you don't set a role, or the only
-  option before roles existed) does both. An endpoint with no role, or
-  every endpoint on `balanced`, behaves exactly as if roles didn't
-  exist — nothing changes until you actually tag one `smart` or `quick`.
+  option before roles existed) builds files and can stand in for `smart`
+  as the plan/critic client if nothing is explicitly tagged `smart`. An
+  endpoint with no role, or every endpoint on `balanced`, behaves exactly
+  as if roles didn't exist — nothing changes until you actually tag one
+  `smart` or `quick`.
 
 The GUI has the same three options as a small dropdown next to each
 endpoint's model/host. `role` is also a field in `config/default.yaml`'s

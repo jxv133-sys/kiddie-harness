@@ -11,6 +11,14 @@ def test_format_event_critic_check_agrees():
     assert line == "[critic] main.py -> ok"
 
 
+def test_format_event_critic_check_agrees_shows_the_endpoint():
+    line = format_event(
+        "critic_check",
+        {"path": "main.py", "follows_spec": True, "issues": "", "endpoint": "http://smart:11434"},
+    )
+    assert line == "[critic] main.py -> ok @ http://smart:11434"
+
+
 def test_format_event_critic_check_disagreement_is_silent():
     # Already surfaced as its own [verify:critic] -> FAILED line with the
     # same issues text -- a second line here would just be noise.
@@ -35,6 +43,13 @@ def test_format_event_returns_none_for_unknown_event():
 def test_format_event_plan():
     line = format_event("plan", {"files": [{"path": "a.py", "purpose": "x"}, {"path": "b.py", "purpose": "y"}]})
     assert line == "[plan] 2 file(s) planned"
+
+
+def test_format_event_plan_shows_the_endpoint():
+    line = format_event(
+        "plan", {"files": [{"path": "a.py", "purpose": "x"}], "endpoint": "http://smart:11434"}
+    )
+    assert line == "[plan] 1 file(s) planned @ http://smart:11434"
 
 
 def test_format_event_spec():

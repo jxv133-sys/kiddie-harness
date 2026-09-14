@@ -30,7 +30,7 @@ def format_event(event: str, fields: dict) -> str | None:
     also silent, so a future new event type doesn't break this formatter.
     """
     if event == "plan":
-        return f"[plan] {len(fields['files'])} file(s) planned"
+        return f"[plan] {len(fields['files'])} file(s) planned{_endpoint_note(fields)}"
 
     if event == "spec":
         return f"[spec] {fields['path']}{_endpoint_note(fields)}"
@@ -49,7 +49,7 @@ def format_event(event: str, fields: dict) -> str | None:
         # only worth a line here when it agrees, which otherwise leaves
         # no trace at all that the critic call happened.
         if fields["follows_spec"]:
-            return f"[critic] {fields['path']} -> ok"
+            return f"[critic] {fields['path']} -> ok{_endpoint_note(fields)}"
         return None
 
     if event == "fix":

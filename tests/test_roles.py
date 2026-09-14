@@ -27,7 +27,10 @@ def test_no_roles_tagged_reproduces_todays_behaviour():
     assert critic_override is None
 
 
-def test_smart_endpoint_becomes_primary_and_critic_and_is_excluded_from_workers():
+def test_smart_endpoint_becomes_primary_and_critic_but_still_joins_the_workers():
+    # A "smart" endpoint is preferred for plan/critic -- it isn't kept
+    # out of the per-file grind for being capable; if anything that's a
+    # reason to give it files too, not sideline it.
     endpoints = [
         Endpoint("http://smart", "big", 60, role="smart"),
         Endpoint("http://q1", "small", 60, role="quick"),
@@ -39,7 +42,7 @@ def test_smart_endpoint_becomes_primary_and_critic_and_is_excluded_from_workers(
 
     assert primary is clients[0]
     assert critic_override is clients[0]
-    assert workers == clients[1:]  # the smart endpoint does no per-file grind
+    assert workers == clients  # smart included alongside the quick ones
 
 
 def test_only_quick_endpoints_falls_back_to_the_first_as_primary():
@@ -65,8 +68,6 @@ def test_an_unrecognised_role_behaves_like_balanced():
 
 
 def test_a_lone_smart_endpoint_still_does_its_own_per_file_work():
-    # workers must never end up empty just because the only endpoint
-    # available happens to be tagged "smart".
     endpoints = [Endpoint("http://only", "m", 60, role="smart")]
     clients = _clients("http://only")
 
@@ -93,3 +94,31 @@ def test_critic_routes_to_the_smart_client_not_the_worker_that_built_the_file(tm
     assert result.success
     assert len(smart.calls) == 1  # only the critic call
     assert len(worker.calls) == 3  # plan, spec, codegen -- never critic
+
+
+def test_the_smart_endpoint_can_still_build_files_alongside_a_quick_one(tmp_path: Path):
+    # "why not have the math expert do math too" -- a smart endpoint
+    # isn't excluded from the per-file dispatch pool. Two independent
+    # files, two workers, each given exactly enough queued responses for
+    # one file (spec + codegen): whichever specific file either one
+    # claims, the totals below only add up if both workers actually did
+    # real per-file work -- proof the smart endpoint wasn't sidelined to
+    # plan/critic only.
+    config = make_config(tmp_path, critic_enabled=False)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps(
+        {
+            "files": [
+                {"path": "a.py", "purpose": "x", "depends_on": []},
+                {"path": "b.py", "purpose": "y", "depends_on": []},
+            ]
+        }
+    )
+    smart = FakeClient([plan, "- spec", "def thing():\n    return 1\n"], host="http://smart")
+    quick = FakeClient(["- spec", "def thing():\n    return 2\n"], host="http://quick")
+
+    result = MultiFileLoop(smart, config, session, pool_clients=[smart, quick]).run("goal")
+
+    assert result.success
+    assert len(smart.calls) == 3  # plan, plus one file's spec + codegen
+    assert len(quick.calls) == 2  # the other file's spec + codegen

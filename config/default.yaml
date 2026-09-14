@@ -16,12 +16,16 @@ ollama:
 #
 # `role` (optional, default "balanced") tags what an endpoint is for --
 # see the README's "Model roles" section:
-#   smart    -- plan / critic / integration-fix (the judgement calls);
-#               excluded from per-file generation.
-#   quick    -- the per-file spec/codegen/fix grind only.
-#   balanced -- does either. The default; an endpoint with no role (or
-#               every endpoint on "balanced") behaves exactly as if
-#               roles didn't exist at all.
+#   smart    -- preferred for plan / critic / integration-fix (the
+#               judgement calls); also builds files like any other
+#               endpoint -- not excluded from per-file generation.
+#   quick    -- the per-file spec/codegen/fix grind; never used for
+#               plan/critic, even as a fallback with no "smart" tagged.
+#   balanced -- builds files, and can stand in for "smart" as the
+#               plan/critic client if nothing is explicitly tagged
+#               "smart". The default; an endpoint with no role (or every
+#               endpoint on "balanced") behaves exactly as if roles
+#               didn't exist at all.
 # endpoints:
 #   - host: "http://192.168.50.142:7869"
 #     role: "smart"

@@ -308,25 +308,43 @@ endpoint that does everything, exactly as before roles existed, so a
 single-endpoint or all-default setup is completely unaffected.
 `orchestrator.partition_clients_by_role(endpoints, clients)` is the one
 place that turns roles into an actual assignment: a `"smart"`-tagged
-endpoint becomes the client for `plan`/`critic`/`integration_fix` (the
+endpoint is *preferred* for `plan`/`critic`/`integration_fix` (the
 judgement calls -- get the architecture and "does this match its own
-spec" right) and is excluded from the per-file worker pool; `"quick"`
-and `"balanced"` endpoints do the per-file spec/codegen/fix grind. Only
-one thing needed to change inside the orchestrator itself:
-`MultiFileLoop`'s critic check previously always ran on *whichever
-worker built that file* (`client`, the dispatcher's per-file parameter)
--- fine when every endpoint is equally capable, wrong once one is
-specifically the "careful" one. `_build_one_file` now uses
-`self._critic_client or client`, so with no smart endpoint configured
-(`critic_client=None`) it's byte-for-byte the old behaviour, and with
-one it's funneled there regardless of which quick worker wrote the code.
-`plan`/`integration_fix` didn't need an orchestrator change at all --
-they already ran on the loop's positional `client`, so routing them to
-the smart endpoint is just the caller (CLI's `main()`, GUI's
-`RunManager._run`) passing the role-resolved `primary` client instead of
-always `endpoints[0]`. CLI: `--endpoint HOST,MODEL,ROLE` (role optional).
-GUI: a compact role `<select>` next to every endpoint row (primary and
-each "+ add endpoint"), defaulting to Balanced.
+spec" right), and becomes the fixed critic override once tagged. It
+still joins the per-file worker pool alongside `"quick"`/`"balanced"`
+endpoints -- **first shipped excluding it from that pool** (the idea
+being a slow, careful model shouldn't be spent on high-volume grind),
+**corrected the same day from live use**: with the smart endpoint mostly
+idle except for the occasional plan/critic call, the obvious question
+was "why not have the math expert do math too" -- being more capable is
+a reason to give it *more* work, not less. Only one thing needed to
+change inside the orchestrator itself for the routing part: `MultiFileLoop`'s
+critic check previously always ran on *whichever worker built that
+file* (`client`, the dispatcher's per-file parameter) -- fine when every
+endpoint is equally capable, wrong once one is specifically the
+"careful" one. `_build_one_file` now uses `self._critic_client or
+client`, so with no smart endpoint configured (`critic_client=None`)
+it's byte-for-byte the old behaviour, and with one it's funneled there
+regardless of which worker wrote the code. `plan`/`integration_fix`
+didn't need an orchestrator change at all -- they already ran on the
+loop's positional `client`, so routing them to the smart endpoint is
+just the caller (CLI's `main()`, GUI's `RunManager._run`) passing the
+role-resolved `primary` client instead of always `endpoints[0]`. A
+`"quick"` tag means one specific thing: never become the plan/critic
+client, not even as a fallback with no `"smart"` endpoint configured --
+`"balanced"` (or an unrecognised role) can still stand in for that,
+matching pre-roles behaviour. CLI: `--endpoint HOST,MODEL,ROLE` (role
+optional). GUI: a compact role `<select>` next to every endpoint row
+(primary and each "+ add endpoint"), defaulting to Balanced.
+
+**Found live testing this, a real observability gap:** `plan` and
+`critic_check` log events never recorded which endpoint handled them --
+unlike `spec`/`codegen`/`fix`, which always have -- so which endpoint a
+"smart" tag actually routed plan/critic to was unverifiable after the
+fact from the log alone, only inferable from which endpoints *didn't*
+show up doing per-file work. Both events now carry `endpoint=`, and
+`progress.py`'s `[plan]`/`[critic]` lines show it the same way
+`[spec]`/`[codegen]` already did.
 
 The **dependency graph** (see the pause/resume entry below for how it
 started) got genuinely hard to read once a real multi-file plan showed

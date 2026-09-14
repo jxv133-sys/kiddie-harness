@@ -201,34 +201,34 @@ def partition_clients_by_role(
     spec/codegen/fix dispatch -- the high-volume grind), and (an explicit
     override for critic, or None).
 
-    No endpoint tagged "smart" (every one left at the "balanced" default,
-    today's only option before roles existed) reproduces today's exact
-    behaviour byte for byte: the first endpoint is the plan/integration
-    client *and* a full member of the worker pool, and the third value is
-    None -- meaning "don't override anything," so a file's own critic
-    check keeps running on whichever worker actually built that file, not
-    a fixed endpoint every file's critic gets funneled through.
+    Every endpoint works the per-file grind regardless of role -- a
+    "smart" endpoint being more capable is a reason to *also* give it
+    files to build, not to leave it idle except for plan/critic. Roles
+    only decide which client handles the judgement calls: a "smart"
+    endpoint is preferred there and, once tagged, becomes the critic
+    override -- every file's critic check, regardless of which worker
+    actually built it, goes to the one model asked to be careful, not
+    whichever one happened to grab the file. Without a "smart" tag
+    anywhere, a "balanced" endpoint can still fall back into that role
+    (matching today's behaviour before roles existed: the first endpoint
+    is the plan/integration client, and critic runs on whichever worker
+    built the file, not a fixed override). A "quick" endpoint never
+    becomes the plan/critic client, not even as a fallback -- that's the
+    one thing tagging something "quick" actually opts it out of.
 
-    A "smart"-tagged endpoint is excluded from the worker pool (the slow,
-    careful model shouldn't be spent on high-volume per-file generation)
-    and *does* become the critic override -- every file's critic check,
-    regardless of which "quick" worker built it, goes to the one model
-    asked to be careful. "quick" and "balanced" endpoints both work the
-    per-file grind; "balanced" alone (no "smart" tag anywhere) also
-    supplies the plan/integration client, same as today.
+    No endpoint tagged "smart" and none tagged "quick" (every one left at
+    the "balanced" default, today's only option before roles existed)
+    reproduces today's exact behaviour byte for byte.
     """
     smart = [c for e, c in zip(endpoints, clients) if e.role == "smart"]
-    quick = [c for e, c in zip(endpoints, clients) if e.role == "quick"]
     # Anything that isn't "smart" or "quick" -- "balanced", or a typo'd/
-    # unrecognised role -- behaves like "balanced": no endpoint silently
-    # falls out of the worker pool just because its role string doesn't
-    # match one of the two special-cased ones exactly.
+    # unrecognised role -- can still stand in for "smart" as a fallback
+    # plan/critic client, same as "balanced" always could.
     balanced = [c for e, c in zip(endpoints, clients) if e.role not in ("smart", "quick")]
 
-    workers = quick + balanced or list(clients)
     primary = smart[0] if smart else (balanced[0] if balanced else clients[0])
     critic_override = smart[0] if smart else None
-    return primary, workers, critic_override
+    return primary, list(clients), critic_override
 
 
 def _generate_and_fix(
@@ -381,7 +381,11 @@ def _with_critic(
                 on_chunk=update,
             )
         session.log(
-            "critic_check", path=str(path), follows_spec=verdict.follows_spec, issues=verdict.issues
+            "critic_check",
+            path=str(path),
+            follows_spec=verdict.follows_spec,
+            issues=verdict.issues,
+            endpoint=client.host,
         )
         if verdict.follows_spec:
             return result
@@ -550,7 +554,9 @@ class MultiFileLoop:
                 aborted=True,
                 abort_reason=reason,
             )
-        self.session.log("plan", files=[dataclasses.asdict(t) for t in tasks])
+        self.session.log(
+            "plan", files=[dataclasses.asdict(t) for t in tasks], endpoint=self.client.host
+        )
 
         file_results, stopped_early, abort_reason, iterations = self._generate_files(goal, tasks)
 
