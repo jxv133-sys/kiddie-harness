@@ -896,19 +896,34 @@ class MultiFileLoop:
     _SIBLING_CONTEXT_CHAR_CAP = 6000
 
     def _sibling_context(self, task: FileTask, file_results: list[FileRunResult]) -> str:
-        """The source of the modules this file declares it depends on, so
-        its codegen imports from them by name instead of guessing (or
+        """The content of the files this file declares it depends on, so
+        it can build on them by name instead of guessing (or
         re-implementing what a dependency already provides). With no
         explicit `depends_on`, `task.depends_on` is every earlier file --
-        the same as before this narrowing existed."""
+        the same as before this narrowing existed.
+
+        Grouped by whether the dependency is itself a Python module --
+        only those get the "import by module name" instruction and a
+        ```python fence. Used to apply that framing to *every*
+        dependency regardless of its real language: a Python file
+        depending on `login_page.html` would see the HTML fenced as
+        ```python and be told to `from login_page import ...` it, which
+        is not just misleading but impossible (Python cannot import an
+        .html file) -- a real, observed failure mode, not a hypothetical
+        one. Anything non-Python is still included as real reference
+        content (a server file legitimately benefits from seeing the
+        exact HTML it needs to serve), just fenced under its own
+        language and explicitly marked as not importable.
+        """
         wanted = set(task.depends_on)
-        blocks: list[str] = []
+        py_blocks: list[str] = []
+        other_blocks: list[str] = []
         used = 0
         for f in file_results:
             name = Path(f.path).name
             # A spec_flagged file already compiles/lints/imports clean --
             # only the critic disagreed -- so it's still safe, real source
-            # for a dependent to import from.
+            # for a dependent to build on.
             ok = f.success or f.spec_flagged
             if name not in wanted or not ok or f.advisory or name.startswith("test_"):
                 continue
@@ -916,14 +931,31 @@ class MultiFileLoop:
             if used + len(source) > self._SIBLING_CONTEXT_CHAR_CAP:
                 break
             used += len(source)
-            blocks.append(f"### {name}\n```python\n{source}\n```")
-        if not blocks:
+            suffix = Path(name).suffix.lower()
+            if suffix == ".py":
+                py_blocks.append(f"### {name}\n```python\n{source}\n```")
+            else:
+                other_blocks.append(f"### {name}\n```{suffix.lstrip('.') or 'text'}\n{source}\n```")
+
+        sections = []
+        if py_blocks:
+            sections.append(
+                "Modules already created in this project -- import what you "
+                "need from them by module name (the filename without `.py`); "
+                "do not re-implement what they already provide:\n"
+                + "\n\n".join(py_blocks)
+            )
+        if other_blocks:
+            sections.append(
+                "Other project files already created that this file depends "
+                "on, for reference only -- these are NOT Python modules and "
+                "must never be `import`ed; read, serve, or reference them by "
+                "their filename the way the task describes:\n"
+                + "\n\n".join(other_blocks)
+            )
+        if not sections:
             return ""
-        return (
-            "\n\nModules already created in this project -- import what you "
-            "need from them by module name (the filename without `.py`); do "
-            "not re-implement what they already provide:\n" + "\n\n".join(blocks)
-        )
+        return "\n\n" + "\n\n".join(sections)
 
     def _run_integration_with_fixes(
         self,

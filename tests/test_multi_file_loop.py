@@ -126,6 +126,58 @@ def test_codegen_instruction_carries_the_sibling_modules_already_built(tmp_path:
     assert "def add(a, b):" not in client.calls[2]
 
 
+def test_a_python_files_html_dependency_is_never_framed_as_importable(tmp_path: Path):
+    # Regression: _sibling_context used to fence *every* dependency's
+    # source as ```python and tell the model to "import ... by module
+    # name" regardless of the dependency's real language. A Python file
+    # (e.g. server.py) depending on an .html file it serves would be
+    # shown that HTML labeled as Python and told to `from login_page
+    # import ...` it -- which Python cannot do at all, since .html isn't
+    # an importable module. A real, observed failure mode, not a
+    # hypothetical one.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    html_source = "<html><body><h1>Log in</h1></body></html>"
+    client = FakeClient(
+        [
+            json.dumps(
+                {
+                    "files": [
+                        {"path": "login_page.html", "purpose": "the login page", "depends_on": []},
+                        {
+                            "path": "server.py",
+                            "purpose": "serves the login page",
+                            "depends_on": ["login_page.html"],
+                        },
+                    ]
+                }
+            ),
+            "- a login form",  # spec for login_page.html
+            html_source,  # codegen for login_page.html
+            "- serve login_page.html over HTTP",  # spec for server.py
+            (
+                "import http.server\n\n\n"
+                'if __name__ == "__main__":\n'
+                '    server = http.server.HTTPServer(("", 8000), '
+                "http.server.SimpleHTTPRequestHandler)\n"
+                "    server.serve_forever()\n"
+            ),  # codegen for server.py
+        ]
+    )
+
+    MultiFileLoop(client, config, session).run("a login page with a server")
+
+    # calls: plan(0), spec-html(1), codegen-html(2), spec-server(3), codegen-server(4)
+    server_instruction = client.calls[4]
+    assert html_source in server_instruction
+    assert "```html" in server_instruction
+    assert "```python\n" + html_source not in server_instruction
+    assert "must never be `import`ed" in server_instruction
+    # no Python sibling exists, so the Python-only "import by module
+    # name" framing must not appear at all
+    assert "import what you need" not in server_instruction
+
+
 def test_catches_and_fixes_a_bad_cross_file_import_during_its_own_generation(tmp_path: Path):
     # Mirrors a real failure: a file imports a sibling module under the
     # wrong name. The bug must be caught (and fixed) during that file's
