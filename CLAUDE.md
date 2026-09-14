@@ -267,6 +267,30 @@ core design, not just style.
 
 ## Status
 
+**Live icons for "critic reviewing" and "fixing", added on request**
+("add a indicator of when a file is being crititiced and when its
+being fixed") -- the same mechanism as the speccing dot, extended.
+`_files_response` takes one `active_calls()` snapshot per request and
+derives `criticizing`/`fixing` alongside `speccing` (`fixing` also
+counts `integration_fix`, the later, whole-project variant of the same
+in-place repair triggered by an integration error rather than the
+file's own verify loop). The graph node has one corner, one dot at a
+time: live activity (speccing > criticizing > fixing, mutually
+exclusive per file at any instant) always wins over the static
+"has a spec" dot, since has_spec stays true for the rest of a file's
+life once logged and would otherwise permanently mask whatever's
+actually happening to it right now. New `--critic` color token (teal);
+"fixing" reuses `--warn` (amber) rather than adding a fourth hue, since
+a fix *is* the model actively working on a flagged problem. Verified
+via the unit suite (gated-call tests proving each flag flips true
+exactly while its call is in flight and false again once it returns,
+for both `fix` and `critic`); visual check reused the same rendering
+path already confirmed live for the speccing case rather than
+re-verifying in the browser, since three separate ~9GB model pulls were
+in flight on the exact endpoints a live run would have used. Tests:
+`test_files_endpoint_reports_a_file_as_fixing_while_its_fix_call_is_in_flight`,
+`test_files_endpoint_reports_a_file_as_criticizing_while_its_critic_call_is_in_flight`.
+
 **A Python file's non-Python dependencies were fenced as `python` and
 told to be `import`ed -- fixed, found from a hunch that turned out to
 be a real, confirmed bug** ("there can be a bug where a .py file tries
