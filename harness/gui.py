@@ -625,10 +625,26 @@ class _Handler(BaseHTTPRequestHandler):
         run_dir = self._runs.log_path(run_id).parent
         if not run_dir.is_dir():
             return {"files": [], "has_plan": False, "phase": "planning"}
+        # In-flight, not-yet-logged spec calls -- a file only shows up in
+        # the completed log's `spec` event once the call returns, but the
+        # graph should show "writing its spec right now" the moment the
+        # call starts, not just after. active_calls() already scopes to
+        # this exact run while it's the one actually running, so this is
+        # empty for good on a finished/other run with no extra bookkeeping.
+        speccing_names = {
+            Path(c["path"]).name
+            for c in self._runs.active_calls(run_id)
+            if c.get("kind") == "spec" and c.get("path")
+        }
         status_by_name: dict[str, str] = {}
         spec_names: set[str] = set()
         endpoint_by_name: dict[str, str] = {}
-        started_names: set[str] = set()  # has a spec or codegen event -- "building", not "pending"
+        # has a spec/codegen event, or a spec call in flight right now --
+        # "building", not "pending". Without the speccing_names seed, a
+        # file whose spec call just started would show as untouched
+        # ("pending", dashed border) underneath its own pulsing
+        # "writing spec" dot -- a contradiction.
+        started_names: set[str] = set(speccing_names)
         finished_names: set[str] = set()  # its build loop has actually concluded, see file_result
         plan_entries: list[dict] = []
         has_plan = False
@@ -703,6 +719,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "status": status,
                         "size": disk_path.stat().st_size if disk_path.exists() else 0,
                         "has_spec": name in spec_names,
+                        "speccing": name in speccing_names,
                         "endpoint": endpoint_by_name.get(name, ""),
                     }
                 )
@@ -719,6 +736,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "status": status_by_name.get(p.name, "pending"),
                     "size": p.stat().st_size,
                     "has_spec": p.name in spec_names,
+                    "speccing": p.name in speccing_names,
                     "endpoint": endpoint_by_name.get(p.name, ""),
                 }
             )
@@ -1005,7 +1023,8 @@ _INDEX_HTML = """<!doctype html>
   .dep-node-group.dim .dep-node-rect,
   .dep-node-group.dim .dep-node-name,
   .dep-node-group.dim .dep-node-status,
-  .dep-node-group.dim .dep-spec-dot { opacity:.3; }
+  .dep-node-group.dim .dep-spec-dot,
+  .dep-node-group.dim .dep-speccing-dot { opacity:.3; }
   .dep-node-group.hl .dep-node-rect { stroke-width:2.5; }
   .dep-edge { fill:none; stroke:var(--muted); stroke-width:1.6; opacity:.65;
                transition:opacity .15s ease, stroke .15s ease, stroke-width .15s ease; }
@@ -1017,6 +1036,7 @@ _INDEX_HTML = """<!doctype html>
      straight to the spec instead of the code. */
   .dep-spec-dot { fill:var(--spec); cursor:pointer; transition:opacity .15s ease; }
   .dep-spec-dot:hover { stroke:var(--spec); stroke-width:2; }
+  .dep-speccing-dot { fill:var(--spec); pointer-events:none; animation:pulse 1.2s ease-in-out infinite; }
   .graph-legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin-top:8px; font-size:10.5px;
                    color:var(--muted); }
   .graph-legend span { display:inline-flex; align-items:center; gap:4px; }
@@ -1028,6 +1048,8 @@ _INDEX_HTML = """<!doctype html>
   .graph-legend i.building { border-color:var(--accent); border-width:2px; }
   .graph-legend i.pending { border-style:dashed; }
   .graph-legend i.spec { border-radius:50%; border-color:var(--spec); background:var(--spec); }
+  .graph-legend i.speccing { border-radius:50%; border-color:var(--spec); background:var(--spec);
+                              animation:pulse 1.2s ease-in-out infinite; }
 </style>
 </head>
 <body>
@@ -1117,6 +1139,7 @@ _INDEX_HTML = """<!doctype html>
       <span><i class="advisory"></i>advisory</span>
       <span><i class="flagged"></i>flagged</span>
       <span><i class="spec"></i>has a spec</span>
+      <span><i class="speccing"></i>writing spec&hellip;</span>
     </div>
   </div>
   <div id="summary"></div>
@@ -1548,12 +1571,20 @@ function renderGraph(files, runId) {
       ? `<circle class="dep-spec-dot" data-spec-name="${esc(f.name)}" `
         + `cx="${p.x + NODE_W - 8}" cy="${p.top + 8}" r="4"><title>view spec</title></circle>`
       : "";
+    // Same corner as the (static) has-a-spec dot -- the two are mutually
+    // exclusive per file (this one only shows while the spec call is
+    // still in flight; has_spec only lands once it's logged), and it
+    // pulses so it reads as "happening now", not "done".
+    const speccingDot = f.speccing
+      ? `<circle class="dep-speccing-dot" cx="${p.x + NODE_W - 8}" cy="${p.top + 8}" r="4">`
+        + `<title>writing spec\\u2026</title></circle>`
+      : "";
     nodes += `<g class="dep-node-group" data-name="${esc(f.name)}">`
       + `<rect class="dep-node-rect ${f.status}" x="${p.x}" y="${p.top}" `
       + `width="${NODE_W}" height="${NODE_H}" rx="7"><title>${esc(title)}</title></rect>`
       + `<text class="dep-node-name" x="${p.cx}" y="${p.top + 17}" text-anchor="middle">${esc(label)}</text>`
       + `<text class="dep-node-status ${f.status}" x="${p.cx}" y="${p.top + 30}" text-anchor="middle">`
-      + `${_STATUS_LABEL[f.status] || esc(f.status)}</text>${specDot}</g>`;
+      + `${_STATUS_LABEL[f.status] || esc(f.status)}</text>${specDot}${speccingDot}</g>`;
   });
 
   const defs = `<defs><marker id="dep-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" `

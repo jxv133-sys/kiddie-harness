@@ -781,6 +781,7 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
                 "status": "ok",
                 "size": 6,
                 "has_spec": True,
+                "speccing": False,
                 "endpoint": "http://second:11434",
             }
         ]
@@ -931,6 +932,81 @@ def test_files_endpoint_does_not_report_a_still_retrying_file_as_failed(tmp_path
             ).read()
         )
         assert body["files"][0]["status"] == "building"  # not "failed"
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_files_endpoint_reports_a_file_as_speccing_while_its_spec_call_is_in_flight(
+    tmp_path: Path, monkeypatch
+):
+    """A file's `spec` log event only lands once the call returns -- the
+    graph should show "writing its spec right now" the moment the call
+    starts, sourced from the live active_calls() list, not the log."""
+    import threading
+    import urllib.request
+
+    # Isolate from the real, developer-machine gui_settings.json -- it can
+    # (and during this session's own use, does) carry real endpoints and
+    # critic_enabled=true, which would spawn extra worker threads and an
+    # unplanned critic call against this test's single fake client.
+    monkeypatch.setattr(gui, "_SETTINGS_PATH", tmp_path / "gui_settings.json")
+
+    class _GatedClient:
+        host = "http://gated"
+
+        def __init__(self, inner, gate_on_call, gate, release):
+            self._inner = inner
+            self._gate_on_call = gate_on_call
+            self._gate = gate
+            self._release = release
+            self._n = 0
+
+        def generate(self, *a, **k):
+            self._n += 1
+            if self._n == self._gate_on_call:
+                self._gate.set()
+                self._release.wait(timeout=5)
+            return self._inner.generate(*a, **k)
+
+    config = make_config(tmp_path)
+    inner = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]}),
+            "- do x",
+            "x = 1\n",
+        ]
+    )
+    gate = threading.Event()
+    release = threading.Event()
+    client = _GatedClient(inner, gate_on_call=2, gate=gate, release=release)  # 2nd call = spec
+
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    server.run_manager._client_factory = lambda *a, **k: client
+    try:
+        run_id = server.run_manager.start(goal="x", model="m", host="h", multi_file=True)
+        assert gate.wait(timeout=5)
+
+        body = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/files/{run_id}", timeout=5).read()
+        )
+        during = {f["name"]: f for f in body["files"]}["main.py"]
+        assert during["speccing"] is True
+        assert during["has_spec"] is False  # not logged yet -- still in flight
+        assert during["status"] == "building"
+
+        release.set()
+        server.run_manager.wait(timeout=5)
+
+        body_after = json.loads(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/files/{run_id}", timeout=5).read()
+        )
+        after = {f["name"]: f for f in body_after["files"]}["main.py"]
+        assert after["speccing"] is False
+        assert after["has_spec"] is True
     finally:
         server.shutdown()
         t.join(timeout=5)
