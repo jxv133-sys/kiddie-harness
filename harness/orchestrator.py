@@ -322,6 +322,18 @@ def _generate_and_fix(
 
     attempts = 0
     while True:
+        # Checked here, before writing -- not only in the gap between
+        # attempts below -- because a fix call already in flight when the
+        # other side of a race wins doesn't know that yet: without this,
+        # it finishes, writes its (now-stale) content straight over the
+        # real path the winner already occupies, and if that stale
+        # content happens to verify clean, _generate_and_fix returns
+        # success without ever reaching the check below at all -- a real
+        # bug found live, not hypothetical (a losing original overwrote
+        # a branch's already-recorded winning file with its own stale,
+        # late-arriving content).
+        if branch_cancel is not None and branch_cancel.is_set():
+            raise _BranchSuperseded("another attempt at this file already won")
         file_path.write_text(code)
         if code.strip():
             result = verify_fn(file_path)

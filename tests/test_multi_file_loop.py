@@ -750,6 +750,42 @@ def test_branching_never_kicks_in_before_the_threshold_is_crossed(tmp_path: Path
     assert b.calls == []
 
 
+def test_a_stale_losing_attempt_never_overwrites_the_winning_branchs_file(tmp_path: Path):
+    # Regression, found live: branch_cancel used to only be checked in
+    # the gap *between* fix attempts -- a fix call already in flight
+    # when the other side of the race won didn't know that yet. It
+    # would finish, write its own (now-stale) content straight over the
+    # real path the winner already occupies, and if that stale content
+    # happened to verify clean, _generate_and_fix returned success
+    # without ever reaching the between-attempts check at all. Delaying
+    # "original"'s calls (same technique the "idle worker" test above
+    # uses -- first in the pool reliably claims the only file) gives
+    # "branch" a real head start to win before "original"'s own
+    # eventually-successful fix call returns.
+    config = make_config(tmp_path).with_overrides(branch_after_fixes=1)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]})
+    # "original"'s eventual, delayed content ("y = 2") is deliberately
+    # *different* from "branch"'s winning content ("x = 1") -- both are
+    # otherwise equally valid, passing files, so only the file's actual
+    # text on disk can tell a stale overwrite apart from the real winner
+    # winning cleanly (identical content would hide the bug either way).
+    original = FakeClient(
+        ["- spec", "bad(", "bad(", "y = 2\n"], delay=1.0, host="http://original"
+    )
+    branch = FakeClient(["- spec", "x = 1\n"], host="http://branch")
+
+    result = MultiFileLoop(
+        FakeClient([plan]), config, session,
+        pool_clients=[original, branch], branch_pool=[original, branch],
+    ).run("goal")
+
+    assert result.success
+    assert (session.run_dir / "main.py").read_text() == "x = 1"
+    events = [json.loads(line) for line in session.log_path.read_text().splitlines()]
+    assert sum(1 for e in events if e["event"] == "file_result") == 1
+
+
 def test_run_aborts_gracefully_when_the_model_becomes_unreachable(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
