@@ -267,6 +267,63 @@ core design, not just style.
 
 ## Status
 
+**A stuck file can branch to an idle endpoint, implemented from the
+same planned proposal as whole-project review** ("finish both A and
+B" -- see the entry below). Observed live: a file can burn many fix
+attempts on one endpoint while the others sit idle with nothing else
+claimable. `partition_clients_by_role` (`orchestrator.py`) gained a
+fourth return value, `branch_pool` -- clients tagged `smart` or
+`balanced`, never `quick` -- resolved once, upstream, the same way
+`primary`/`pool_clients`/`critic_client` already are, so `MultiFileLoop`
+itself still never learns what a role *means* (a deliberate invariant
+stated in its own docstring, preserved rather than broken for this).
+
+`_generate_files`'s dispatch loop gained real new machinery: a shared
+`in_progress` dict (task name -> live attempt count, a per-task cancel
+`Event`, branched flag, and a `pending_workers` counter) that an idle,
+branch-eligible worker consults instead of just polling `cv.wait()` with
+nothing to do. A branch writes to a scratch path
+(`.branch-<real name>`) so it can never collide on disk with the
+original still writing the real one. `settle()` (replacing the old
+inline `record()` call at both success sites) decides the race: a
+success always wins immediately and cancels the losing side at its next
+checkpoint (`_BranchSuperseded`, the same cooperative between-attempts
+checkpoint `RunCancelled` already uses); a failure is only recorded once
+every concurrent attempt has also finished, so a branch still in flight
+gets its real chance instead of the original's exhaustion (or vice
+versa) silently pre-empting it. A genuine correctness gap found and
+fixed during implementation, not after: the fix-loop's *success* path
+returns immediately without ever checking `branch_cancel` (only the
+failure path does), so a loser whose own verify also happens to pass
+would reach `settle()` after the winner already had -- guarded with a
+`name in done or name in hard_failed` staleness check so a late,
+lost-the-race result is discarded instead of double-recorded. A second
+gap: `_BranchSuperseded` wasn't caught at two of the three call sites
+that needed it (the original's own build call, and its in-place retry
+lambda after a transient endpoint blip) -- an uncaught exception there
+would have silently hung the dispatch loop's `busy` bookkeeping forever.
+New `Config.branch_after_fixes` (0 disables entirely -- verified zero
+behavior change against the full pre-existing suite), `--branch-after-
+fixes` CLI flag, GUI settings-panel input, and a live `branching` graph
+dot (highest priority of the existing live dots, sourced from
+`active_calls()` recognizing the `.branch-` scratch prefix). A
+`FileRunResult.branched` flag, only useful if it actually reaches a
+report: fixed `summary.py` to treat the new `file_result` event's
+`success`/`branched` fields as authoritative over a branch-winning
+file's stale codegen/verify history (which was logged under the
+scratch path, not the real one) and to exclude scratch-path entries
+from the report entirely, rather than showing `.branch-main.py` as if
+it were its own real file. Given the concurrency risk, the dispatch-
+loop tests (FakeClient, both pool clients given identical/interchangeable
+queues since which one claims first is a genuine race the codebase's own
+existing tests already treat the same way) were run 8x to check for
+flakiness before considering this done. Live verification with real,
+slow endpoints was judged impractical for this specific feature (forcing
+a multi-minute stuck-file race would take a very long time per attempt);
+relied on the test suite instead, consistent with how live-verification
+tradeoffs were handled elsewhere this session when real-endpoint timing
+made them impractical.
+
 **Whole-project review with independent confirmation, implemented from
 a planned proposal** ("write up a plan for both" -> approved -> "finish
 both A and B"). New `harness/steps/super_review.py`, mirroring
