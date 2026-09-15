@@ -202,6 +202,60 @@ def test_catches_and_fixes_a_bad_cross_file_import_during_its_own_generation(tmp
     assert main_file.attempts == 1
 
 
+def test_a_disclaimer_prose_spec_response_is_rejected_and_retried(tmp_path: Path):
+    # write_spec itself has no validation -- a model that responds with
+    # commentary instead of real bullet points used to flow straight into
+    # the codegen instruction unflagged, corrupting everything built from
+    # it without ever surfacing the real cause.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "print hello", "depends_on": []}]}),
+            "Sure, here's a specification for main.py based on your request.",  # rejected
+            "- print hello",  # accepted retry
+            "print('hello')\n",  # codegen
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("print hello")
+
+    assert result.success
+    assert len(client.calls) == 4  # plan + 2 spec attempts + codegen -- both spec calls were real
+    events = [
+        json.loads(line)["event"] for line in (session.run_dir / "log.jsonl").read_text().splitlines()
+    ]
+    assert events.count("spec_rejected") == 1
+    assert events.count("spec") == 1  # only the accepted attempt is logged as "spec"
+
+
+def test_a_persistently_bad_spec_still_proceeds_once_retries_are_exhausted(tmp_path: Path):
+    # Spec retries are a small, bounded nudge, not a guarantee -- codegen
+    # and verify remain the real backstop, so a file must still get built
+    # (and judged by real tooling) even if every spec attempt is bad.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "print hello", "depends_on": []}]}),
+            "I cannot help with that request.",  # attempt 1 -- rejected
+            "I'm not able to generate this.",  # attempt 2 -- rejected
+            "Sorry, I can't complete this task.",  # attempt 3 -- exhausted, used anyway
+            "print('hello')\n",  # codegen still happens
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("print hello")
+
+    assert result.success
+    assert len(client.calls) == 5  # plan + 3 spec attempts + codegen
+    events = [
+        json.loads(line)["event"] for line in (session.run_dir / "log.jsonl").read_text().splitlines()
+    ]
+    assert events.count("spec_rejected") == 2  # attempts 1 and 2; the 3rd is used regardless
+    assert events.count("spec") == 1
+
+
 def test_auto_fixes_a_per_file_lint_issue_without_calling_the_llm(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)

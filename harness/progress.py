@@ -35,6 +35,12 @@ def format_event(event: str, fields: dict) -> str | None:
     if event == "spec":
         return f"[spec] {fields['path']}{_endpoint_note(fields)}"
 
+    if event == "spec_rejected":
+        return (
+            f"[spec] {fields['path']} -> attempt {fields['attempt']} didn't look like a "
+            f"real spec (retrying, hotter)"
+        )
+
     if event == "codegen":
         note = " (truncated)" if fields.get("truncated") else ""
         return f"[codegen] {fields['path']}{note}{_endpoint_note(fields)}"

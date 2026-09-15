@@ -187,6 +187,16 @@ _TRUNCATION_NOTE = (
 _RETRY_TEMPERATURE_STEP = 0.15
 _RETRY_TEMPERATURE_MAX = 0.9
 
+# A spec response that doesn't look like a real spec (disclaimer prose
+# instead of bullet points -- the same "vacuous pass" failure mode
+# verify.py's html/css/js checks guard against, but one step earlier,
+# before it ever reaches codegen) gets a few retries, each a little
+# hotter than the last, same reasoning as fix attempts. Small on
+# purpose: spec generation is cheap and a genuinely stuck model won't
+# recover with more tries than that -- codegen and verify remain the
+# real backstop either way.
+_SPEC_RETRY_ATTEMPTS = 3
+
 
 def _retry_temperature(base: float, fix_attempt: int) -> float:
     """Sampling temperature for fix attempt N (1 = first fix)."""
@@ -824,14 +834,27 @@ class MultiFileLoop:
     def _build_one_file(
         self, client: OllamaClient, goal: str, task: FileTask, built_so_far: list[FileRunResult]
     ) -> tuple[FileRunResult, int]:
-        with self.session.track_call("spec", task.path, client.host) as update:
-            spec_text = spec.write_spec(
-                client,
-                goal,
-                task,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                on_chunk=update,
+        spec_text = ""
+        spec_calls = 0
+        for spec_attempt in range(1, _SPEC_RETRY_ATTEMPTS + 1):
+            spec_calls += 1
+            with self.session.track_call("spec", task.path, client.host) as update:
+                spec_text = spec.write_spec(
+                    client,
+                    goal,
+                    task,
+                    temperature=_retry_temperature(self.config.temperature, spec_attempt - 1),
+                    max_tokens=self.config.max_tokens,
+                    on_chunk=update,
+                )
+            if spec.looks_like_a_spec(spec_text) or spec_attempt == _SPEC_RETRY_ATTEMPTS:
+                break
+            self.session.log(
+                "spec_rejected",
+                path=task.path,
+                spec=spec_text,
+                attempt=spec_attempt,
+                endpoint=client.host,
             )
         self.session.log("spec", path=task.path, spec=spec_text, endpoint=client.host)
 
@@ -890,7 +913,7 @@ class MultiFileLoop:
                 advisory=advisory,
                 spec_flagged=spec_flagged,
             ),
-            2 + attempts + critic_calls[0],  # spec + codegen + fixes + critic checks
+            spec_calls + 1 + attempts + critic_calls[0],  # spec attempts + codegen + fixes + critic
         )
 
     _SIBLING_CONTEXT_CHAR_CAP = 6000

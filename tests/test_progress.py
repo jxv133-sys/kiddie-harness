@@ -103,6 +103,13 @@ def test_format_event_fix_noop():
     assert line == "[fix] main.py -> attempt 2 repeated its previous output (raising temperature)"
 
 
+def test_format_event_spec_rejected():
+    line = format_event(
+        "spec_rejected", {"path": "main.py", "spec": "Sure, here you go.", "attempt": 1}
+    )
+    assert line == "[spec] main.py -> attempt 1 didn't look like a real spec (retrying, hotter)"
+
+
 def test_format_event_advisory_test():
     line = format_event("advisory_test", {"path": "test_main.py", "last_error": "boom"})
     assert line == "[advisory] test_main.py -> generated test never passed (not blocking the run)"
