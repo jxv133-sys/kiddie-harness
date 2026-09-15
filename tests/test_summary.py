@@ -341,3 +341,92 @@ def test_render_table_formats_stopped_early():
     table = render_table(summary)
 
     assert "Result: STOPPED: iteration budget exhausted (2 LLM call(s) total)" in table
+
+
+def test_load_run_summary_pairs_a_finding_with_its_confirmation(tmp_path: Path):
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "plan", "files": [{"path": "a.py", "purpose": "x"}]},
+            {"event": "integration_verify", "stage": "run", "success": True, "output": ""},
+            {
+                "event": "super_review",
+                "issues": [{"file": "a.py", "description": "never imports b.py"}],
+                "endpoint": "http://smart",
+            },
+            {
+                "event": "super_review_confirm",
+                "file": "a.py",
+                "description": "never imports b.py",
+                "confirmed": True,
+                "endpoint": "http://quick",
+            },
+            {"event": "run_result", "success": True},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert summary.super_review_started
+    assert summary.cross_file_issues == [
+        {"file": "a.py", "description": "never imports b.py", "confirmed": True}
+    ]
+    assert summary.total_llm_calls == 3  # plan + super_review + super_review_confirm
+
+
+def test_load_run_summary_keeps_an_unconfirmed_finding_visible(tmp_path: Path):
+    # No super_review_confirm event at all (single-endpoint run, no second
+    # client to ask) -- the finding must still show up, just unconfirmed.
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "plan", "files": [{"path": "a.py", "purpose": "x"}]},
+            {
+                "event": "super_review",
+                "issues": [{"file": "a.py", "description": "maybe an issue"}],
+                "endpoint": "http://smart",
+            },
+            {"event": "run_result", "success": True},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert summary.cross_file_issues == [
+        {"file": "a.py", "description": "maybe an issue", "confirmed": False}
+    ]
+
+
+def test_load_run_summary_super_review_not_started_when_absent(tmp_path: Path):
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "plan", "files": [{"path": "a.py", "purpose": "x"}]},
+            {"event": "run_result", "success": True},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert not summary.super_review_started
+    assert summary.cross_file_issues == []
+
+
+def test_render_table_shows_confirmed_and_unconfirmed_findings():
+    summary = RunSummary(
+        run_id="r4",
+        files=[],
+        integration=IntegrationSummary(stage="run", success=True),
+        total_llm_calls=4,
+        stopped_early=False,
+        succeeded=True,
+        cross_file_issues=[
+            {"file": "a.py", "description": "real problem", "confirmed": True},
+            {"file": "b.py", "description": "maybe a problem", "confirmed": False},
+        ],
+    )
+
+    table = render_table(summary)
+
+    assert "[review:confirmed] a.py -- real problem" in table
+    assert "[review:unconfirmed] b.py -- maybe a problem" in table

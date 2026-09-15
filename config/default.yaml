@@ -53,6 +53,18 @@ critic:
   # disagreement is reported, not fatal. Off saves one LLM call per file.
   enabled: true
 
+super_review:
+  # Once every file is built and integration has run, one more pass hands
+  # *all* the files to a model and asks it to find whole-project problems
+  # (see steps/super_review.py) -- the kind a per-file critic can never
+  # see, since it's only ever shown one file. Each finding is checked
+  # against a second, independent endpoint before being reported; an
+  # unconfirmed finding is still shown, just marked as such. Advisory
+  # only, like the per-file critic -- never fails the run. Off by
+  # default: heavier than the per-file critic (up to two extra calls per
+  # finding), opt in once you've tried it.
+  enabled: false
+
 retries:
   # Bounded retries per file's fix loop. Each retry samples a little
   # hotter than the last (see orchestrator._retry_temperature), so these
@@ -61,6 +73,12 @@ retries:
   max_fix_attempts: 5
   # Bounded total LLM calls across an entire multi-file run (Phase 2+).
   max_total_iterations: 40
+  # Once a file's fix loop reaches this many attempts, an idle endpoint
+  # tagged "smart" or "balanced" (never "quick") may start its own
+  # independent attempt at the same file in parallel -- whichever finishes
+  # first wins, see orchestrator._generate_files. 0 (the default) disables
+  # this entirely; only matters with more than one endpoint configured.
+  branch_after_fixes: 0
 
 workspace:
   root: "workspace"

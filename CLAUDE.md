@@ -267,6 +267,36 @@ core design, not just style.
 
 ## Status
 
+**Whole-project review with independent confirmation, implemented from
+a planned proposal** ("write up a plan for both" -> approved -> "finish
+both A and B"). New `harness/steps/super_review.py`, mirroring
+`critic.py`'s shape exactly (atomic, schema-constrained, fails open):
+`find_issues` hands every finished file to the primary/reviewer client
+and asks for whole-project problems -- the kind a per-file critic can
+never catch, since it's only ever shown one file (a mismatch between
+what one file provides and what another expects, e.g. this session's
+own `server.py`-doesn't-serve-`login_page.html` bug). `confirm_issue`
+asks a second, different pool client whether it independently sees the
+same problem before it's reported as confirmed -- an unconfirmed
+finding is still shown, never silently dropped, since two small models
+disagreeing isn't proof the issue is fake. Runs in
+`MultiFileLoop._run_super_review` right after integration, gated the
+same way integration itself is (`all_required_ok and not stopped_early
+and abort_reason is None`), regardless of integration's own success --
+"once all files are generated" is the trigger. Advisory only: a new
+`cross_file_issues` field on `MultiFileRunResult`/`RunSummary`, never
+affects `overall_success`. New `Config.super_review_enabled` (off by
+default -- heavier than the per-file critic, opt in), `--super-review`
+CLI flag, and a GUI settings-panel checkbox, all following the exact
+`critic_enabled` pattern. GUI also gained a REVIEW step in the phase
+stepper (between INTEGRATE and DONE, driven by a new
+`RunSummary.super_review_started` flag so it doesn't show prematurely
+during integration's own fix loop) and a findings table in the run
+summary, confirmed/unconfirmed styled distinctly. Tests:
+`test_super_review.py` (unit), four integration tests in
+`test_multi_file_loop.py`, CLI tests in `test_cli.py`, summary-parsing
+tests in `test_summary.py`, progress-line tests in `test_progress.py`.
+
 **A vacuous-prose spec now gets retried instead of silently flowing
 into codegen, implemented from a research pass on small-LLM harness
 design** ("implement the spec validation fix"). `write_spec` had zero

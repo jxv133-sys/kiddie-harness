@@ -137,6 +137,33 @@ def test_format_event_run_paused_and_resumed():
     assert format_event("run_resumed", {}) == "[resumed]"
 
 
+def test_format_event_super_review_no_issues():
+    line = format_event("super_review", {"issues": [], "endpoint": "http://smart:11434"})
+    assert line == "[review] no whole-project issues found @ http://smart:11434"
+
+
+def test_format_event_super_review_found_issues():
+    line = format_event(
+        "super_review",
+        {"issues": [{"file": "a.py", "description": "x"}], "endpoint": "http://smart:11434"},
+    )
+    assert line == "[review] 1 possible issue(s) found @ http://smart:11434 -- confirming…"
+
+
+def test_format_event_super_review_confirm():
+    line = format_event(
+        "super_review_confirm",
+        {"file": "main.py", "description": "never imports helper", "confirmed": True},
+    )
+    assert line == "[review] main.py -> confirmed: never imports helper"
+
+    line = format_event(
+        "super_review_confirm",
+        {"file": "main.py", "description": "never imports helper", "confirmed": False},
+    )
+    assert line == "[review] main.py -> not confirmed: never imports helper"
+
+
 def test_console_reporter_prints_only_non_silent_events():
     printed = []
     reporter = console_reporter(print_fn=printed.append)

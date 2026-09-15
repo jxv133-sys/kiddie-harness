@@ -928,3 +928,105 @@ def test_integration_fix_is_tracked_as_its_own_kind(tmp_path: Path):
     )
 
     assert seen == ["integration_fix"]
+
+
+def test_super_review_finds_and_confirms_a_cross_file_issue(tmp_path: Path):
+    config = make_config(tmp_path).with_overrides(super_review_enabled=True)
+    session = Session.create(config.workspace_root)
+    # `client` (plan + reviewer) and the sole pool client are deliberately
+    # different objects, so confirm_client (self._pool minus self.client)
+    # resolves to the pool client unambiguously.
+    plan_and_review_client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]}),
+            json.dumps(
+                {"issues": [{"file": "main.py", "description": "doesn't do what the goal asked"}]}
+            ),
+        ]
+    )
+    builder_client = FakeClient(
+        [
+            "- print hello",
+            "print('hello')\n",
+            json.dumps({"confirmed": True}),
+        ]
+    )
+
+    result = MultiFileLoop(
+        plan_and_review_client, config, session, pool_clients=[builder_client]
+    ).run("print hello")
+
+    assert result.success
+    assert result.cross_file_issues == [
+        {"file": "main.py", "description": "doesn't do what the goal asked", "confirmed": True}
+    ]
+
+
+def test_super_review_shows_an_unconfirmed_issue_rather_than_dropping_it(tmp_path: Path):
+    # A finding the second reviewer disagrees with is still reported --
+    # silently dropping it would risk losing a real issue just because
+    # two small models didn't happen to agree.
+    config = make_config(tmp_path).with_overrides(super_review_enabled=True)
+    session = Session.create(config.workspace_root)
+    plan_and_review_client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]}),
+            json.dumps({"issues": [{"file": "main.py", "description": "maybe an issue"}]}),
+        ]
+    )
+    builder_client = FakeClient(
+        [
+            "- print hello",
+            "print('hello')\n",
+            json.dumps({"confirmed": False}),
+        ]
+    )
+
+    result = MultiFileLoop(
+        plan_and_review_client, config, session, pool_clients=[builder_client]
+    ).run("print hello")
+
+    assert result.success
+    assert result.cross_file_issues == [
+        {"file": "main.py", "description": "maybe an issue", "confirmed": False}
+    ]
+
+
+def test_super_review_skips_confirmation_with_only_one_endpoint(tmp_path: Path):
+    # No second, distinct client to ask -- every finding comes back
+    # unconfirmed rather than the feature crashing or inventing a verdict.
+    config = make_config(tmp_path).with_overrides(super_review_enabled=True)
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]}),
+            "- print hello",
+            "print('hello')\n",
+            json.dumps({"issues": [{"file": "main.py", "description": "an issue"}]}),
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("print hello")
+
+    assert result.success
+    assert result.cross_file_issues == [
+        {"file": "main.py", "description": "an issue", "confirmed": False}
+    ]
+
+
+def test_super_review_is_off_by_default(tmp_path: Path):
+    config = make_config(tmp_path)  # super_review_enabled defaults False
+    session = Session.create(config.workspace_root)
+    client = FakeClient(
+        [
+            json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]}),
+            "- print hello",
+            "print('hello')\n",
+        ]
+    )
+
+    result = MultiFileLoop(client, config, session).run("print hello")
+
+    assert result.success
+    assert result.cross_file_issues == []
+    assert len(client.calls) == 3  # no extra review call made

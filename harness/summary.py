@@ -12,7 +12,16 @@ import dataclasses
 import json
 from pathlib import Path
 
-_CALL_EVENTS = {"plan", "spec", "codegen", "fix", "integration_fix", "critic_check"}
+_CALL_EVENTS = {
+    "plan",
+    "spec",
+    "codegen",
+    "fix",
+    "integration_fix",
+    "critic_check",
+    "super_review",
+    "super_review_confirm",
+}
 
 
 @dataclasses.dataclass
@@ -56,6 +65,15 @@ class RunSummary:
     # partway through, rather than on the code.
     aborted: bool = False
     abort_reason: str = ""
+    # Whole-project findings from steps/super_review.py, in the order
+    # they were reported: {"file", "description", "confirmed"}. Empty
+    # when super_review never ran or found nothing.
+    cross_file_issues: list[dict] = dataclasses.field(default_factory=list)
+    # True the moment a super_review event lands in the log -- separate
+    # from `cross_file_issues` being non-empty, since "reviewed and found
+    # nothing" and "hasn't started reviewing yet" must read differently
+    # (the GUI's phase stepper needs to tell them apart).
+    super_review_started: bool = False
 
 
 def load_run_summary(log_path: Path) -> RunSummary:
@@ -71,6 +89,9 @@ def load_run_summary(log_path: Path) -> RunSummary:
     finished = False
     aborted = False
     abort_reason = ""
+    found_issues: list[dict] = []
+    confirmed_by_key: dict[tuple[str, str], bool] = {}
+    super_review_started = False
 
     for line in log_path.read_text().splitlines():
         if not line.strip():
@@ -116,6 +137,11 @@ def load_run_summary(log_path: Path) -> RunSummary:
                 output="" if record["success"] else record.get("output", ""),
             )
             finished = True
+        elif event == "super_review":
+            super_review_started = True
+            found_issues = record.get("issues") or []
+        elif event == "super_review_confirm":
+            confirmed_by_key[(record["file"], record["description"])] = record["confirmed"]
         elif event == "budget_exhausted":
             stopped_early = True
             finished = True
@@ -147,6 +173,15 @@ def load_run_summary(log_path: Path) -> RunSummary:
         for path, data in files.items()
     ]
 
+    cross_file_issues = [
+        {
+            "file": item["file"],
+            "description": item["description"],
+            "confirmed": confirmed_by_key.get((item["file"], item["description"]), False),
+        }
+        for item in found_issues
+    ]
+
     return RunSummary(
         run_id=log_path.parent.name,
         files=file_summaries,
@@ -157,6 +192,8 @@ def load_run_summary(log_path: Path) -> RunSummary:
         finished=finished,
         aborted=aborted,
         abort_reason=abort_reason,
+        cross_file_issues=cross_file_issues,
+        super_review_started=super_review_started,
     )
 
 
@@ -183,6 +220,10 @@ def render_table(summary: RunSummary) -> str:
     if summary.integration is not None:
         status = "ok" if summary.integration.success else "FAILED"
         lines.append(f"  [{status}] integration check ({summary.integration.stage})")
+
+    for issue in summary.cross_file_issues:
+        tag = "confirmed" if issue["confirmed"] else "unconfirmed"
+        lines.append(f"  [review:{tag}] {issue['file']} -- {issue['description']}")
 
     if summary.aborted:
         detail = f" ({summary.abort_reason})" if summary.abort_reason else ""

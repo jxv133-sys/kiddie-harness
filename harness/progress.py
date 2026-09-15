@@ -102,6 +102,16 @@ def format_event(event: str, fields: dict) -> str | None:
     if event == "run_resumed":
         return "[resumed]"
 
+    if event == "super_review":
+        n = len(fields["issues"])
+        if n == 0:
+            return f"[review] no whole-project issues found{_endpoint_note(fields)}"
+        return f"[review] {n} possible issue(s) found{_endpoint_note(fields)} -- confirming…"
+
+    if event == "super_review_confirm":
+        verdict = "confirmed" if fields["confirmed"] else "not confirmed"
+        return f"[review] {fields['file']} -> {verdict}: {fields['description']}"
+
     return None
 
 

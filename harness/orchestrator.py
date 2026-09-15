@@ -18,7 +18,7 @@ from typing import TypeVar
 from .config import Config, Endpoint
 from .llm_client import OllamaClient, OllamaError
 from .session import Session
-from .steps import codegen, critic, plan, spec, verify
+from .steps import codegen, critic, plan, spec, super_review, verify
 from .steps.plan import FileTask
 from .steps.verify import VerifyResult
 
@@ -157,6 +157,11 @@ class MultiFileRunResult:
     # files completed before the outage are kept in `files`.
     aborted: bool = False
     abort_reason: str = ""
+    # Whole-project findings from steps/super_review.py, one dict per
+    # issue: {"file", "description", "confirmed"}. Empty when
+    # super_review_enabled is off, integration never ran, or the review
+    # pass itself found nothing -- advisory only, never affects `success`.
+    cross_file_issues: list[dict] = dataclasses.field(default_factory=list)
 
 
 def _safe_relative_path(raw: str) -> Path:
@@ -571,6 +576,7 @@ class MultiFileLoop:
         file_results, stopped_early, abort_reason, iterations = self._generate_files(goal, tasks)
 
         integration: VerifyResult | None = None
+        cross_file_issues: list[dict] = []
         advisory_paths = [Path(f.path) for f in file_results if f.advisory]
         # A run's success rides on its non-advisory, non-spec_flagged
         # files: the implementation, and any test that actually passed.
@@ -598,6 +604,17 @@ class MultiFileLoop:
                 abort_reason = str(exc)
             except RunCancelled:
                 abort_reason = "cancelled by user"
+
+            if self.config.super_review_enabled and abort_reason is None:
+                try:
+                    cross_file_issues, iterations = self._run_super_review(
+                        goal, required, iterations
+                    )
+                except (OllamaError, RunCancelled):
+                    # Advisory only -- a failure in the review pass itself
+                    # must never sink an otherwise-successful run, same
+                    # contract as the per-file critic.
+                    pass
 
         overall_success = (
             abort_reason is None
@@ -627,6 +644,7 @@ class MultiFileLoop:
             stopped_early=stopped_early,
             aborted=abort_reason is not None,
             abort_reason=abort_reason or "",
+            cross_file_issues=cross_file_issues,
         )
 
     def _generate_files(
@@ -1053,6 +1071,71 @@ class MultiFileLoop:
             "integration_verify", stage=result.stage, success=result.success, output=result.output
         )
         return result
+
+    def _run_super_review(
+        self, goal: str, required: list[FileRunResult], iterations: int
+    ) -> tuple[list[dict], int]:
+        """Once every required file is built, hand all of them to the
+        reviewer client (the same primary client used for plan/critic/
+        integration-fix -- the existing "judgement calls" client) and ask
+        it to find whole-project problems a per-file critic can never see,
+        since it's only ever shown one file. Each finding is checked
+        against a second, different pool client before being reported as
+        confirmed; unconfirmed findings are still returned, just marked
+        as such -- filtering silently would risk dropping a real issue
+        just because two small models didn't happen to agree.
+
+        Skips the confirm step (every finding comes back unconfirmed) when
+        the pool has no second distinct client to ask -- a single-endpoint
+        run has no "another agent" to check against."""
+        if iterations >= self.config.max_total_iterations:
+            return [], iterations
+        confirm_client = next((c for c in self._pool if c is not self.client), None)
+        files = [(Path(f.path).name, Path(f.path).read_text()) for f in required]
+
+        with self.session.track_call("super_review", "", self.client.host) as update:
+            found = super_review.find_issues(
+                self.client,
+                goal,
+                files,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                on_chunk=update,
+            )
+        iterations += 1
+        self.session.log(
+            "super_review",
+            issues=[dataclasses.asdict(i) for i in found],
+            endpoint=self.client.host,
+        )
+
+        results: list[dict] = []
+        for issue in found:
+            confirmed = False
+            if confirm_client is not None and iterations < self.config.max_total_iterations:
+                with self.session.track_call(
+                    "super_review_confirm", issue.file, confirm_client.host
+                ) as update:
+                    confirmed = super_review.confirm_issue(
+                        confirm_client,
+                        files,
+                        issue,
+                        temperature=self.config.temperature,
+                        max_tokens=self.config.max_tokens,
+                        on_chunk=update,
+                    )
+                iterations += 1
+                self.session.log(
+                    "super_review_confirm",
+                    file=issue.file,
+                    description=issue.description,
+                    confirmed=confirmed,
+                    endpoint=confirm_client.host,
+                )
+            results.append(
+                {"file": issue.file, "description": issue.description, "confirmed": confirmed}
+            )
+        return results, iterations
 
     def _pick_entry_path(self, tasks: list[FileTask]) -> Path | None:
         """The file `run_script`/`import_check` treats as the program's

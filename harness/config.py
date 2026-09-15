@@ -49,6 +49,18 @@ class Config:
     # off is per-run (--no-critic / the GUI's settings screen), not
     # editing the yaml.
     critic_enabled: bool = True
+    # Whether the whole-project review (steps/super_review.py) runs once
+    # every file is built -- a second model's opinion confirms a finding
+    # before it's reported, same fails-open, advisory-only contract as
+    # critic_enabled. Off by default: unlike the per-file critic, this is
+    # a new, heavier check (up to two extra calls per finding), opt-in
+    # until proven.
+    super_review_enabled: bool = False
+    # Once a file's fix loop reaches this many attempts, an idle endpoint
+    # tagged "smart" or "balanced" may start its own independent attempt
+    # at the same file in parallel (see orchestrator._generate_files) --
+    # whichever finishes first wins. 0 disables this entirely.
+    branch_after_fixes: int = 0
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:
@@ -79,6 +91,8 @@ class Config:
             workspace_root=Path(workspace["root"]),
             endpoints=endpoints,
             critic_enabled=bool((raw.get("critic") or {}).get("enabled", True)),
+            super_review_enabled=bool((raw.get("super_review") or {}).get("enabled", False)),
+            branch_after_fixes=int(retries.get("branch_after_fixes", 0)),
         )
 
     def resolved_endpoints(self) -> list[Endpoint]:
@@ -101,6 +115,8 @@ class Config:
         max_tokens_ceiling: int | None = None,
         max_total_iterations: int | None = None,
         critic_enabled: bool | None = None,
+        super_review_enabled: bool | None = None,
+        branch_after_fixes: int | None = None,
     ) -> Config:
         # `is None` throughout, not `or` -- an explicit 0 (e.g. "no fix
         # attempts, just report the first failure") is a real, meaningful
@@ -122,6 +138,12 @@ class Config:
                 self.max_total_iterations if max_total_iterations is None else max_total_iterations
             ),
             critic_enabled=self.critic_enabled if critic_enabled is None else critic_enabled,
+            super_review_enabled=(
+                self.super_review_enabled if super_review_enabled is None else super_review_enabled
+            ),
+            branch_after_fixes=(
+                self.branch_after_fixes if branch_after_fixes is None else branch_after_fixes
+            ),
         )
 
     def apply_overrides(self, **overrides) -> None:

@@ -215,6 +215,43 @@ def test_critic_runs_by_default_when_the_config_enables_it(tmp_path, monkeypatch
     assert len(client.calls) == 2  # codegen + critic
 
 
+def test_super_review_flag_runs_the_whole_project_review_pass(tmp_path, monkeypatch, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    client = FakeClient(
+        [
+            '{"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]}',
+            "- print hello",
+            "print('hello')\n",
+            '{"issues": [{"file": "main.py", "description": "an issue"}]}',
+        ]
+    )
+    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: client)
+
+    exit_code = cli.main(["run", "--multi-file", "--goal", "print hello", "--super-review"])
+
+    assert exit_code == 0
+    # plan, spec, codegen, super_review find -- single endpoint means no
+    # confirm client, so the finding comes back unconfirmed with no 5th call
+    assert len(client.calls) == 4
+
+
+def test_super_review_is_off_by_default_on_the_cli(tmp_path, monkeypatch, capsys):
+    _patch_config(monkeypatch, tmp_path)
+    client = FakeClient(
+        [
+            '{"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]}',
+            "- print hello",
+            "print('hello')\n",
+        ]
+    )
+    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: client)
+
+    exit_code = cli.main(["run", "--multi-file", "--goal", "print hello"])
+
+    assert exit_code == 0
+    assert len(client.calls) == 3  # no review call without the flag
+
+
 def test_endpoint_with_no_model_defaults_to_the_run_overridden_model(tmp_path, monkeypatch, capsys):
     # --endpoint host (no ",model") should default to what --model just
     # asked for on this run, not silently fall back to the raw yaml

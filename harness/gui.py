@@ -40,10 +40,11 @@ _SETTINGS_KEYS = (
     "max_fix_attempts",
     "max_total_iterations",
     "timeout_seconds",
+    "branch_after_fixes",
 )
 # Boolean settings, handled separately from the numeric ones above (no
 # float()/int() parsing -- the value is already a real JSON boolean).
-_BOOL_SETTINGS_KEYS = ("critic_enabled",)
+_BOOL_SETTINGS_KEYS = ("critic_enabled", "super_review_enabled")
 _ALL_SETTINGS_KEYS = _SETTINGS_KEYS + _BOOL_SETTINGS_KEYS
 _SETTINGS_PATH = DEFAULT_CONFIG_PATH.parent / "gui_settings.json"
 
@@ -711,6 +712,8 @@ class _Handler(BaseHTTPRequestHandler):
             phase = "building"
             if run_summary is not None and run_summary.integration is not None:
                 phase = "integration"
+            if run_summary is not None and run_summary.super_review_started:
+                phase = "reviewing"
         if run_summary is not None and run_summary.finished:
             phase = "done"
 
@@ -979,6 +982,10 @@ _INDEX_HTML = """<!doctype html>
   td { padding:5px 8px; border-top:1px solid var(--line); }
   td.s-ok { color:var(--ok); } td.s-bad { color:var(--bad); } td.s-adv { color:var(--warn); }
   td.s-flag { color:var(--accent); }
+  td.s-review-confirmed { color:var(--critic); } td.s-review-unconfirmed { color:var(--muted); }
+  .review-findings { margin-top:14px; }
+  .review-findings b { font-size:11px; text-transform:uppercase; letter-spacing:.03em;
+                         color:var(--muted); }
   .err { color:var(--bad); font-size:13px; margin-top:10px; }
   pre.reason { margin:12px 0 0; padding:12px 14px; border:1px solid var(--bad);
                border-radius:8px; background:color-mix(in srgb, var(--bad) 8%, transparent);
@@ -1100,6 +1107,7 @@ _INDEX_HTML = """<!doctype html>
     <div class="phase-step" data-phase="planning">Plan</div>
     <div class="phase-step" data-phase="building">Build</div>
     <div class="phase-step" data-phase="integration">Integrate</div>
+    <div class="phase-step" data-phase="reviewing">Review</div>
     <div class="phase-step" data-phase="done">Done</div>
   </div>
   <div id="settings-panel" class="settings-panel" hidden>
@@ -1115,9 +1123,16 @@ _INDEX_HTML = """<!doctype html>
       <div><label for="s-max_total_iterations">Max LLM calls</label><input type="text" id="s-max_total_iterations"></div>
       <div><label for="s-timeout_seconds">Call timeout (s)</label><input type="text" id="s-timeout_seconds"></div>
     </div>
+    <div class="row">
+      <div><label for="s-branch_after_fixes" title="Once a file's fix loop reaches this many attempts, an idle Smart or Balanced endpoint may start its own independent attempt at the same file in parallel -- whichever finishes first wins. 0 disables this.">Branch after N fixes (0 = off)</label><input type="text" id="s-branch_after_fixes"></div>
+    </div>
     <div class="check" style="margin-top:0">
       <input type="checkbox" id="s-critic_enabled">
       <label for="s-critic_enabled" style="margin:0;text-transform:none;letter-spacing:0;font-size:13px">critic check (one extra call per file, judges it against its own spec)</label>
+    </div>
+    <div class="check">
+      <input type="checkbox" id="s-super_review_enabled">
+      <label for="s-super_review_enabled" style="margin:0;text-transform:none;letter-spacing:0;font-size:13px" title="Once every file is built and integration has run, review the whole project together for cross-file problems a per-file critic can never see. A second endpoint confirms each finding before it's reported. Advisory only.">whole-project review (finds cross-file issues once everything's built; a second endpoint confirms each finding)</label>
     </div>
     <div class="settings-actions">
       <button type="button" id="settings-save">Save</button>
@@ -1289,8 +1304,9 @@ async function loadConfig() {
 const SETTINGS_KEYS = [
   "temperature", "max_tokens", "max_tokens_ceiling",
   "max_fix_attempts", "max_total_iterations", "timeout_seconds",
+  "branch_after_fixes",
 ];
-const BOOL_SETTINGS_KEYS = ["critic_enabled"];
+const BOOL_SETTINGS_KEYS = ["critic_enabled", "super_review_enabled"];
 
 async function loadSettings() {
   try {
@@ -1382,7 +1398,7 @@ resumeBtn.addEventListener("click", async () => {
   } catch (e) { /* the SSE stream will still carry run_resumed when it lands */ }
 });
 
-const PHASE_ORDER = ["planning", "building", "integration", "done"];
+const PHASE_ORDER = ["planning", "building", "integration", "reviewing", "done"];
 function updatePhaseStepper(phase, aborted) {
   const idx = PHASE_ORDER.indexOf(phase);
   $("#phase-stepper").querySelectorAll(".phase-step").forEach(el => {
@@ -1768,7 +1784,17 @@ async function showSummary(runId) {
   }
   const why = whyFailed(s);
   const reason = why ? `<pre class="reason">${esc(why)}</pre>` : "";
-  $("#summary").innerHTML = (rows ? `<table>${rows}</table>` : "") + reason;
+  let issuesHtml = "";
+  if (s.cross_file_issues && s.cross_file_issues.length) {
+    const issueRows = s.cross_file_issues.map(i => {
+      const cls = i.confirmed ? "s-review-confirmed" : "s-review-unconfirmed";
+      const tag = i.confirmed ? "confirmed" : "unconfirmed";
+      return `<tr><td class="${cls}">${tag}</td><td>${esc(i.file)}</td><td>${esc(i.description)}</td></tr>`;
+    }).join("");
+    issuesHtml = `<div class="review-findings"><b>Whole-project review</b>`
+      + `<table>${issueRows}</table></div>`;
+  }
+  $("#summary").innerHTML = (rows ? `<table>${rows}</table>` : "") + issuesHtml + reason;
   return s;
 }
 

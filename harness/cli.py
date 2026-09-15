@@ -54,6 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
         "spec; never hard-fails a file that compiles/lints/imports clean, but costs a call)",
     )
     run.add_argument(
+        "--super-review",
+        action="store_true",
+        help="After every file is built and integration has run, review the whole project "
+        "together for cross-file problems a per-file critic can never see (a second "
+        "endpoint confirms each finding before it's reported); advisory only, never fails "
+        "the run. Off by default.",
+    )
+    run.add_argument(
         "--endpoint",
         action="append",
         metavar="HOST,MODEL[,ROLE]",
@@ -206,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             max_tokens_ceiling=args.max_tokens_ceiling,
             critic_enabled=False if args.no_critic else None,
+            super_review_enabled=True if args.super_review else None,
         )
         if args.endpoint:
             try:
