@@ -45,6 +45,35 @@ def test_generate_file_uses_javascript_rules_for_a_js_path():
     assert "no Node-only APIs" in prompt
 
 
+def test_generate_file_uses_batch_rules_for_a_bat_path():
+    client = FakeClient(["@echo off"])
+
+    generate_file(client, "goal", path="setup.bat", temperature=0.2, max_tokens=512)
+
+    prompt = client.calls[0]
+    assert "You are a Batch code generator" in prompt
+    assert "@echo off" in prompt
+    assert 'if __name__ == "__main__"' not in prompt
+
+
+def test_generate_file_uses_batch_rules_for_a_cmd_path():
+    client = FakeClient(["@echo off"])
+
+    generate_file(client, "goal", path="setup.cmd", temperature=0.2, max_tokens=512)
+
+    assert "You are a Batch code generator" in client.calls[0]
+
+
+def test_generate_file_uses_powershell_rules_for_a_ps1_path():
+    client = FakeClient(["Write-Host 'hi'"])
+
+    generate_file(client, "goal", path="deploy.ps1", temperature=0.2, max_tokens=512)
+
+    prompt = client.calls[0]
+    assert "You are a PowerShell code generator" in prompt
+    assert "Verb-Noun" in prompt
+
+
 def test_generate_file_falls_back_to_python_for_an_unrecognized_extension():
     client = FakeClient(["x = 1\n"])
 

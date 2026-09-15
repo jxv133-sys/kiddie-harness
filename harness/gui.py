@@ -612,11 +612,12 @@ class _Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 continue
 
-    _GENERATED_FILE_GLOBS = ("*.py", "*.html", "*.css", "*.js")
+    _GENERATED_FILE_GLOBS = ("*.py", "*.html", "*.css", "*.js", "*.bat", "*.cmd", "*.ps1")
 
     def _files_response(self, run_id: str) -> dict:
-        """Every file this run is building, `.py`/`.html`/`.css`/`.js`
-        (everything the planner may produce, see steps/plan.py) -- not
+        """Every file this run is building, `.py`/`.html`/`.css`/`.js`/
+        `.bat`/`.cmd`/`.ps1` (everything the planner may produce, see
+        steps/plan.py) -- not
         just the ones that exist on disk yet. When the run went through
         the planner (`has_plan`), the plan's own file list is the source
         of truth, in plan order: a file the planner listed but no worker

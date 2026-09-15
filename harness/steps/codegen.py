@@ -4,9 +4,10 @@ Each function here does exactly one thing and returns exactly one output
 contract (a raw file body). Neither function loops, retries, or decides
 what happens next -- that's the orchestrator's job.
 
-Language-aware: the planner can hand back .py, .html, .css, or .js files
-(see steps/plan.py), and each needs its own rules -- a Python file's
-main-guard/no-module-state conventions mean nothing for a stylesheet.
+Language-aware: the planner can hand back .py, .html, .css, .js, .bat/
+.cmd, or .ps1 files (see steps/plan.py), and each needs its own rules --
+a Python file's main-guard/no-module-state conventions mean nothing for
+a stylesheet.
 `_LANGUAGE_RULES` is the only place that varies; the prompt structure and
 the call itself are identical regardless of language.
 """
@@ -29,6 +30,9 @@ _LANGUAGE_BY_SUFFIX = {
     ".html": "HTML",
     ".css": "CSS",
     ".js": "JavaScript",
+    ".bat": "Batch",
+    ".cmd": "Batch",
+    ".ps1": "PowerShell",
 }
 
 _LANGUAGE_RULES = {
@@ -69,6 +73,24 @@ _LANGUAGE_RULES = {
         "  says otherwise.\n"
         "- Reference only DOM elements, ids, and classes the task's spec says\n"
         "  exist in the HTML."
+    ),
+    "Batch": (
+        "- Output a Windows Command Prompt batch script (`.bat`/`.cmd`), not a\n"
+        "  Unix shell script -- `set VAR=value` not `VAR=value`, `%VAR%` not\n"
+        "  `$VAR`, `if exist` not `if [ -e ]`, `rem` or `::` for comments.\n"
+        "- Start with `@echo off` so commands aren't echoed to the console.\n"
+        "- Use only commands built into `cmd.exe` (echo, set, if, for, goto,\n"
+        "  call, exit) unless the task specifically names an external tool."
+    ),
+    "PowerShell": (
+        "- Output a PowerShell script (`.ps1`) -- use PowerShell cmdlets\n"
+        "  (`Write-Host`, `Get-ChildItem`, ...) and `$variable` syntax, not Unix\n"
+        "  shell or batch syntax.\n"
+        "- Use only cmdlets built into Windows PowerShell/PowerShell 7's\n"
+        "  standard modules unless the task specifically names an external\n"
+        "  module -- do not assume a package is installed.\n"
+        "- Put the script's work in named functions where practical, matching\n"
+        "  the PascalCase Verb-Noun convention (`Get-Todos`, not `getTodos`)."
     ),
 }
 

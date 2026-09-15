@@ -67,7 +67,7 @@ class FileTask:
     depends_on: tuple[str, ...] = ()
 
 
-_CODE_NAME_RE = re.compile(r"([A-Za-z_][\w-]*\.(?:py|html|css|js))")
+_CODE_NAME_RE = re.compile(r"([A-Za-z_][\w-]*\.(?:py|html|css|js|bat|cmd|ps1))")
 
 
 def _parse_free_form(text: str) -> dict:
@@ -125,7 +125,7 @@ def _first_brace_object(text: str) -> str | None:
     return match.group(0) if match else None
 
 
-_ALLOWED_EXTENSIONS = (".py", ".html", ".css", ".js")
+_ALLOWED_EXTENSIONS = (".py", ".html", ".css", ".js", ".bat", ".cmd", ".ps1")
 
 
 def _tasks_from_plan(data: dict) -> list[FileTask]:
@@ -134,7 +134,7 @@ def _tasks_from_plan(data: dict) -> list[FileTask]:
     Normalisation handles what a weak planner hands back:
      - drop entries outside the allowed extensions (a README, a
        requirements.txt, an image) -- this harness only generates and
-       verifies Python/HTML/CSS/JS;
+       verifies Python/HTML/CSS/JS and Windows Batch/PowerShell scripts;
      - flatten any subdirectory path to a bare filename -- every file
        lives in one flat run directory, and a `pkg/core.py` would break
        its import-check (wrong cwd) and any sibling that imports it;

@@ -158,6 +158,23 @@ def test_plan_files_accepts_html_css_and_js_alongside_python():
     assert [t.path for t in tasks] == ["index.html", "style.css", "app.js", "server.py"]
 
 
+def test_plan_files_accepts_batch_and_powershell_scripts():
+    payload = json.dumps(
+        {
+            "files": [
+                {"path": "setup.bat", "purpose": "installs the tool"},
+                {"path": "deploy.ps1", "purpose": "deploys the build"},
+                {"path": "notes.txt", "purpose": "irrelevant"},
+            ]
+        }
+    )
+    client = FakeClient([payload])
+
+    tasks = plan_files(client, "a windows install script", temperature=0.2, max_tokens=512)
+
+    assert [t.path for t in tasks] == ["setup.bat", "deploy.ps1"]
+
+
 def test_plan_files_recovers_html_and_js_filenames_from_a_markdown_list():
     client = FakeClient(
         [

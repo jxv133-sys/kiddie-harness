@@ -3,10 +3,12 @@
 This is the "gold standard" feedback signal for the fix loop: a real
 compiler/interpreter result, never another LLM's opinion. Nothing here
 calls the LLM. Most of this file is Python-specific (py_compile, ruff,
-pytest, real import resolution); `html_check`/`css_check`/`js_check` are
-the equivalent for the other languages the planner can produce, using
-hand-rolled structural checks since no such tooling exists in the
-stdlib -- still real and deterministic, just less capable.
+pytest, real import resolution); `html_check`/`css_check`/`js_check`/
+`batch_check`/`powershell_check` are the equivalent for the other
+languages the planner can produce, using hand-rolled structural checks
+since no such tooling exists in the stdlib (and, for the two Windows
+script types, no real interpreter is even available on this machine to
+run them against) -- still real and deterministic, just less capable.
 """
 
 from __future__ import annotations
@@ -314,15 +316,27 @@ def html_check(path: Path) -> VerifyResult:
 
 
 def _check_balance(
-    text: str, *, line_comment: str | None, block_comment: tuple[str, str] | None
+    text: str,
+    *,
+    line_comment: str | None,
+    block_comment: tuple[str, str] | None,
+    quote_chars: tuple[str, ...] = ("'", '"', "`"),
+    escape_char: str | None = "\\",
 ) -> list[str]:
-    """Minimal, best-effort structural check shared by `css_check` and
-    `js_check`: are brackets/braces/parens balanced, and are string
-    literals terminated? Skips comments and escaped quote characters.
-    Not a real parser -- a JS template literal's `${...}` interpolation
-    isn't tracked inside the string, for one -- but it catches the most
-    common, consequential mistake a small model makes: an unterminated
-    string or an unclosed block.
+    """Minimal, best-effort structural check shared by `css_check`,
+    `js_check`, `batch_check`, and `powershell_check`: are brackets/
+    braces/parens balanced, and are string literals terminated? Skips
+    comments and escaped quote characters. Not a real parser -- a JS
+    template literal's `${...}` interpolation isn't tracked inside the
+    string, for one -- but it catches the most common, consequential
+    mistake a small model makes: an unterminated string or an unclosed
+    block.
+
+    `quote_chars`/`escape_char` default to JS/CSS's rules (`'`/`"`/`` ` ``
+    as quotes, `\\` escapes the next character) but are overridable:
+    batch and PowerShell both use `\\` as a literal path separator, not
+    an escape character, so treating it as one would misread an ordinary
+    Windows path like `"C:\\"` as an escaped, still-open quote.
     """
     pairs = {")": "(", "]": "[", "}": "{"}
     openers = set(pairs.values())
@@ -335,7 +349,7 @@ def _check_balance(
         if ch == "\n":
             line += 1
         if quote:
-            if ch == "\\":
+            if escape_char is not None and ch == escape_char:
                 i += 2
                 continue
             if ch == quote:
@@ -353,7 +367,7 @@ def _check_balance(
             nl = text.find("\n", i)
             i = nl if nl != -1 else n
             continue
-        if ch in ("'", '"', "`"):
+        if ch in quote_chars:
             quote = ch
             i += 1
             continue
@@ -408,18 +422,70 @@ def js_check(path: Path) -> VerifyResult:
     return VerifyResult(success=not errors, stage="compile", output="\n".join(errors))
 
 
-_WEB_FILE_CHECKS = {".html": html_check, ".htm": html_check, ".css": css_check, ".js": js_check}
+def batch_check(path: Path) -> VerifyResult:
+    """Structural check only -- see `_check_balance`. No Windows Batch
+    parser exists on a non-Windows machine (there's no `cmd.exe` to run
+    it against at all here), so this is a best-effort stand-in: balanced
+    parens (batch's `if`/`for` blocks use them) and terminated `"..."`
+    strings -- single quotes aren't string delimiters in batch, and `\\`
+    is a literal path separator, not an escape character, so both are
+    excluded rather than reusing JS/CSS's defaults. Comment detection is
+    limited to the `::` idiom (a fake label used as a no-op) -- `rem` is
+    deliberately not treated as a comment marker here, since it's a
+    plain word and could false-positive inside an unrelated identifier
+    (the same risk `_check_balance` doesn't otherwise have to worry
+    about, since every other comment token it knows is punctuation)."""
+    text = path.read_text()
+    errors = _check_balance(
+        text, line_comment="::", block_comment=None, quote_chars=('"',), escape_char=None
+    )
+    if not errors and not _looks_like_code(text.lower(), ("@echo", "%", "goto", "setlocal")):
+        errors.append("no batch commands found -- doesn't look like a batch script")
+    return VerifyResult(success=not errors, stage="compile", output="\n".join(errors))
+
+
+def powershell_check(path: Path) -> VerifyResult:
+    """Structural check only -- see `_check_balance`. No PowerShell parser
+    exists on this machine either (installing PowerShell Core just to
+    validate scripts would be a real new dependency for one check); this
+    is a best-effort stand-in instead: balanced braces/parens/brackets
+    and terminated `'...'`/`"..."` strings, with PowerShell's own escape
+    character (backtick, not `\\` -- `\\` is a literal Windows path
+    separator here too) so `` `" `` inside a double-quoted string doesn't
+    misread as closing it."""
+    text = path.read_text()
+    errors = _check_balance(
+        text,
+        line_comment="#",
+        block_comment=("<#", "#>"),
+        quote_chars=("'", '"'),
+        escape_char="`",
+    )
+    if not errors and not _looks_like_code(text, ("$", "{", "}")):
+        errors.append("no PowerShell statements found -- doesn't look like a PowerShell script")
+    return VerifyResult(success=not errors, stage="compile", output="\n".join(errors))
+
+
+_STRUCTURAL_CHECKS = {
+    ".html": html_check,
+    ".htm": html_check,
+    ".css": css_check,
+    ".js": js_check,
+    ".bat": batch_check,
+    ".cmd": batch_check,
+    ".ps1": powershell_check,
+}
 
 
 def verify_generated_file(path: Path) -> VerifyResult:
     """Routes to the right check for this file's extension: Python's full
     compile/lint/guard/import pipeline, or a lighter structural check for
-    HTML/CSS/JS -- no Python-style tooling applies to those; the checks
-    above are hand-rolled and deterministic, just less capable than
-    py_compile/ruff. Anything else falls back to the Python pipeline
-    (the planner is only ever allowed to hand back these four
+    HTML/CSS/JS/Batch/PowerShell -- no Python-style tooling applies to
+    those; the checks above are hand-rolled and deterministic, just less
+    capable than py_compile/ruff. Anything else falls back to the Python
+    pipeline (the planner is only ever allowed to hand back these seven
     extensions, so this is only reached for a `.py` file in practice)."""
-    checker = _WEB_FILE_CHECKS.get(path.suffix.lower())
+    checker = _STRUCTURAL_CHECKS.get(path.suffix.lower())
     if checker is not None:
         return checker(path)
     return verify_python_file_static(path)

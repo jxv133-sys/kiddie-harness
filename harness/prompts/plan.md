@@ -3,9 +3,13 @@ list of files needed to build the project, in the order they should be
 created.
 
 Rules:
-- List only Python (.py), HTML (.html), CSS (.css), and JavaScript (.js)
-  files -- nothing else, and only the ones the goal actually needs. A
-  goal about a script or a command-line tool needs only .py files.
+- List only Python (.py), HTML (.html), CSS (.css), JavaScript (.js),
+  Windows Batch (.bat/.cmd), and PowerShell (.ps1) files -- nothing else,
+  and only the ones the goal actually needs. A goal about a script or a
+  command-line tool needs only .py files, unless it specifically asks for
+  a Windows batch file or PowerShell script -- do not add one just
+  because the goal happens to run on Windows or mentions "Windows" in
+  passing.
 - If the goal describes a web page or site, include a small Python entry
   point (a stdlib `http.server`-based server, no third-party frameworks)
   that serves the HTML/CSS/JS files -- this project only ever runs and

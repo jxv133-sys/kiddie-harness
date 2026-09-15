@@ -160,6 +160,25 @@ orchestrator and prompts are otherwise unchanged in spirit:
   button" goal planned `index.html` + `style.css` + `script.js` +  a
   Python entry point, all four passed their verify + critic checks, and
   the integration check ran clean.
+- **Windows Batch/PowerShell support.** The planner can also emit `.bat`/
+  `.cmd` and `.ps1` files, for a goal that specifically asks for a
+  Windows script -- it's told not to add one just because a goal happens
+  to run on Windows or mentions it in passing. Same pattern as the web
+  languages: `codegen.py` gets its own rule block per language (batch's
+  `%VAR%`/`set`/`if exist` conventions vs. PowerShell's `$variable`/
+  cmdlet conventions, neither of which is Unix shell syntax); `verify.py`
+  gets `batch_check`/`powershell_check`, hand-rolled structural checks
+  reusing the same bracket/quote-balance engine `css_check`/`js_check`
+  already use. No real interpreter for either is available on this
+  machine to actually run them against (there's no `cmd.exe`/PowerShell
+  runtime here at all, unlike HTML/CSS/JS where a stdlib parser at least
+  exists for one of the four), so this is real, deterministic, but
+  weaker than even the web checks -- balance and a presence check only,
+  nothing close to real execution. Both checks account for the one
+  language-specific trap a Unix-first balance checker would get wrong on
+  Windows content: `\` is a literal path separator in both batch and
+  PowerShell, not an escape character, so a plain `"C:\"` doesn't get
+  misread as an escaped, still-open string.
 
 ## Setup
 

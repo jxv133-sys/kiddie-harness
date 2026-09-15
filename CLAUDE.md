@@ -267,6 +267,71 @@ core design, not just style.
 
 ## Status
 
+**Windows Batch (.bat/.cmd) and PowerShell (.ps1) join the supported file
+types, added on request** ("expand the amount of supported file types to
+include window exacutables and scripts"). Clarified first, since "Windows
+executables" is ambiguous and forks into very different scopes: an actual
+compiled `.exe` would need a real cross-compiler toolchain (a C toolchain
+targeting Windows, or .NET/dotnet) plus something like Wine to even run
+the result on this Mac -- a different project, not an addition to
+`verify.py`. Scoped down to script types the model writes directly, same
+model as `.py`/`.html`/`.css`/`.js` today, per explicit confirmation.
+Same follow-up choice as the original HTML/CSS/JS work: verify with a
+real interpreter (PowerShell Core, `pwsh`, is actually cross-platform and
+installable via Homebrew) or a hand-rolled, dependency-free structural
+check matching the existing `html_check`/`css_check`/`js_check` pattern.
+Chose the latter, explicitly, to keep this project's consistent
+"no new dependency" property intact -- `pwsh` would only have covered
+`.ps1` anyway, and no equivalent real parser exists for batch on macOS
+either way, so half the new surface would stay unverified by real
+tooling regardless.
+
+`plan.py`'s `_ALLOWED_EXTENSIONS`/`_CODE_NAME_RE` and `plan.md` now admit
+`.bat`/`.cmd`/`.ps1`, with an explicit instruction not to add one just
+because a goal happens to run on Windows or mentions it in passing --
+only when the goal specifically asks for a Windows script.
+`codegen.py`'s `_LANGUAGE_RULES` gained "Batch" and "PowerShell" blocks
+(batch's `%VAR%`/`set`/`if exist` conventions, PowerShell's `$variable`/
+cmdlet/Verb-Noun conventions -- neither is Unix shell syntax, the trap a
+model would otherwise default to). `verify.py` gained `batch_check`/
+`powershell_check`, both built on the same `_check_balance` engine
+`css_check`/`js_check` already share -- extended with two new optional
+parameters (`quote_chars`, `escape_char`, both defaulting to the
+existing JS/CSS behaviour so those two callers needed no changes) rather
+than a parallel implementation. The reason those parameters exist at
+all, not just a generalization for its own sake: `_check_balance`
+hardcoded `\` as an escape character and backtick as a third quote
+character, both specifically to support JS template literals -- correct
+for JS, actively wrong for batch and PowerShell, where `\` is a literal
+Windows path separator (an ordinary `"C:\"` would otherwise misread as
+an escaped, still-open string) and, for PowerShell, backtick is the
+*real* escape character, not a quote delimiter. `batch_check` disables
+escape processing entirely (batch has no real string-escape convention)
+and only recognizes `"..."` as a string (single quotes aren't string
+delimiters in batch); `powershell_check` recognizes both `'...'`/`"..."`
+and uses backtick as the escape character, matching PowerShell's actual
+rules instead of JS's. Batch comment detection is deliberately limited
+to the `::` fake-label idiom -- `rem` was left out on purpose, since
+unlike every other comment token this module already knows (all
+punctuation), `rem` is a plain word and risks a false match inside an
+unrelated identifier that happens to contain those three letters.
+`_STRUCTURAL_CHECKS` (renamed from `_WEB_FILE_CHECKS`, now that it
+covers non-web languages too) routes both new extensions through
+`verify_generated_file`. `gui.py`'s `_GENERATED_FILE_GLOBS` picks up
+`.bat`/`.cmd`/`.ps1` so the Files panel lists them like any other
+generated file. Tests: `tests/test_windows_script_verify.py` (new,
+mirroring `test_web_verify.py`'s structure -- balance, unterminated
+strings, comment handling, the presence check, and specifically the
+backslash-is-not-an-escape-character and backtick-escaping cases that
+motivated the parameter changes), plus extension-acceptance and
+language-rule tests added to the existing `test_plan.py`/
+`test_codegen.py`. **Not yet verified live** against a real model,
+unlike the original HTML/CSS/JS work -- these checks are pure,
+deterministic string-processing with no model-dependent behavior to
+exercise, so the unit suite is the right verification tool here, but an
+actual "write me a Windows batch script" goal against a live endpoint
+hasn't been run.
+
 **The GUI can be opened to the local network, added on request** ("make
 it so anyone on the local network can access the GUI"). `gui.build_server`/
 `gui.serve` already accepted a `host` parameter -- unused, since `cli.py`
