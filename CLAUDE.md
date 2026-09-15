@@ -267,6 +267,39 @@ core design, not just style.
 
 ## Status
 
+**A vacuous-prose spec now gets retried instead of silently flowing
+into codegen, implemented from a research pass on small-LLM harness
+design** ("implement the spec validation fix"). `write_spec` had zero
+validation of its own -- a model responding with disclaimer/commentary
+prose instead of real bullet points (the exact `login_page.html`
+failure mode this session's earlier `verify.py` fix addressed, but one
+step *upstream*) used to flow straight into the codegen instruction
+unflagged, since nothing downstream would ever attribute a bad
+resulting file back to its actual cause. Per the MAST multi-agent
+failure taxonomy, specification ambiguity is the single largest
+failure category (41.8%) -- yet this was the one step with no
+deterministic check at all. Fixed with `spec.looks_like_a_spec(text)`:
+true if at least one line starts with `-`, matching the prompt's own
+explicit contract ("each starting with '-'"), so it's checking
+compliance with an instruction already given, not guessing at
+"spec-like" content. `_build_one_file` now retries a rejected spec up
+to `_SPEC_RETRY_ATTEMPTS = 3` times, escalating temperature each time
+(same `_retry_temperature` fix attempts already use) -- small and
+bounded on purpose, since spec generation is cheap and a genuinely
+stuck model won't recover with more tries; codegen and verify remain
+the real backstop regardless, so a persistently bad spec still
+proceeds once retries are exhausted rather than failing the file
+outright. Each rejected attempt logs `spec_rejected` (visible live in
+the GUI progress feed, same transparency `fix_noop` already gets) and
+only the accepted (or final, if none passed) attempt is logged as
+`spec`. Existing tests were unaffected -- every already-queued
+FakeClient spec response in the suite already started with `-`, since
+that's what the prompt has always asked for. Tests:
+`test_looks_like_a_spec_accepts_real_bullet_points`,
+`test_looks_like_a_spec_rejects_disclaimer_prose`,
+`test_a_disclaimer_prose_spec_response_is_rejected_and_retried`,
+`test_a_persistently_bad_spec_still_proceeds_once_retries_are_exhausted`.
+
 **Per-file fix count shown live on the graph, added on request** ("show
 # of fixes on each file"). The final run-summary table already showed
 this ("N fixes" per file), sourced from `summary.load_run_summary`'s
