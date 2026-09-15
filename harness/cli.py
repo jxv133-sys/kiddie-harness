@@ -101,6 +101,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     gui_cmd = subparsers.add_parser("gui", help="Open a minimal local web GUI")
     gui_cmd.add_argument("--port", type=int, default=8765, help="Port to bind (default 8765)")
+    gui_cmd.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Interface to bind (default 127.0.0.1, localhost-only). Use 0.0.0.0 to accept "
+        "connections from other devices on the local network -- there is no authentication, "
+        "so anyone who can reach the port can start/stop runs and read generated code.",
+    )
     gui_cmd.add_argument("--no-browser", action="store_true", help="Do not open a browser")
 
     return parser
@@ -213,7 +220,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "gui":
         from . import gui
 
-        gui.serve(Config.load(), port=args.port, open_browser=not args.no_browser)
+        gui.serve(
+            Config.load(), host=args.host, port=args.port, open_browser=not args.no_browser
+        )
         return 0
 
     if args.command == "run":

@@ -325,15 +325,22 @@ summary table.
 ## GUI
 
 ```bash
-harness gui          # opens a browser at http://127.0.0.1:8765
+harness gui                    # opens a browser at http://127.0.0.1:8765, localhost-only
+harness gui --host 0.0.0.0     # also reachable from other devices on your network
 ```
+
+Binds to `127.0.0.1` by default. There's no authentication either way,
+so `--host 0.0.0.0` (or a specific LAN-facing address) means anyone who
+can reach the port can start/stop runs, change settings, and read
+generated code — fine on a trusted home network, not something to put
+on the open internet.
 
 A single minimalist page: pick a model (the list is pulled live from the
 Ollama host; **↻ re-fetch models** after you pull one), point at a host,
 type a goal, hit **Generate**. **+ add endpoint** adds another parallel
 backend — click it as many times as you have machines; there's no cap.
-A **phase stepper** (Plan → Build → Integrate → Done) under the title
-shows where the run is at a glance. The progress log streams in as it
+A **phase stepper** (Plan → Build → Integrate → Review → Done) under the
+title shows where the run is at a glance. The progress log streams in as it
 happens (`[plan]`, `[codegen]`, `[verify:*]`, `[fix]`, ...), a small
 strip tracks files / fix attempts / LLM calls / elapsed time, and the
 final verdict and per-file table drop in when the run finishes (with

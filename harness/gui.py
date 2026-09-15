@@ -7,7 +7,11 @@ uses -- `RunManager` drives `SingleFileLoop` / `MultiFileLoop`,
 `progress.format_event` formats the live lines, `summary.load_run_summary`
 builds the final table.
 
-One run at a time. No auth (it binds to 127.0.0.1). No new dependencies.
+One run at a time. Binds to 127.0.0.1 by default; `--host 0.0.0.0` opens
+it to the local network instead (see `harness gui --help`). No
+authentication either way -- on a shared network, that means anyone who
+can reach the port can start/stop runs, change settings, and read
+generated code. No new dependencies.
 """
 
 from __future__ import annotations
@@ -876,10 +880,27 @@ def build_server(config: Config, *, host: str = "127.0.0.1", port: int = 8765) -
 
 def serve(config: Config, *, host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:
     server = build_server(config, host=host, port=port)
-    url = f"http://{host}:{server.server_address[1]}"
-    print(f"kiddie-harness GUI on {url}  (Ctrl-C to stop)", flush=True)
+    bound_port = server.server_address[1]
+    local_url = f"http://127.0.0.1:{bound_port}"
+    if host in ("0.0.0.0", "::"):
+        # There's no way to reliably learn this machine's real LAN-facing
+        # IP from here (multiple interfaces, VPNs) without risking
+        # printing a wrong one -- pointing at "your LAN IP" is honest
+        # about what we don't know, rather than guessing.
+        print(
+            f"kiddie-harness GUI on {local_url} -- also reachable from other devices on "
+            f"your network at http://<this machine's LAN IP>:{bound_port}  (Ctrl-C to stop)",
+            flush=True,
+        )
+        print(
+            "WARNING: no authentication -- anyone who can reach this port can start and "
+            "stop runs, change settings, and read generated code.",
+            flush=True,
+        )
+    else:
+        print(f"kiddie-harness GUI on {local_url}  (Ctrl-C to stop)", flush=True)
     if open_browser:
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.5, lambda: webbrowser.open(local_url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -267,6 +267,23 @@ core design, not just style.
 
 ## Status
 
+**The GUI can be opened to the local network, added on request** ("make
+it so anyone on the local network can access the GUI"). `gui.build_server`/
+`gui.serve` already accepted a `host` parameter -- unused, since `cli.py`
+never exposed it -- so this was CLI + messaging, not new server logic.
+New `harness gui --host` flag (default `127.0.0.1`, unchanged); `0.0.0.0`
+binds every interface. Deliberately does **not** try to detect and print
+the machine's actual LAN IP -- a host can have several interfaces (Wi-Fi,
+Ethernet, VPN) and guessing wrong is worse than not guessing, so `serve()`
+just says "your network at http://<this machine's LAN IP>:{port}" and
+leaves finding that address to the user. Since the GUI has no
+authentication at all (unchanged, pre-existing), binding to `0.0.0.0`
+prints an explicit `WARNING: no authentication -- anyone who can reach
+this port can start and stop runs, change settings, and read generated
+code.` on startup, in addition to the `--host`/README docs saying the
+same. Tests: `test_gui_host_flag_defaults_to_localhost_and_threads_through`,
+`test_gui_host_flag_overrides_to_a_given_value`.
+
 **A stuck file can branch to an idle endpoint, implemented from the
 same planned proposal as whole-project review** ("finish both A and
 B" -- see the entry below). Observed live: a file can burn many fix

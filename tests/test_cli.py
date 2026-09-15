@@ -309,3 +309,30 @@ def test_main_multi_file_prints_plan_and_spec_progress(tmp_path, monkeypatch, ca
     out = capsys.readouterr().out
     assert "[plan] 1 file(s) planned" in out
     assert "[spec] main.py" in out
+
+
+def test_gui_host_flag_defaults_to_localhost_and_threads_through(monkeypatch):
+    from harness import gui
+
+    calls = []
+    monkeypatch.setattr(
+        gui, "serve", lambda config, **kwargs: calls.append(kwargs)
+    )
+
+    cli.main(["gui", "--no-browser"])
+
+    assert calls[-1]["host"] == "127.0.0.1"
+
+
+def test_gui_host_flag_overrides_to_a_given_value(monkeypatch):
+    from harness import gui
+
+    calls = []
+    monkeypatch.setattr(
+        gui, "serve", lambda config, **kwargs: calls.append(kwargs)
+    )
+
+    cli.main(["gui", "--host", "0.0.0.0", "--port", "9999", "--no-browser"])
+
+    assert calls[-1]["host"] == "0.0.0.0"
+    assert calls[-1]["port"] == 9999
