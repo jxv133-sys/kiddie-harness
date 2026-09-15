@@ -807,6 +807,7 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
                 "speccing": False,
                 "criticizing": False,
                 "fixing": False,
+                "branching": False,
                 "fixes": 0,
                 "endpoint": "http://second:11434",
             }

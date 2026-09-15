@@ -62,6 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
         "the run. Off by default.",
     )
     run.add_argument(
+        "--branch-after-fixes",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Once a file's fix loop reaches N attempts, an idle endpoint tagged smart or "
+        "balanced (never quick) may start its own independent attempt at the same file in "
+        "parallel; whichever finishes first wins. 0 (the default) disables this.",
+    )
+    run.add_argument(
         "--endpoint",
         action="append",
         metavar="HOST,MODEL[,ROLE]",
@@ -122,10 +131,16 @@ def _run_multi_file(
     args,
     pool_clients: list[OllamaClient] | None = None,
     critic_client: OllamaClient | None = None,
+    branch_pool: list[OllamaClient] | None = None,
 ) -> int:
     try:
         loop = MultiFileLoop(
-            client, config, session, pool_clients=pool_clients, critic_client=critic_client
+            client,
+            config,
+            session,
+            pool_clients=pool_clients,
+            critic_client=critic_client,
+            branch_pool=branch_pool,
         )
         result = loop.run(args.goal)
     except (OllamaError, PlanError) as exc:
@@ -215,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             max_tokens_ceiling=args.max_tokens_ceiling,
             critic_enabled=False if args.no_critic else None,
             super_review_enabled=True if args.super_review else None,
+            branch_after_fixes=args.branch_after_fixes,
         )
         if args.endpoint:
             try:
@@ -226,7 +242,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
         endpoints = config.resolved_endpoints()
         all_clients = [OllamaClient(e.host, e.model, e.timeout_seconds) for e in endpoints]
-        client, pool_clients, critic_client = partition_clients_by_role(endpoints, all_clients)
+        client, pool_clients, critic_client, branch_pool = partition_clients_by_role(
+            endpoints, all_clients
+        )
         reporter = None if args.quiet else progress.console_reporter()
         session = Session.create(config.workspace_root, on_event=reporter)
 
@@ -239,7 +257,13 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.multi_file:
             return _run_multi_file(
-                client, config, session, args, pool_clients=pool_clients, critic_client=critic_client
+                client,
+                config,
+                session,
+                args,
+                pool_clients=pool_clients,
+                critic_client=critic_client,
+                branch_pool=branch_pool,
             )
         return _run_single_file(all_clients[0], config, session, args)
 

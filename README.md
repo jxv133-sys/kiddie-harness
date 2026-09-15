@@ -225,6 +225,24 @@ does not block the run, block a dependent file's build, or fail the exit
 code. On by default (`config/default.yaml`'s `critic.enabled`); turn it
 off per run with `--no-critic`, or from the GUI's settings screen.
 
+## Whole-project review
+
+The critic above only ever sees one file against its own spec — it can't
+catch a problem that only shows up when the files are considered
+together (a server that doesn't actually serve the page it was given, a
+name used two different ways across files). Once every file is built
+and integration has run, this hands the whole project to the primary
+endpoint and asks it to find that kind of problem; each finding is then
+checked against a second, different endpoint before being reported as
+confirmed. An unconfirmed finding is still shown, just marked as such —
+two small models disagreeing isn't proof an issue is fake, only a lower
+confidence signal. Advisory only, same as the critic: never fails the
+run. Off by default (heavier than the per-file critic — up to two extra
+calls per finding); turn it on with `--super-review`, `super_review:
+enabled: true` in `config/default.yaml`, or the GUI's settings screen.
+Needs a second endpoint to actually confirm anything — with only one,
+every finding comes back unconfirmed.
+
 ## Parallel endpoints
 
 A multi-file run can be split across two (or more) Ollama backends. Each
@@ -285,6 +303,24 @@ The GUI has the same three options as a small dropdown next to each
 endpoint's model/host. `role` is also a field in `config/default.yaml`'s
 `endpoints:` list, and a third comma-separated field on `--endpoint`
 (`HOST,MODEL,ROLE` — omit it for `balanced`).
+
+## Branching a stuck file
+
+With more than one endpoint, one file can end up grinding through many
+fix attempts while the others sit idle once they've run out of work
+that isn't blocked on it. Once a file's fix loop crosses a configurable
+number of attempts, an idle endpoint tagged `smart` or `balanced`
+(never `quick`) may start its own independent attempt at that same
+file — a fresh spec and generation, possibly on a different model, not
+a resume of the original's specific state — racing the original.
+Whichever attempt finishes successfully first wins and is kept; the
+other is discarded, its scratch file (`.branch-<name>`) cleaned up. If
+the original fails outright while a branch is still going, the file
+isn't recorded as failed until the branch has had its own chance too.
+Off by default (`0`); set a threshold with `--branch-after-fixes N`,
+`retries: branch_after_fixes: N` in `config/default.yaml`, or the GUI's
+settings screen. A file the branch won shows `(branched)` in the final
+summary table.
 
 ## GUI
 

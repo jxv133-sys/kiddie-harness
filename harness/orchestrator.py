@@ -34,6 +34,15 @@ class RunCancelled(Exception):
     """
 
 
+class _BranchSuperseded(Exception):
+    """Raised when a `branch_cancel` event fires between fix attempts --
+    a concurrent attempt at the same file (the original, or a branch)
+    already won the race. Same cooperative, between-calls-only
+    checkpoint as `RunCancelled`, but scoped to one file's race, not the
+    whole run -- caught entirely inside `_generate_files`, never
+    propagates past it."""
+
+
 def _wait_if_paused(
     pause_event: threading.Event | None, cancel_event: threading.Event | None
 ) -> None:
@@ -143,6 +152,11 @@ class FileRunResult:
     # an opinion that might be wrong must not be able to sink code that
     # every deterministic check already passed.
     spec_flagged: bool = False
+    # True when this file's winning result came from a branch (a second,
+    # independent attempt an idle endpoint started after this file's
+    # original attempt got stuck -- see _generate_files), not the file's
+    # original attempt.
+    branched: bool = False
 
 
 @dataclasses.dataclass
@@ -210,11 +224,19 @@ def _retry_temperature(base: float, fix_attempt: int) -> float:
 
 def partition_clients_by_role(
     endpoints: list[Endpoint], clients: list[OllamaClient]
-) -> tuple[OllamaClient, list[OllamaClient], OllamaClient | None]:
+) -> tuple[OllamaClient, list[OllamaClient], OllamaClient | None, list[OllamaClient]]:
     """Splits a resolved endpoint pool into (the client for plan/critic/
     integration-fix -- the "judgement" calls), (the pool for per-file
-    spec/codegen/fix dispatch -- the high-volume grind), and (an explicit
-    override for critic, or None).
+    spec/codegen/fix dispatch -- the high-volume grind), (an explicit
+    override for critic, or None), and (the subset of clients eligible to
+    branch a stuck file -- "smart" or "balanced", never "quick").
+
+    `MultiFileLoop` itself never learns what a role *means* -- it only
+    ever sees this pre-filtered `branch_pool` list, the same way it only
+    ever sees `primary`/`pool_clients`/`critic_override` and not the
+    roles that produced them (see that class's own docstring). Resolving
+    "quick" endpoints out of branch eligibility here, once, keeps that
+    invariant intact instead of teaching the dispatch loop about roles.
 
     Every endpoint works the per-file grind regardless of role -- a
     "smart" endpoint being more capable is a reason to *also* give it
@@ -243,7 +265,8 @@ def partition_clients_by_role(
 
     primary = smart[0] if smart else (balanced[0] if balanced else clients[0])
     critic_override = smart[0] if smart else None
-    return primary, list(clients), critic_override
+    branch_pool = [c for e, c in zip(endpoints, clients) if e.role != "quick"]
+    return primary, list(clients), critic_override, branch_pool
 
 
 def _generate_and_fix(
@@ -256,6 +279,8 @@ def _generate_and_fix(
     *,
     cancel_event: threading.Event | None = None,
     pause_event: threading.Event | None = None,
+    branch_cancel: threading.Event | None = None,
+    on_attempt: Callable[[int], None] | None = None,
 ) -> tuple[VerifyResult, int]:
     """Shared bounded-retry loop: generate once, verify, fix on failure.
 
@@ -268,6 +293,15 @@ def _generate_and_fix(
     config.max_tokens_ceiling) whenever a generation was truncated -- a
     file that ran out of tokens needs more room on the next attempt, not
     just a generic "here's the error" retry.
+
+    `branch_cancel`, if given, is checked at the exact same between-
+    attempts checkpoint as `cancel_event` (see `_BranchSuperseded`) --
+    used when this call is one side of a stuck-file race in
+    `_generate_files`, so the losing side stops promptly once the other
+    one wins, instead of grinding out its remaining fix attempts for
+    nothing. `on_attempt`, if given, is called with the new attempt
+    count each time a fix attempt completes, so the dispatch loop can
+    see live progress without waiting for this call to return.
     """
     max_tokens = config.max_tokens
     with session.track_call("codegen", str(file_path), client.host) as update:
@@ -315,6 +349,8 @@ def _generate_and_fix(
         _wait_if_paused(pause_event, cancel_event)
         if cancel_event is not None and cancel_event.is_set():
             raise RunCancelled("cancelled by user")
+        if branch_cancel is not None and branch_cancel.is_set():
+            raise _BranchSuperseded("another attempt at this file already won")
 
         if result.stage == "lint":
             # ruff's --fix may have just rewritten the file in place; make
@@ -349,6 +385,8 @@ def _generate_and_fix(
             truncated=gen.truncated,
             endpoint=client.host,
         )
+        if on_attempt is not None:
+            on_attempt(attempts)
         if gen.truncated:
             max_tokens = min(max_tokens * 2, config.max_tokens_ceiling)
 
@@ -526,6 +564,7 @@ class MultiFileLoop:
         cancel_event: threading.Event | None = None,
         pause_event: threading.Event | None = None,
         critic_client: OllamaClient | None = None,
+        branch_pool: list[OllamaClient] | None = None,
     ):
         self.client = client
         self.config = config
@@ -539,6 +578,12 @@ class MultiFileLoop:
         # funnel every file's critic check through that one model
         # instead, regardless of which "quick" worker wrote the code.
         self._critic_client = critic_client
+        # Clients eligible to branch a stuck file (see partition_clients_
+        # by_role) -- "smart" or "balanced", never "quick". Empty by
+        # default, same as every other role-derived param here: this
+        # class doesn't know what a role means, only which clients were
+        # pre-approved for the job.
+        self._branch_pool = list(branch_pool) if branch_pool else []
 
     def run(self, goal: str) -> MultiFileRunResult:
         self.session.log("goal", goal=goal)
@@ -672,6 +717,19 @@ class MultiFileLoop:
         # worker that already returned is gone for good and never claims it.
         busy = [0]
 
+        # Branching: an idle, branch-eligible endpoint (role "smart" or
+        # "balanced" -- see partition_clients_by_role) may start its own
+        # independent attempt at a file that's already in progress and
+        # stuck, once its live fix-attempt count crosses
+        # config.branch_after_fixes. Wired up only when it could ever do
+        # anything (a branch-eligible client exists and the threshold is
+        # on), so a default (disabled) run has zero extra bookkeeping and
+        # zero behavior change from before this existed. Keyed by bare
+        # task name; each entry lives from the task's first claim until
+        # `record()` (or a hard requeue) removes it.
+        branching_enabled = bool(self._branch_pool) and self.config.branch_after_fixes > 0
+        in_progress: dict[str, dict] = {}
+
         def record(task: FileTask, result: FileRunResult) -> None:
             results[result.path] = result
             order.append(result.path)
@@ -680,6 +738,7 @@ class MultiFileLoop:
                 done.add(name)
             else:
                 hard_failed.add(name)
+            in_progress.pop(name, None)
             # The one place that knows a file's build loop has actually
             # concluded (success, exhausted its retries, or skipped) --
             # as opposed to a `verify` event that merely failed one of
@@ -688,7 +747,77 @@ class MultiFileLoop:
             # apart from "genuinely done", which a bare verify-event scan
             # can't -- especially with a paused run holding a failed
             # attempt open indefinitely before its next retry.
-            self.session.log("file_result", path=result.path, success=result.success)
+            self.session.log(
+                "file_result", path=result.path, success=result.success, branched=result.branched
+            )
+
+        def settle(
+            task: FileTask, result: FileRunResult, *, is_branch: bool, build_path: Path, real_path: Path
+        ) -> None:
+            """Called with `cv` held once one build attempt (the
+            original, or a branch) has finished. With no in_progress
+            entry for this task (branching off, or this task was never
+            branched), this is exactly the plain, always-decisive
+            record() from before branching existed.
+
+            Once a task *has* been branched, a success always wins
+            immediately -- the losing side, if still running, is told to
+            stop at its next checkpoint (see _BranchSuperseded). A
+            failure is only recorded once every concurrent attempt at
+            this task has also finished, so a branch still in flight
+            gets its real chance instead of the original's exhaustion
+            (or vice versa) silently pre-empting it.
+
+            A losing side isn't guaranteed to notice `_BranchSuperseded`
+            before arriving here itself -- `_generate_and_fix` only
+            checks `branch_cancel` on its failure path, so a loser whose
+            own verify happens to also pass returns success without ever
+            seeing it. The `done`/`hard_failed` check below catches that:
+            a task already resolved gets its late, stale result quietly
+            discarded here instead of recorded a second time.
+            """
+            name = Path(task.path).name
+            if name in done or name in hard_failed:
+                if is_branch and build_path != real_path:
+                    build_path.unlink(missing_ok=True)
+                return
+            info = in_progress.get(name)
+            if info is None:
+                if is_branch and build_path != real_path:
+                    build_path.unlink(missing_ok=True)
+                record(task, result)
+                return
+            info["pending_workers"] -= 1
+            was_branched = info["branched"]
+            won = result.success or result.advisory or result.spec_flagged
+            if won:
+                if is_branch:
+                    build_path.replace(real_path)
+                    result = dataclasses.replace(result, path=str(real_path), branched=True)
+                if was_branched:
+                    info["cancel"].set()
+                    self.session.log(
+                        "branch_race_won",
+                        path=str(real_path),
+                        winner="branch" if is_branch else "original",
+                    )
+                record(task, result)
+            elif info["pending_workers"] <= 0:
+                # Last attempt standing, and it also failed.
+                if is_branch and build_path != real_path:
+                    build_path.unlink(missing_ok=True)
+                record(task, result)
+            else:
+                # Lost, but the other concurrent attempt is still going --
+                # discard quietly and let it decide the task's fate.
+                if is_branch and build_path != real_path:
+                    build_path.unlink(missing_ok=True)
+                if was_branched:
+                    self.session.log(
+                        "branch_discarded",
+                        path=str(build_path),
+                        side="branch" if is_branch else "original",
+                    )
 
         def claim() -> FileTask | None:
             i = 0
@@ -723,9 +852,24 @@ class MultiFileLoop:
                 i += 1
             return None
 
+        def claim_branch(client: OllamaClient) -> FileTask | None:
+            """Must be called with `cv` held, only when this worker is
+            otherwise idle. Picks the first in-progress, not-yet-branched
+            task whose live fix-attempt count has crossed the threshold.
+            """
+            if not branching_enabled or client not in self._branch_pool:
+                return None
+            for info in in_progress.values():
+                if not info["branched"] and info["attempts"] >= self.config.branch_after_fixes:
+                    info["branched"] = True
+                    info["pending_workers"] += 1
+                    return info["task"]
+            return None
+
         def worker(client: OllamaClient) -> None:
             try:
                 while True:
+                    is_branch = False
                     with cv:
                         while True:
                             if abort_reason[0] is not None:
@@ -747,6 +891,14 @@ class MultiFileLoop:
                             task = claim()
                             if task is not None:
                                 busy[0] += 1
+                                if branching_enabled:
+                                    in_progress[Path(task.path).name] = {
+                                        "task": task,
+                                        "attempts": 0,
+                                        "cancel": threading.Event(),
+                                        "branched": False,
+                                        "pending_workers": 1,
+                                    }
                                 break
                             if stopped_early[0] or (not pending and busy[0] == 0):
                                 # Nothing left to claim, and nobody else is
@@ -763,10 +915,77 @@ class MultiFileLoop:
                                 )
                                 cv.notify_all()
                                 return
+                            branch_task = claim_branch(client)
+                            if branch_task is not None:
+                                task = branch_task
+                                is_branch = True
+                                busy[0] += 1
+                                break
                             cv.wait(timeout=0.5)
                         snapshot = list(results.values())
+
+                    name = Path(task.path).name
+                    real_path = self.session.run_dir / _safe_relative_path(task.path)
+                    build_path = real_path
+                    branch_cancel = None
+                    on_attempt = None
+                    if branching_enabled:
+                        info = in_progress.get(name)
+                        if info is not None:
+                            branch_cancel = info["cancel"]
+
+                            def on_attempt(n: int, _name: str = name) -> None:
+                                with cv:
+                                    i = in_progress.get(_name)
+                                    if i is not None:
+                                        i["attempts"] = n
+                                        cv.notify_all()
+                        if is_branch:
+                            build_path = real_path.with_name(f".branch-{real_path.name}")
+
+                    if is_branch:
+                        # A lower-stakes, opportunistic extra attempt, not
+                        # this file's primary claim -- an endpoint dying
+                        # mid-branch just ends the branch quietly. The
+                        # original attempt (or an earlier-claimed one) is
+                        # completely unaffected and keeps going through its
+                        # own retry/retire logic independently.
+                        try:
+                            result, used = self._build_one_file(
+                                client,
+                                goal,
+                                task,
+                                snapshot,
+                                file_path=build_path,
+                                branch_cancel=branch_cancel,
+                                on_attempt=on_attempt,
+                            )
+                        except (OllamaError, RunCancelled, _BranchSuperseded):
+                            with cv:
+                                busy[0] -= 1
+                                info = in_progress.get(name)
+                                if info is not None:
+                                    info["pending_workers"] -= 1
+                                cv.notify_all()
+                            build_path.unlink(missing_ok=True)
+                            continue
+                        with cv:
+                            iterations[0] += used
+                            busy[0] -= 1
+                            settle(task, result, is_branch=True, build_path=build_path, real_path=real_path)
+                            cv.notify_all()
+                        continue
+
                     try:
-                        result, used = self._build_one_file(client, goal, task, snapshot)
+                        result, used = self._build_one_file(
+                            client,
+                            goal,
+                            task,
+                            snapshot,
+                            file_path=build_path,
+                            branch_cancel=branch_cancel,
+                            on_attempt=on_attempt,
+                        )
                     except OllamaError as first_exc:
                         with cv:
                             am_last_worker = active[0] <= 1
@@ -782,7 +1001,13 @@ class MultiFileLoop:
                             try:
                                 result, used = _with_endpoint_retry(
                                     lambda task=task, snapshot=snapshot: self._build_one_file(
-                                        client, goal, task, snapshot
+                                        client,
+                                        goal,
+                                        task,
+                                        snapshot,
+                                        file_path=build_path,
+                                        branch_cancel=branch_cancel,
+                                        on_attempt=on_attempt,
                                     ),
                                     # One attempt already spent above --
                                     # this makes up the rest of
@@ -799,17 +1024,36 @@ class MultiFileLoop:
                                     busy[0] -= 1
                                     cv.notify_all()
                                 return
+                            except _BranchSuperseded:
+                                with cv:
+                                    busy[0] -= 1
+                                    info = in_progress.get(name)
+                                    if info is not None:
+                                        info["pending_workers"] -= 1
+                                    cv.notify_all()
+                                continue
                             else:
                                 with cv:
                                     iterations[0] += used
                                     busy[0] -= 1
-                                    record(task, result)
+                                    settle(
+                                        task, result, is_branch=False,
+                                        build_path=build_path, real_path=real_path,
+                                    )
                                     cv.notify_all()
                                 continue
                         with cv:
                             last_error[0] = str(final_exc)
                             pending.insert(0, task)  # another endpoint may manage it
                             busy[0] -= 1
+                            # The task is restarting clean -- cancel any
+                            # branch that was racing it (its own attempt
+                            # is being thrown away too) rather than leave
+                            # it racing against a claim that no longer
+                            # exists.
+                            info = in_progress.pop(name, None)
+                            if info is not None:
+                                info["cancel"].set()
                             cv.notify_all()
                         # Otherwise this endpoint just silently vanishes from
                         # the log and the file's whole build (spec included)
@@ -828,10 +1072,22 @@ class MultiFileLoop:
                             busy[0] -= 1
                             cv.notify_all()
                         return
+                    except _BranchSuperseded:
+                        # The original attempt itself lost the race (a
+                        # branch of its own file won first) -- not a real
+                        # failure, and not this worker's run to give up
+                        # on: go back and look for more work.
+                        with cv:
+                            busy[0] -= 1
+                            info = in_progress.get(name)
+                            if info is not None:
+                                info["pending_workers"] -= 1
+                            cv.notify_all()
+                        continue
                     with cv:
                         iterations[0] += used
                         busy[0] -= 1
-                        record(task, result)
+                        settle(task, result, is_branch=False, build_path=build_path, real_path=real_path)
                         cv.notify_all()
             finally:
                 with cv:
@@ -850,8 +1106,25 @@ class MultiFileLoop:
         return [results[p] for p in order], stopped_early[0], abort_reason[0], iterations[0]
 
     def _build_one_file(
-        self, client: OllamaClient, goal: str, task: FileTask, built_so_far: list[FileRunResult]
+        self,
+        client: OllamaClient,
+        goal: str,
+        task: FileTask,
+        built_so_far: list[FileRunResult],
+        *,
+        file_path: Path | None = None,
+        branch_cancel: threading.Event | None = None,
+        on_attempt: Callable[[int], None] | None = None,
     ) -> tuple[FileRunResult, int]:
+        """One full, independent attempt at `task`: spec, then generate-
+        and-fix. `file_path`, if given, overrides where the file is
+        written and verified -- used by a branch attempt (see
+        `_generate_files`), which writes to a scratch path so it can
+        never collide with the original attempt still writing the real
+        one. A branch redoes the spec too, deliberately: this is a
+        fresh, fully independent try (possibly on a different model),
+        not a resume of the original's specific state.
+        """
         spec_text = ""
         spec_calls = 0
         for spec_attempt in range(1, _SPEC_RETRY_ATTEMPTS + 1):
@@ -876,7 +1149,7 @@ class MultiFileLoop:
             )
         self.session.log("spec", path=task.path, spec=spec_text, endpoint=client.host)
 
-        file_path = self.session.run_dir / _safe_relative_path(task.path)
+        file_path = file_path or (self.session.run_dir / _safe_relative_path(task.path))
         file_path.parent.mkdir(parents=True, exist_ok=True)
         instruction = (
             f"Create the file `{task.path}`.\n"
@@ -912,6 +1185,8 @@ class MultiFileLoop:
             verify_fn,
             cancel_event=self._cancel,
             pause_event=self._pause,
+            branch_cancel=branch_cancel,
+            on_attempt=on_attempt,
         )
         advisory = is_test_file and not result.success
         if advisory:

@@ -41,6 +41,11 @@ class FileSummary:
     # The last verifier output for this file (the error, when it failed;
     # or "skipped: ..." when a dependency didn't build).
     last_error: str = ""
+    # True when this file's winning result came from a branch -- a
+    # second, independent attempt an idle endpoint started after this
+    # file's original attempt got stuck (see
+    # orchestrator._generate_files / Config.branch_after_fixes).
+    branched: bool = False
 
 
 @dataclasses.dataclass
@@ -76,6 +81,10 @@ class RunSummary:
     super_review_started: bool = False
 
 
+def _new_file_entry() -> dict:
+    return {"attempts": 0, "truncated": False, "success": False, "last_error": "", "branched": False}
+
+
 def load_run_summary(log_path: Path) -> RunSummary:
     """Reconstruct a RunSummary from a run's log.jsonl."""
     files: dict[str, dict] = {}
@@ -103,29 +112,31 @@ def load_run_summary(log_path: Path) -> RunSummary:
             total_llm_calls += 1
 
         if event in ("codegen", "fix"):
-            entry = files.setdefault(
-                record["path"], {"attempts": 0, "truncated": False, "success": False, "last_error": ""}
-            )
+            entry = files.setdefault(record["path"], _new_file_entry())
             if event == "fix":
                 entry["attempts"] += 1
             if record.get("truncated"):
                 entry["truncated"] = True
         elif event == "verify":
-            entry = files.setdefault(
-                record["path"], {"attempts": 0, "truncated": False, "success": False, "last_error": ""}
-            )
+            entry = files.setdefault(record["path"], _new_file_entry())
             entry["success"] = record["success"]
             entry["last_error"] = "" if record["success"] else record.get("output", "")
         elif event == "skipped":
-            files.setdefault(
-                record["path"],
-                {
-                    "attempts": 0,
-                    "truncated": False,
-                    "success": False,
-                    "last_error": f"skipped: {record.get('reason', 'a dependency did not build')}",
-                },
-            )
+            entry = files.setdefault(record["path"], _new_file_entry())
+            entry["last_error"] = f"skipped: {record.get('reason', 'a dependency did not build')}"
+        elif event == "file_result":
+            # The one authoritative word on a file's final success/
+            # branched status -- codegen/fix/verify events for a file a
+            # branch won were logged under that branch's own scratch
+            # path (see orchestrator._generate_files), so they can't be
+            # trusted for the file's real, final outcome the way this
+            # can. Never skipped: every path that reaches record() gets
+            # exactly one of these.
+            entry = files.setdefault(record["path"], _new_file_entry())
+            entry["success"] = record["success"]
+            entry["branched"] = record.get("branched", False)
+            if record["success"]:
+                entry["last_error"] = ""
         elif event == "advisory_test":
             advisory_paths.add(record["path"])
         elif event == "spec_flagged":
@@ -169,8 +180,15 @@ def load_run_summary(log_path: Path) -> RunSummary:
             advisory=path in advisory_paths,
             spec_flagged=path in spec_flagged_paths,
             last_error=data.get("last_error", ""),
+            branched=data.get("branched", False),
         )
         for path, data in files.items()
+        # A losing branch's own codegen/fix/verify events were logged
+        # under its scratch path (".branch-<real name>") and it never
+        # gets a file_result of its own (see orchestrator._generate_
+        # files) -- exclude that internal bookkeeping from the report
+        # entirely rather than showing it as if it were a real file.
+        if not Path(path).name.startswith(".branch-")
     ]
 
     cross_file_issues = [
@@ -215,6 +233,8 @@ def render_table(summary: RunSummary) -> str:
             note += " -- generated test never passed; not blocking the run"
         elif f.spec_flagged:
             note += " -- passes every real check, but the critic disagrees; not blocking the run"
+        if f.branched:
+            note += " -- won by a branch to another endpoint"
         lines.append(f"  [{status}] {f.path} ({f.attempts} fix attempt(s)){note}")
 
     if summary.integration is not None:

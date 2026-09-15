@@ -672,6 +672,84 @@ def test_an_idle_worker_does_not_retire_just_because_the_only_file_is_already_cl
     assert [Path(f.path).name for f in result.files] == ["a.py"]
 
 
+def test_a_file_exceeding_the_fix_threshold_gets_branched_to_an_idle_endpoint(tmp_path: Path):
+    # A file stuck deep in its fix loop can borrow an idle, branch-
+    # eligible endpoint instead of leaving it sitting around -- see
+    # _generate_files' claim_branch/settle. Both pool clients get an
+    # identical, interchangeable queue since which one claims the file
+    # first (and so plays "original" vs "branch") is a genuine race;
+    # the assertions only check aggregate outcomes that must hold
+    # regardless of who wins it.
+    config = make_config(tmp_path).with_overrides(branch_after_fixes=1)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]})
+    queue = ["- spec", "bad(", "bad(", "x = 1\n"]
+    a = FakeClient([plan, *queue], host="http://a")
+    b = FakeClient(list(queue), host="http://b")
+
+    result = MultiFileLoop(
+        a, config, session, pool_clients=[a, b], branch_pool=[a, b]
+    ).run("goal")
+
+    assert result.success
+    assert (session.run_dir / "main.py").read_text() == "x = 1"
+    assert not (session.run_dir / ".branch-main.py").exists()  # scratch file cleaned up
+
+    events = [json.loads(line) for line in session.log_path.read_text().splitlines()]
+    assert any(e["event"] == "branch_race_won" for e in events)
+    assert sum(1 for e in events if e["event"] == "file_result") == 1  # never double-recorded
+
+
+def test_an_endpoint_outside_the_branch_pool_never_branches(tmp_path: Path):
+    # Only "a" is branch-eligible (imagine a real run: "b" tagged
+    # "quick") -- "b" sitting idle must never pick up a's struggling
+    # file even though branching is otherwise on.
+    config = make_config(tmp_path, max_fix_attempts=2).with_overrides(branch_after_fixes=1)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]})
+    a = FakeClient([plan, "- spec", "bad(", "bad(", "x = 1\n"], host="http://a")
+    b = FakeClient([], host="http://b")  # would raise "ran out" if ever asked to do anything
+
+    result = MultiFileLoop(
+        a, config, session, pool_clients=[a, b], branch_pool=[a]
+    ).run("goal")
+
+    assert result.success
+    assert b.calls == []
+
+
+def test_branch_after_fixes_zero_disables_branching_entirely(tmp_path: Path):
+    # The default -- must be a true no-op even with a fully eligible
+    # branch pool and a file that genuinely struggles.
+    config = make_config(tmp_path, max_fix_attempts=2)  # branch_after_fixes defaults to 0
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]})
+    a = FakeClient([plan, "- spec", "bad(", "bad(", "x = 1\n"], host="http://a")
+    b = FakeClient([], host="http://b")
+
+    result = MultiFileLoop(
+        a, config, session, pool_clients=[a, b], branch_pool=[a, b]
+    ).run("goal")
+
+    assert result.success
+    assert b.calls == []
+
+
+def test_branching_never_kicks_in_before_the_threshold_is_crossed(tmp_path: Path):
+    config = make_config(tmp_path).with_overrides(branch_after_fixes=10)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "main.py", "purpose": "x", "depends_on": []}]})
+    a = FakeClient([plan, "- spec", "x = 1\n"], host="http://a")  # succeeds first try, no fixes
+    b = FakeClient([], host="http://b")
+
+    result = MultiFileLoop(
+        a, config, session, pool_clients=[a, b], branch_pool=[a, b]
+    ).run("goal")
+
+    assert result.success
+    assert b.calls == []
+
+
 def test_run_aborts_gracefully_when_the_model_becomes_unreachable(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)

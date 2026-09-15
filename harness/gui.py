@@ -236,7 +236,7 @@ class RunManager:
             ]
             pool = [self._client_factory(e.host, e.model, e.timeout_seconds) for e in eps]
             if multi_file:
-                primary, workers, critic_client = partition_clients_by_role(eps, pool)
+                primary, workers, critic_client, branch_pool = partition_clients_by_role(eps, pool)
                 MultiFileLoop(
                     primary,
                     config,
@@ -245,6 +245,7 @@ class RunManager:
                     cancel_event=cancel_event,
                     pause_event=pause_event,
                     critic_client=critic_client,
+                    branch_pool=branch_pool,
                 ).run(goal)
             else:
                 SingleFileLoop(
@@ -648,6 +649,21 @@ class _Handler(BaseHTTPRequestHandler):
             for c in active_calls
             if c.get("kind") in ("fix", "integration_fix") and c.get("path")
         }
+        # A branch attempt (orchestrator._generate_files) codegens/fixes
+        # under a scratch filename (".branch-<real name>") so it can
+        # never collide on disk with the original attempt still racing
+        # it -- strip that prefix back off to attribute the activity to
+        # the real file. Its brief initial spec phase isn't caught here
+        # (spec calls are tracked under the bare task path, same as the
+        # original's, since specs don't touch a file path at all) -- a
+        # small, acceptable gap since branching exists for files stuck
+        # deep in the fix loop, where that's where almost all of a
+        # branch's time is actually spent.
+        branching_names = {
+            Path(c["path"]).name.removeprefix(".branch-")
+            for c in active_calls
+            if c.get("path") and Path(c["path"]).name.startswith(".branch-")
+        }
         status_by_name: dict[str, str] = {}
         fixes_by_name: dict[str, int] = {}
         spec_names: set[str] = set()
@@ -742,6 +758,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "speccing": name in speccing_names,
                         "criticizing": name in criticizing_names,
                         "fixing": name in fixing_names,
+                        "branching": name in branching_names,
                         "fixes": fixes_by_name.get(name, 0),
                         "endpoint": endpoint_by_name.get(name, ""),
                     }
@@ -762,6 +779,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "speccing": p.name in speccing_names,
                     "criticizing": p.name in criticizing_names,
                     "fixing": p.name in fixing_names,
+                    "branching": p.name in branching_names,
                     "fixes": fixes_by_name.get(p.name, 0),
                     "endpoint": endpoint_by_name.get(p.name, ""),
                 }
@@ -879,11 +897,11 @@ _INDEX_HTML = """<!doctype html>
 <style>
   :root { --fg:#1c1c1e; --bg:#fbfbfa; --muted:#8a8a8e; --line:#e4e4e2;
           --accent:#3a6adf; --ok:#1f9d55; --bad:#d1453b; --warn:#c47f17;
-          --spec:#8a5cf6; --critic:#0891b2; }
+          --spec:#8a5cf6; --critic:#0891b2; --branch:#db2777; }
   @media (prefers-color-scheme: dark) {
     :root { --fg:#eaeaea; --bg:#181818; --muted:#8a8a8e; --line:#333;
             --accent:#6f9bff; --ok:#57c97f; --bad:#ff6b60; --warn:#e0a24a;
-            --spec:#b39bfa; --critic:#22d3ee; }
+            --spec:#b39bfa; --critic:#22d3ee; --branch:#f472b6; }
   }
   * { box-sizing:border-box; }
   [hidden] { display:none !important; }
@@ -983,6 +1001,7 @@ _INDEX_HTML = """<!doctype html>
   td.s-ok { color:var(--ok); } td.s-bad { color:var(--bad); } td.s-adv { color:var(--warn); }
   td.s-flag { color:var(--accent); }
   td.s-review-confirmed { color:var(--critic); } td.s-review-unconfirmed { color:var(--muted); }
+  .s-branched { color:var(--branch); font-weight:600; font-size:11.5px; }
   .review-findings { margin-top:14px; }
   .review-findings b { font-size:11px; text-transform:uppercase; letter-spacing:.03em;
                          color:var(--muted); }
@@ -1063,6 +1082,7 @@ _INDEX_HTML = """<!doctype html>
   .dep-node-group.dim .dep-speccing-dot,
   .dep-node-group.dim .dep-criticizing-dot,
   .dep-node-group.dim .dep-fixing-dot,
+  .dep-node-group.dim .dep-branching-dot,
   .dep-node-group.dim .dep-node-fixes { opacity:.3; }
   .dep-node-group.hl .dep-node-rect { stroke-width:2.5; }
   .dep-edge { fill:none; stroke:var(--muted); stroke-width:1.6; opacity:.65;
@@ -1078,6 +1098,7 @@ _INDEX_HTML = """<!doctype html>
   .dep-speccing-dot { fill:var(--spec); pointer-events:none; animation:pulse 1.2s ease-in-out infinite; }
   .dep-criticizing-dot { fill:var(--critic); pointer-events:none; animation:pulse 1.2s ease-in-out infinite; }
   .dep-fixing-dot { fill:var(--warn); pointer-events:none; animation:pulse 1.2s ease-in-out infinite; }
+  .dep-branching-dot { fill:var(--branch); pointer-events:none; animation:pulse 1.2s ease-in-out infinite; }
   .graph-legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin-top:8px; font-size:10.5px;
                    color:var(--muted); }
   .graph-legend span { display:inline-flex; align-items:center; gap:4px; }
@@ -1095,6 +1116,8 @@ _INDEX_HTML = """<!doctype html>
                                   animation:pulse 1.2s ease-in-out infinite; }
   .graph-legend i.fixing { border-radius:50%; border-color:var(--warn); background:var(--warn);
                              animation:pulse 1.2s ease-in-out infinite; }
+  .graph-legend i.branching { border-radius:50%; border-color:var(--branch); background:var(--branch);
+                                animation:pulse 1.2s ease-in-out infinite; }
 </style>
 </head>
 <body>
@@ -1195,6 +1218,7 @@ _INDEX_HTML = """<!doctype html>
       <span><i class="speccing"></i>writing spec&hellip;</span>
       <span><i class="criticizing"></i>critic reviewing&hellip;</span>
       <span><i class="fixing"></i>fixing&hellip;</span>
+      <span><i class="branching"></i>branching to another endpoint&hellip;</span>
     </div>
   </div>
   <div id="summary"></div>
@@ -1631,13 +1655,17 @@ function renderGraph(files, runId) {
       ? `<text class="dep-node-fixes" x="${p.x + 6}" y="${p.top + NODE_H - 6}" text-anchor="start">`
         + `\\u21bb${f.fixes}<title>${f.fixes} fix${f.fixes === 1 ? "" : "es"}</title></text>`
       : "";
-    // One corner, one dot at a time. Live activity (spec/critic/fix, in
-    // that order -- they're mutually exclusive per file at any instant)
-    // always wins over the static "has a spec" dot: has_spec stays true
-    // for the rest of the file's life once logged, so without a
-    // priority order it would permanently mask whatever's actually
-    // happening to the file right now.
-    const live = f.speccing
+    // One corner, one dot at a time. Live activity always wins over the
+    // static "has a spec" dot: has_spec stays true for the rest of the
+    // file's life once logged, so without a priority order it would
+    // permanently mask whatever's actually happening to the file right
+    // now. "branching" comes first -- a file racing two concurrent
+    // attempts is the most exceptional thing that can be happening to
+    // it, worth flagging over the (also-true) fact that one side of
+    // that race happens to be speccing/critiquing/fixing at this instant.
+    const live = f.branching
+      ? { cls: "dep-branching-dot", title: "branching to another endpoint\\u2026" }
+      : f.speccing
       ? { cls: "dep-speccing-dot", title: "writing spec\\u2026" }
       : f.criticizing
       ? { cls: "dep-criticizing-dot", title: "critic reviewing\\u2026" }
@@ -1776,7 +1804,11 @@ async function showSummary(runId) {
     const cls = f.success ? "s-ok" : (f.spec_flagged ? "s-flag" : (f.advisory ? "s-adv" : "s-bad"));
     const tag = f.success ? "ok" : (f.spec_flagged ? "flagged" : (f.advisory ? "advisory" : "FAILED"));
     const name = f.path.split("/").pop();
-    return `<tr><td class="${cls}">${tag}</td><td>${esc(name)}</td><td>${f.attempts} fix${f.attempts === 1 ? "" : "es"}</td></tr>`;
+    const branchNote = f.branched
+      ? ` <span class="s-branched" title="won by a branch to another endpoint">(branched)</span>`
+      : "";
+    return `<tr><td class="${cls}">${tag}</td><td>${esc(name)}</td>`
+      + `<td>${f.attempts} fix${f.attempts === 1 ? "" : "es"}${branchNote}</td></tr>`;
   }).join("");
   if (s.integration) {
     const ic = s.integration.success ? "s-ok" : "s-bad";

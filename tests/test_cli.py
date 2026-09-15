@@ -193,6 +193,20 @@ def test_max_tokens_flags_override_the_configured_generation_length(tmp_path, mo
     assert config.max_tokens != 4096  # the yaml default is untouched
 
 
+def test_branch_after_fixes_flag_is_accepted(tmp_path, monkeypatch, capsys):
+    # Full branching behavior is covered at the orchestrator level
+    # (test_multi_file_loop.py) -- this just proves the flag parses and
+    # threads through main() without disturbing an ordinary run (a
+    # single endpoint has nobody else to branch to regardless).
+    _patch_config(monkeypatch, tmp_path)
+    client = FakeClient(["print('hi')\n"])
+    monkeypatch.setattr(cli, "OllamaClient", lambda *a, **k: client)
+
+    exit_code = cli.main(["run", "--goal", "print hi", "--branch-after-fixes", "2"])
+
+    assert exit_code == 0
+
+
 def test_no_critic_flag_skips_the_critic_call(tmp_path, monkeypatch, capsys):
     _patch_config(monkeypatch, tmp_path, critic_enabled=True)
     client = FakeClient(["print('hi')\n"])

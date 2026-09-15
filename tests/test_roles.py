@@ -20,11 +20,12 @@ def test_no_roles_tagged_reproduces_todays_behaviour():
     endpoints = [Endpoint("http://a", "m", 60), Endpoint("http://b", "m", 60)]
     clients = _clients("http://a", "http://b")
 
-    primary, workers, critic_override = partition_clients_by_role(endpoints, clients)
+    primary, workers, critic_override, branch_pool = partition_clients_by_role(endpoints, clients)
 
     assert primary is clients[0]
     assert workers == clients
     assert critic_override is None
+    assert branch_pool == clients  # both "balanced" -- both branch-eligible
 
 
 def test_smart_endpoint_becomes_primary_and_critic_but_still_joins_the_workers():
@@ -38,44 +39,48 @@ def test_smart_endpoint_becomes_primary_and_critic_but_still_joins_the_workers()
     ]
     clients = _clients("http://smart", "http://q1", "http://q2")
 
-    primary, workers, critic_override = partition_clients_by_role(endpoints, clients)
+    primary, workers, critic_override, branch_pool = partition_clients_by_role(endpoints, clients)
 
     assert primary is clients[0]
     assert critic_override is clients[0]
     assert workers == clients  # smart included alongside the quick ones
+    assert branch_pool == [clients[0]]  # only the smart one -- both quicks excluded
 
 
 def test_only_quick_endpoints_falls_back_to_the_first_as_primary():
     endpoints = [Endpoint("http://q1", "m", 60, role="quick"), Endpoint("http://q2", "m", 60, role="quick")]
     clients = _clients("http://q1", "http://q2")
 
-    primary, workers, critic_override = partition_clients_by_role(endpoints, clients)
+    primary, workers, critic_override, branch_pool = partition_clients_by_role(endpoints, clients)
 
     assert primary is clients[0]
     assert workers == clients
     assert critic_override is None  # no "smart" tag anywhere -- nothing to override with
+    assert branch_pool == []  # no endpoint is ever branch-eligible if all are "quick"
 
 
 def test_an_unrecognised_role_behaves_like_balanced():
     endpoints = [Endpoint("http://a", "m", 60, role="typo-not-a-real-role")]
     clients = _clients("http://a")
 
-    primary, workers, critic_override = partition_clients_by_role(endpoints, clients)
+    primary, workers, critic_override, branch_pool = partition_clients_by_role(endpoints, clients)
 
     assert primary is clients[0]
     assert workers == clients
     assert critic_override is None
+    assert branch_pool == clients  # not "quick" -- still branch-eligible, like "balanced"
 
 
 def test_a_lone_smart_endpoint_still_does_its_own_per_file_work():
     endpoints = [Endpoint("http://only", "m", 60, role="smart")]
     clients = _clients("http://only")
 
-    primary, workers, critic_override = partition_clients_by_role(endpoints, clients)
+    primary, workers, critic_override, branch_pool = partition_clients_by_role(endpoints, clients)
 
     assert primary is clients[0]
     assert workers == clients
     assert critic_override is clients[0]
+    assert branch_pool == clients
 
 
 def test_critic_routes_to_the_smart_client_not_the_worker_that_built_the_file(tmp_path: Path):

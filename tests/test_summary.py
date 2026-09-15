@@ -430,3 +430,72 @@ def test_render_table_shows_confirmed_and_unconfirmed_findings():
 
     assert "[review:confirmed] a.py -- real problem" in table
     assert "[review:unconfirmed] b.py -- maybe a problem" in table
+
+
+def test_load_run_summary_marks_a_branched_file_and_drops_its_scratch_path(tmp_path: Path):
+    # A branch's own codegen/fix/verify events are logged under a scratch
+    # path (".branch-<real name>") so they can never collide on disk with
+    # the original attempt -- those must never show up as their own fake
+    # "file" in the summary, and file_result (not the original's own,
+    # possibly-failing verify events) is the authoritative word on the
+    # real path's final outcome.
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "plan", "files": [{"path": "main.py", "purpose": "x"}]},
+            # the original's own (failing) progress on the real path
+            {"event": "codegen", "path": "main.py", "code": "bad(", "truncated": False},
+            {"event": "verify", "path": "main.py", "attempt": 0, "stage": "compile",
+             "success": False, "output": "SyntaxError"},
+            # a branch's progress under the scratch path -- it wins
+            {"event": "codegen", "path": ".branch-main.py", "code": "x = 1", "truncated": False},
+            {"event": "verify", "path": ".branch-main.py", "attempt": 0, "stage": "compile",
+             "success": True, "output": ""},
+            {"event": "file_result", "path": "main.py", "success": True, "branched": True},
+            {"event": "run_result", "success": True},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert len(summary.files) == 1  # the scratch-path entry never appears
+    main = summary.files[0]
+    assert main.path == "main.py"
+    assert main.success
+    assert main.branched
+    assert main.last_error == ""  # not the original's stale SyntaxError
+
+
+def test_load_run_summary_leaves_branched_false_for_an_ordinary_file(tmp_path: Path):
+    log_path = _write_log(
+        tmp_path,
+        [
+            {"event": "plan", "files": [{"path": "main.py", "purpose": "x"}]},
+            {"event": "codegen", "path": "main.py", "code": "x = 1", "truncated": False},
+            {"event": "verify", "path": "main.py", "attempt": 0, "stage": "compile",
+             "success": True, "output": ""},
+            {"event": "file_result", "path": "main.py", "success": True, "branched": False},
+            {"event": "run_result", "success": True},
+        ],
+    )
+
+    summary = load_run_summary(log_path)
+
+    assert summary.files == [
+        FileSummary(path="main.py", success=True, attempts=0, truncated=False)
+    ]
+
+
+def test_render_table_notes_a_branched_file():
+    summary = RunSummary(
+        run_id="r5",
+        files=[FileSummary(path="main.py", success=True, attempts=1, truncated=False, branched=True)],
+        integration=None,
+        total_llm_calls=5,
+        stopped_early=False,
+        succeeded=True,
+    )
+
+    table = render_table(summary)
+
+    assert "won by a branch to another endpoint" in table
