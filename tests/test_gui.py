@@ -796,6 +796,7 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
         )
         assert body["has_plan"] is True
         assert body["phase"] == "building"  # no run_result event in this fixture
+        assert body["goal"] == ""  # this fixture's log has no "goal" event
         assert body["files"] == [
             {
                 "name": "core.py",
@@ -861,6 +862,61 @@ def test_files_and_file_endpoints_serve_a_runs_generated_source(tmp_path: Path):
             raise AssertionError("expected an error response")
         except urllib.error.HTTPError as exc:
             assert exc.code == 404
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_files_endpoint_reports_the_runs_goal_for_the_life_of_the_run(tmp_path: Path):
+    # The live log feed deliberately silences the "goal" event (redundant
+    # with the CLI's own preamble print) -- but the GUI never prints that
+    # preamble, and a run started via a raw API call never even fills in
+    # the goal textarea, so /api/files is the one live-polled endpoint
+    # that can still surface it while the run is in progress.
+    import threading
+    import urllib.request
+
+    config = make_config(tmp_path)
+    run_dir = config.workspace_root / "20260101-000000-abcd1234"
+    run_dir.mkdir(parents=True)
+    records = [
+        {"event": "goal", "goal": "a script that prints hi"},
+        {"event": "plan", "files": [{"path": "core.py", "purpose": "x", "depends_on": []}]},
+    ]
+    (run_dir / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        body = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/files/20260101-000000-abcd1234", timeout=5
+            ).read()
+        )
+        assert body["goal"] == "a script that prints hi"
+    finally:
+        server.shutdown()
+        t.join(timeout=5)
+
+
+def test_files_endpoint_reports_no_goal_for_a_missing_run(tmp_path: Path):
+    import threading
+    import urllib.request
+
+    config = make_config(tmp_path)
+    server = gui.build_server(config, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        body = json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/files/no-such-run", timeout=5
+            ).read()
+        )
+        assert body["goal"] == ""
     finally:
         server.shutdown()
         t.join(timeout=5)

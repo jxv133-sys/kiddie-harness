@@ -79,6 +79,13 @@ class RunSummary:
     # nothing" and "hasn't started reviewing yet" must read differently
     # (the GUI's phase stepper needs to tell them apart).
     super_review_started: bool = False
+    # The original goal text, straight from the run's own "goal" event --
+    # empty for a log written before this field existed. Lets a viewer
+    # (the GUI's live header, `harness inspect`) show what a run is
+    # actually building without relying on the caller to have kept the
+    # text around itself, which the GUI can't when a run was started
+    # through a raw API call rather than its own form.
+    goal: str = ""
 
 
 def _new_file_entry() -> dict:
@@ -101,6 +108,7 @@ def load_run_summary(log_path: Path) -> RunSummary:
     found_issues: list[dict] = []
     confirmed_by_key: dict[tuple[str, str], bool] = {}
     super_review_started = False
+    goal = ""
 
     for line in log_path.read_text().splitlines():
         if not line.strip():
@@ -111,7 +119,9 @@ def load_run_summary(log_path: Path) -> RunSummary:
         if event in _CALL_EVENTS:
             total_llm_calls += 1
 
-        if event in ("codegen", "fix"):
+        if event == "goal":
+            goal = record.get("goal", "")
+        elif event in ("codegen", "fix"):
             entry = files.setdefault(record["path"], _new_file_entry())
             if event == "fix":
                 entry["attempts"] += 1
@@ -202,6 +212,7 @@ def load_run_summary(log_path: Path) -> RunSummary:
 
     return RunSummary(
         run_id=log_path.parent.name,
+        goal=goal,
         files=file_summaries,
         integration=integration,
         total_llm_calls=total_llm_calls,

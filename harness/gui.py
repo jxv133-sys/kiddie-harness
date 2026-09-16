@@ -628,10 +628,13 @@ class _Handler(BaseHTTPRequestHandler):
         single-file run has no plan at all; falls back to whatever's on
         disk, as before. `phase` is a coarse "where is this run right
         now" for an at-a-glance header: planning -> building ->
-        integration -> done."""
+        integration -> done. `goal` is the run's own goal text (from its
+        "goal" log event) -- polled here, not just `/api/summary`, so it
+        stays visible in the header for the run's entire life, not only
+        after it finishes; empty once the run directory itself is gone."""
         run_dir = self._runs.log_path(run_id).parent
         if not run_dir.is_dir():
-            return {"files": [], "has_plan": False, "phase": "planning"}
+            return {"files": [], "has_plan": False, "phase": "planning", "goal": ""}
         # In-flight, not-yet-logged spec/critic/fix calls -- a file only
         # shows up in the completed log's own event once a call returns,
         # but the graph should show what's actually happening to it right
@@ -768,7 +771,12 @@ class _Handler(BaseHTTPRequestHandler):
                         "endpoint": endpoint_by_name.get(name, ""),
                     }
                 )
-            return {"files": files, "has_plan": True, "phase": phase}
+            return {
+                "files": files,
+                "has_plan": True,
+                "phase": phase,
+                "goal": run_summary.goal if run_summary is not None else "",
+            }
 
         found = (p for pattern in self._GENERATED_FILE_GLOBS for p in run_dir.glob(pattern))
         files = []
@@ -789,7 +797,12 @@ class _Handler(BaseHTTPRequestHandler):
                     "endpoint": endpoint_by_name.get(p.name, ""),
                 }
             )
-        return {"files": files, "has_plan": has_plan, "phase": phase}
+        return {
+            "files": files,
+            "has_plan": has_plan,
+            "phase": phase,
+            "goal": run_summary.goal if run_summary is not None else "",
+        }
 
     def _read_plan_text(self, run_id: str) -> str | None:
         """The most recent `plan` event, rendered as plain text -- None
@@ -1033,6 +1046,12 @@ _INDEX_HTML = """<!doctype html>
                color:var(--fg); font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
                white-space:pre-wrap; word-break:break-word; max-height:280px; overflow:auto; }
 
+  /* -- the running goal, visible for the life of the run regardless of
+     how it was started (typed in, or via the API directly) -- */
+  .run-goal { margin:0 0 10px; font-size:12.5px; color:var(--muted);
+              white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .run-goal b { color:var(--fg); font-weight:600; }
+
   /* -- phase stepper: "where is this run right now", at a glance -- */
   .phase-stepper { display:flex; margin:0 0 22px; border:1px solid var(--line);
                     border-radius:8px; overflow:hidden; }
@@ -1148,6 +1167,7 @@ _INDEX_HTML = """<!doctype html>
     <button type="button" id="settings-btn" class="gear" title="settings">&#9881;</button>
   </h1>
   <div id="calls-list" class="calls-list" hidden></div>
+  <div id="run-goal" class="run-goal" hidden></div>
   <div id="phase-stepper" class="phase-stepper" hidden>
     <div class="phase-step" data-phase="planning">Plan</div>
     <div class="phase-step" data-phase="building">Build</div>
@@ -1559,11 +1579,19 @@ function showCallWindow(call) {
 
 async function refreshFiles(runId) {
   if (!runId) return;
-  let files = [], hasPlan = false, phase = "planning";
+  let files = [], hasPlan = false, phase = "planning", goal = "";
   try {
     const { url } = tagUrl("/api/files/" + runId);
-    ({ files, has_plan: hasPlan, phase } = await (await fetch(url)).json());
+    ({ files, has_plan: hasPlan, phase, goal } = await (await fetch(url)).json());
   } catch (e) { return; }
+  const goalEl = $("#run-goal");
+  if (goal) {
+    goalEl.innerHTML = `<b>Goal:</b> ${goal.replace(/</g, "&lt;")}`;
+    goalEl.title = goal;
+    goalEl.hidden = false;
+  } else {
+    goalEl.hidden = true;
+  }
   updatePhaseStepper(phase, false);
   const panel = $("#files-panel");
   if (!files.length && !hasPlan) { panel.hidden = true; return; }

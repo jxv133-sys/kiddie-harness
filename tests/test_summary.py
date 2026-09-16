@@ -43,6 +43,7 @@ def test_load_run_summary_success_case(tmp_path: Path):
     summary = load_run_summary(log_path)
 
     assert summary.run_id == "20260101-000000-abcd1234"
+    assert summary.goal == "do a thing"
     assert summary.succeeded
     assert not summary.stopped_early
     assert summary.total_llm_calls == 3  # plan + spec + codegen
@@ -82,6 +83,7 @@ def test_load_run_summary_with_fix_and_truncation(tmp_path: Path):
     assert summary.total_llm_calls == 2  # codegen + fix
     assert summary.succeeded
     assert summary.finished
+    assert summary.goal == ""  # no "goal" event in this fixture
 
 
 def test_load_run_summary_flags_a_run_that_never_finished(tmp_path: Path):
