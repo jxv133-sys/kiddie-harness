@@ -267,6 +267,57 @@ core design, not just style.
 
 ## Status
 
+**A new `overflow` endpoint role lets a slower/weaker endpoint sit out
+until it can genuinely help, added on request** (a fast local Apple
+Silicon GPU vs. a consistently slower home-lab box: "I always want my
+local endpoint LLM working" for everything, and only want the other
+endpoint used "for parallel work"). Unlike the existing roles, this one
+changes per-file *dispatch* itself, not just which client handles the
+judgement calls -- `partition_clients_by_role` (`orchestrator.py`) grew a
+fifth return value, `overflow_pool` (clients tagged `"overflow"`),
+resolved the same way `branch_pool` already is; `overflow` never becomes
+the plan/critic client (same exclusion `"quick"` already has) but stays
+branch-eligible (picking up a second attempt at an already-stuck file is
+exactly the kind of parallel work it's for).
+
+The real change is in `_generate_files`'s dispatch loop: an `overflow`
+worker only calls `claim()` for ordinary pending work once every
+non-`overflow` endpoint is already busy building something else --
+tracked with two small counters, `non_overflow_active` (how many
+non-overflow endpoints are still alive at all) and `non_overflow_busy`
+(how many are *currently* mid-build), both `cv`-protected like every
+other piece of this loop's shared state. Getting the bookkeeping right
+without touching each of the ~10 existing `busy[0] -= 1` sites (this
+loop's own established danger zone) came down to one observation: every
+one of those sites either loops back to the top of the worker's outer
+`while True:` or falls through to the `finally:` block that already
+runs `active[0] -= 1` on every exit path -- so `non_overflow_busy` only
+needs clearing in exactly those same two places (a per-worker local
+`marked_busy` flag makes both cheap and unambiguous), never at the
+individual exit sites themselves. `non_overflow_active` only ever counts
+down, and once it hits zero (every non-overflow endpoint has
+permanently died, not just momentarily busy) the gate opens
+unconditionally -- worked through deliberately as its own edge case: a
+naive "wait until busy" rule alone would strand pending work behind a
+dead preferred endpoint forever, since "busy" would never come again
+once nothing non-overflow is left alive to be busy. Config/CLI/GUI
+plumbing follows the exact shape every other role already established:
+`ROLES` gains `"overflow"`, `--endpoint HOST,MODEL,overflow`, a fourth
+GUI role-dropdown option, `config/default.yaml` documentation. Tests:
+`test_roles.py` covers the partition (never primary/critic, stays
+branch-eligible); `test_multi_file_loop.py` covers the dispatch gate
+itself with four cases -- overflow never touches the only pending file
+(an empty response queue would raise if it were ever asked to do
+anything), overflow claims a genuinely independent second file once the
+first endpoint is busy on it (same delay-based determinism technique
+`test_an_idle_worker_does_not_retire...` already established), overflow
+unlocks unconditionally once the sole non-overflow endpoint has died for
+good, and an unset `overflow_pool` changes nothing (the full suite's
+existing 300+ tests, none of which ever set it, are the real proof of
+that last one). Run 8x to check for flakiness in the race-sensitive
+cases before considering this done, same discipline the branching work
+used.
+
 **Windows Batch (.bat/.cmd) and PowerShell (.ps1) join the supported file
 types, added on request** ("expand the amount of supported file types to
 include window exacutables and scripts"). Clarified first, since "Windows

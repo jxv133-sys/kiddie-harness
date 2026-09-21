@@ -77,8 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Extra Ollama backend for parallel multi-file generation (repeatable). "
         "First --endpoint replaces the default primary; use it twice for two. "
         "Optional third field tags its role: smart (plan/critic/integration-fix), "
-        "quick (the per-file spec/codegen/fix grind), or balanced (does either, "
-        "the default) -- see the Model roles section of the README.",
+        "quick (the per-file spec/codegen/fix grind), balanced (does either, "
+        "the default), or overflow (per-file grind only, and only once every "
+        "other endpoint is already busy) -- see the Model roles section of the README.",
     )
     run.add_argument(
         "--filename",
@@ -139,6 +140,7 @@ def _run_multi_file(
     pool_clients: list[OllamaClient] | None = None,
     critic_client: OllamaClient | None = None,
     branch_pool: list[OllamaClient] | None = None,
+    overflow_pool: list[OllamaClient] | None = None,
 ) -> int:
     try:
         loop = MultiFileLoop(
@@ -148,6 +150,7 @@ def _run_multi_file(
             pool_clients=pool_clients,
             critic_client=critic_client,
             branch_pool=branch_pool,
+            overflow_pool=overflow_pool,
         )
         result = loop.run(args.goal)
     except (OllamaError, PlanError) as exc:
@@ -251,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
         endpoints = config.resolved_endpoints()
         all_clients = [OllamaClient(e.host, e.model, e.timeout_seconds) for e in endpoints]
-        client, pool_clients, critic_client, branch_pool = partition_clients_by_role(
+        client, pool_clients, critic_client, branch_pool, overflow_pool = partition_clients_by_role(
             endpoints, all_clients
         )
         reporter = None if args.quiet else progress.console_reporter()
@@ -273,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
                 pool_clients=pool_clients,
                 critic_client=critic_client,
                 branch_pool=branch_pool,
+                overflow_pool=overflow_pool,
             )
         return _run_single_file(all_clients[0], config, session, args)
 

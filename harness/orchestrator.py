@@ -224,19 +224,20 @@ def _retry_temperature(base: float, fix_attempt: int) -> float:
 
 def partition_clients_by_role(
     endpoints: list[Endpoint], clients: list[OllamaClient]
-) -> tuple[OllamaClient, list[OllamaClient], OllamaClient | None, list[OllamaClient]]:
+) -> tuple[OllamaClient, list[OllamaClient], OllamaClient | None, list[OllamaClient], list[OllamaClient]]:
     """Splits a resolved endpoint pool into (the client for plan/critic/
     integration-fix -- the "judgement" calls), (the pool for per-file
     spec/codegen/fix dispatch -- the high-volume grind), (an explicit
-    override for critic, or None), and (the subset of clients eligible to
-    branch a stuck file -- "smart" or "balanced", never "quick").
+    override for critic, or None), (the subset of clients eligible to
+    branch a stuck file -- "smart", "balanced", or "overflow", never
+    "quick"), and (the subset tagged "overflow" -- see below).
 
     `MultiFileLoop` itself never learns what a role *means* -- it only
-    ever sees this pre-filtered `branch_pool` list, the same way it only
-    ever sees `primary`/`pool_clients`/`critic_override` and not the
-    roles that produced them (see that class's own docstring). Resolving
-    "quick" endpoints out of branch eligibility here, once, keeps that
-    invariant intact instead of teaching the dispatch loop about roles.
+    ever sees these pre-filtered lists, the same way it only ever sees
+    `primary`/`pool_clients`/`critic_override` and not the roles that
+    produced them (see that class's own docstring). Resolving roles out
+    into plain client lists here, once, keeps that invariant intact
+    instead of teaching the dispatch loop about roles.
 
     Every endpoint works the per-file grind regardless of role -- a
     "smart" endpoint being more capable is a reason to *also* give it
@@ -249,24 +250,40 @@ def partition_clients_by_role(
     anywhere, a "balanced" endpoint can still fall back into that role
     (matching today's behaviour before roles existed: the first endpoint
     is the plan/integration client, and critic runs on whichever worker
-    built the file, not a fixed override). A "quick" endpoint never
-    becomes the plan/critic client, not even as a fallback -- that's the
-    one thing tagging something "quick" actually opts it out of.
+    built the file, not a fixed override). Neither "quick" nor
+    "overflow" ever becomes the plan/critic client, not even as a
+    fallback -- that's the one thing tagging something either way
+    actually opts it out of.
 
-    No endpoint tagged "smart" and none tagged "quick" (every one left at
+    "overflow" is the one role that changes per-file dispatch itself,
+    not just judgement-call routing: an "overflow" endpoint is for a
+    consistently slower/weaker endpoint (a home-lab box next to a fast
+    local GPU, say) that should never compete for a file a preferred
+    endpoint could just take -- only step in once every non-"overflow"
+    endpoint is already busy, so a solo goal (or the first file of any
+    goal) always goes to the preferred endpoint(s) alone, and the
+    overflow endpoint only ever picks up genuinely parallel work. The
+    dispatch loop (`_generate_files`) enforces this by checking simple
+    membership in the returned `overflow_pool` list -- the same pattern
+    `branch_pool` already established, not a new kind of role-awareness.
+
+    No endpoint tagged "smart", "quick", or "overflow" (every one left at
     the "balanced" default, today's only option before roles existed)
     reproduces today's exact behaviour byte for byte.
     """
     smart = [c for e, c in zip(endpoints, clients) if e.role == "smart"]
-    # Anything that isn't "smart" or "quick" -- "balanced", or a typo'd/
-    # unrecognised role -- can still stand in for "smart" as a fallback
-    # plan/critic client, same as "balanced" always could.
-    balanced = [c for e, c in zip(endpoints, clients) if e.role not in ("smart", "quick")]
+    # Anything that isn't "smart", "quick", or "overflow" -- "balanced",
+    # or a typo'd/unrecognised role -- can still stand in for "smart" as
+    # a fallback plan/critic client, same as "balanced" always could.
+    balanced = [
+        c for e, c in zip(endpoints, clients) if e.role not in ("smart", "quick", "overflow")
+    ]
 
     primary = smart[0] if smart else (balanced[0] if balanced else clients[0])
     critic_override = smart[0] if smart else None
     branch_pool = [c for e, c in zip(endpoints, clients) if e.role != "quick"]
-    return primary, list(clients), critic_override, branch_pool
+    overflow_pool = [c for e, c in zip(endpoints, clients) if e.role == "overflow"]
+    return primary, list(clients), critic_override, branch_pool, overflow_pool
 
 
 def _generate_and_fix(
@@ -577,6 +594,7 @@ class MultiFileLoop:
         pause_event: threading.Event | None = None,
         critic_client: OllamaClient | None = None,
         branch_pool: list[OllamaClient] | None = None,
+        overflow_pool: list[OllamaClient] | None = None,
     ):
         self.client = client
         self.config = config
@@ -591,11 +609,16 @@ class MultiFileLoop:
         # instead, regardless of which "quick" worker wrote the code.
         self._critic_client = critic_client
         # Clients eligible to branch a stuck file (see partition_clients_
-        # by_role) -- "smart" or "balanced", never "quick". Empty by
-        # default, same as every other role-derived param here: this
-        # class doesn't know what a role means, only which clients were
-        # pre-approved for the job.
+        # by_role) -- "smart", "balanced", or "overflow", never "quick".
+        # Empty by default, same as every other role-derived param here:
+        # this class doesn't know what a role means, only which clients
+        # were pre-approved for the job.
         self._branch_pool = list(branch_pool) if branch_pool else []
+        # Clients tagged "overflow" (see partition_clients_by_role) --
+        # only claim ordinary per-file work once every other client is
+        # already busy building something else. Empty by default, same
+        # zero-behavior-change-when-unused shape as `_branch_pool`.
+        self._overflow_pool = list(overflow_pool) if overflow_pool else []
 
     def run(self, goal: str) -> MultiFileRunResult:
         self.session.log("goal", goal=goal)
@@ -742,6 +765,24 @@ class MultiFileLoop:
         branching_enabled = bool(self._branch_pool) and self.config.branch_after_fixes > 0
         in_progress: dict[str, dict] = {}
 
+        # Overflow: an "overflow"-tagged endpoint (see partition_clients_
+        # by_role) only claims ordinary pending work once every other
+        # endpoint is already busy building something -- a solo goal (or
+        # the first file of any goal) always goes to a preferred endpoint
+        # alone. `non_overflow_active` starts at however many non-
+        # overflow endpoints exist and only ever counts down (a worker
+        # that's permanently retired can't be "busy" again); once it
+        # reaches 0 -- every non-overflow endpoint is gone for good, not
+        # just momentarily idle -- overflow endpoints are freed to work
+        # unconditionally, so a dead preferred endpoint can never strand
+        # pending work behind a permanently-unmet "wait your turn" gate.
+        # `non_overflow_busy` is each currently-mid-build non-overflow
+        # worker; overflow may claim exactly when it catches up to
+        # `non_overflow_active` (everyone who could still be busy, is).
+        overflow_enabled = bool(self._overflow_pool)
+        non_overflow_active = [sum(1 for c in self._pool if c not in self._overflow_pool)]
+        non_overflow_busy = [0]
+
         def record(task: FileTask, result: FileRunResult) -> None:
             results[result.path] = result
             order.append(result.path)
@@ -879,10 +920,23 @@ class MultiFileLoop:
             return None
 
         def worker(client: OllamaClient) -> None:
+            is_overflow = overflow_enabled and client in self._overflow_pool
+            # This worker's own current contribution to non_overflow_busy
+            # -- cleared at the top of the outer loop (the normal "done
+            # with one file, looking for the next" case) and, as a
+            # backstop, in `finally` (this worker died mid-build and never
+            # made it back around). Between those two, every exit from
+            # "busy" is covered without touching each of the several
+            # inner return/continue paths below individually.
+            marked_busy = False
             try:
                 while True:
                     is_branch = False
                     with cv:
+                        if marked_busy:
+                            non_overflow_busy[0] -= 1
+                            marked_busy = False
+                            cv.notify_all()
                         while True:
                             if abort_reason[0] is not None:
                                 return
@@ -900,9 +954,23 @@ class MultiFileLoop:
                                 # in `_generate_and_fix` between fix attempts.
                                 cv.wait(timeout=0.5)
                                 continue
-                            task = claim()
+                            # An overflow worker only competes for ordinary
+                            # pending work once it can't be leaving a
+                            # preferred endpoint idle -- either every
+                            # non-overflow endpoint is already busy, or
+                            # none are left active at all (a dead preferred
+                            # endpoint must never strand pending work
+                            # behind a wait that can no longer end).
+                            may_claim = (
+                                not is_overflow
+                                or non_overflow_busy[0] >= non_overflow_active[0]
+                            )
+                            task = claim() if may_claim else None
                             if task is not None:
                                 busy[0] += 1
+                                if not is_overflow:
+                                    non_overflow_busy[0] += 1
+                                    marked_busy = True
                                 if branching_enabled:
                                     in_progress[Path(task.path).name] = {
                                         "task": task,
@@ -932,6 +1000,9 @@ class MultiFileLoop:
                                 task = branch_task
                                 is_branch = True
                                 busy[0] += 1
+                                if not is_overflow:
+                                    non_overflow_busy[0] += 1
+                                    marked_busy = True
                                 break
                             cv.wait(timeout=0.5)
                         snapshot = list(results.values())
@@ -1104,6 +1175,10 @@ class MultiFileLoop:
             finally:
                 with cv:
                     active[0] -= 1
+                    if not is_overflow:
+                        non_overflow_active[0] -= 1
+                        if marked_busy:
+                            non_overflow_busy[0] -= 1
                     cv.notify_all()
 
         threads = [threading.Thread(target=worker, args=(c,), daemon=True) for c in self._pool]

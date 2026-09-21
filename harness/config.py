@@ -13,8 +13,13 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "defau
 #: What an endpoint is for, see orchestrator.partition_clients_by_role.
 #: "balanced" (the default) means "no opinion" -- an endpoint tagged this
 #: way (or every endpoint, if none are tagged at all) does everything,
-#: exactly like before this existed.
-ROLES = ("smart", "quick", "balanced")
+#: exactly like before this existed. "overflow" is for a slower/weaker
+#: endpoint that should sit out unless it can genuinely help: it never
+#: becomes the plan/critic client, and in the per-file dispatch loop it
+#: only claims a file once every non-"overflow" endpoint is already busy
+#: building something else -- a solo goal (or the first file of any
+#: goal) always goes to the faster/preferred endpoint(s) alone.
+ROLES = ("smart", "quick", "balanced", "overflow")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -26,7 +31,9 @@ class Endpoint:
     timeout_seconds: int
     # "smart" (bigger/slower/more careful -- plan, critic, integration
     # fixes), "quick" (smaller/faster -- the high-volume per-file spec/
-    # codegen/fix grind), or "balanced" (does either, see ROLES above).
+    # codegen/fix grind), "balanced" (does either), or "overflow" (only
+    # the per-file grind, and only once every other endpoint is busy --
+    # see ROLES above).
     role: str = "balanced"
 
 

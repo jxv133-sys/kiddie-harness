@@ -317,8 +317,17 @@ harness run --multi-file --goal "..." \
   endpoint with no role, or every endpoint on `balanced`, behaves exactly
   as if roles didn't exist — nothing changes until you actually tag one
   `smart` or `quick`.
+- **`overflow`** does the per-file grind too, but only once every
+  non-`overflow` endpoint is already busy building something else —
+  never plan/critic, and never given a file a preferred endpoint could
+  just take alone. For an endpoint that's consistently slower or weaker
+  than the rest of the pool (a home-lab box sitting next to a fast local
+  GPU, say) and should only ever help with genuinely parallel work — a
+  solo goal, or the first file of any goal, always goes to the preferred
+  endpoint(s) by itself; `overflow` only picks up a second file once
+  there's real concurrent work to do.
 
-The GUI has the same three options as a small dropdown next to each
+The GUI has the same four options as a small dropdown next to each
 endpoint's model/host. `role` is also a field in `config/default.yaml`'s
 `endpoints:` list, and a third comma-separated field on `--endpoint`
 (`HOST,MODEL,ROLE` — omit it for `balanced`).

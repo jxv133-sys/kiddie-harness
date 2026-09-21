@@ -240,7 +240,9 @@ class RunManager:
             ]
             pool = [self._client_factory(e.host, e.model, e.timeout_seconds) for e in eps]
             if multi_file:
-                primary, workers, critic_client, branch_pool = partition_clients_by_role(eps, pool)
+                primary, workers, critic_client, branch_pool, overflow_pool = (
+                    partition_clients_by_role(eps, pool)
+                )
                 MultiFileLoop(
                     primary,
                     config,
@@ -250,6 +252,7 @@ class RunManager:
                     pause_event=pause_event,
                     critic_client=critic_client,
                     branch_pool=branch_pool,
+                    overflow_pool=overflow_pool,
                 ).run(goal)
             else:
                 SingleFileLoop(
@@ -1210,10 +1213,11 @@ _INDEX_HTML = """<!doctype html>
     <div><select id="model"></select></div>
     <div><input type="text" id="host" placeholder="http://localhost:11434"></div>
     <div class="role-col">
-      <select id="role" title="Balanced does both plan/critic and per-file work. Smart handles plan/critic/integration-fix only. Quick does the per-file spec/codegen/fix grind only.">
+      <select id="role" title="Balanced does both plan/critic and per-file work. Smart handles plan/critic/integration-fix only. Quick does the per-file spec/codegen/fix grind only. Overflow does the per-file grind too, but only once every other endpoint is already busy.">
         <option value="balanced" selected>Balanced</option>
         <option value="smart">Smart</option>
         <option value="quick">Quick</option>
+        <option value="overflow">Overflow</option>
       </select>
     </div>
   </div>
@@ -1311,10 +1315,11 @@ function addEndpointRow(seed) {
     `<label>Endpoint <span style="text-transform:none;letter-spacing:0">(parallel, multi-file only)</span></label>` +
     `<div class="row"><div><select id="model${suffix}"></select></div>` +
     `<div><input type="text" id="host${suffix}" placeholder="http://localhost:11434"></div>` +
-    `<div class="role-col"><select id="role${suffix}">` +
+    `<div class="role-col"><select id="role${suffix}" title="Balanced does both plan/critic and per-file work. Smart handles plan/critic/integration-fix only. Quick does the per-file spec/codegen/fix grind only. Overflow does the per-file grind too, but only once every other endpoint is already busy.">` +
     `<option value="balanced" selected>Balanced</option>` +
     `<option value="smart">Smart</option>` +
     `<option value="quick">Quick</option>` +
+    `<option value="overflow">Overflow</option>` +
     `</select></div></div>` +
     `<button type="button" id="refresh${suffix}" class="link">&#8635; re-fetch models</button>` +
     `<button type="button" class="endpoint-remove" title="remove this endpoint">&times;</button>`;

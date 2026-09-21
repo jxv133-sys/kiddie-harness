@@ -26,6 +26,14 @@ ollama:
 #               "smart". The default; an endpoint with no role (or every
 #               endpoint on "balanced") behaves exactly as if roles
 #               didn't exist at all.
+#   overflow -- the per-file grind only, and only once every non-
+#               "overflow" endpoint is already busy building something
+#               else -- never used for plan/critic, and never given a
+#               file while a preferred endpoint could just take it
+#               solo. For a consistently slower/weaker endpoint (e.g. a
+#               home-lab box next to a fast local GPU) that should only
+#               ever help with genuinely parallel work, not compete for
+#               everything.
 # endpoints:
 #   - host: "http://192.168.50.142:7869"
 #     role: "smart"

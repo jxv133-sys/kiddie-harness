@@ -786,6 +786,102 @@ def test_a_stale_losing_attempt_never_overwrites_the_winning_branchs_file(tmp_pa
     assert sum(1 for e in events if e["event"] == "file_result") == 1
 
 
+def test_overflow_endpoint_never_claims_the_only_pending_file(tmp_path: Path):
+    # No parallel work exists (one file, one non-overflow endpoint) --
+    # overflow must sit out entirely, not just lose a race for it. An
+    # empty response queue means any call to it would raise, proving it
+    # was never even asked.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "a.py", "purpose": "x", "depends_on": []}]})
+    local = FakeClient([plan, "- spec", "x = 1\n"], host="http://local")
+    homelab = FakeClient([], host="http://homelab")
+
+    result = MultiFileLoop(
+        local, config, session, pool_clients=[local, homelab], overflow_pool=[homelab]
+    ).run("goal")
+
+    assert result.success
+    assert (session.run_dir / "a.py").read_text() == "x = 1"
+    assert homelab.calls == []
+
+
+def test_overflow_endpoint_claims_a_second_file_once_the_first_is_busy(tmp_path: Path):
+    # Two independent files -- genuine parallel work exists once the
+    # non-overflow endpoint is occupied with one of them, so overflow
+    # should pick up the other rather than leaving it for later. The
+    # delay keeps "local" busy long enough for "homelab" to notice its
+    # gate has opened and claim the second file, the same technique
+    # `test_an_idle_worker_does_not_retire...` above already relies on.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps(
+        {
+            "files": [
+                {"path": "a.py", "purpose": "x", "depends_on": []},
+                {"path": "b.py", "purpose": "y", "depends_on": []},
+            ]
+        }
+    )
+    local = FakeClient([plan, "- spec", "x = 1\n"], delay=0.1, host="http://local")
+    homelab = FakeClient(["- spec", "y = 1\n"], host="http://homelab")
+
+    result = MultiFileLoop(
+        local, config, session, pool_clients=[local, homelab], overflow_pool=[homelab]
+    ).run("goal")
+
+    assert result.success
+    assert {Path(f.path).name for f in result.files} == {"a.py", "b.py"}
+    assert len(homelab.calls) == 2  # spec + codegen -- it really built the second file
+
+
+def test_overflow_endpoint_unlocks_once_every_other_endpoint_is_gone_for_good(tmp_path: Path):
+    # A dead non-overflow endpoint must never permanently strand pending
+    # work behind an overflow gate that can no longer open on its own --
+    # once the only non-overflow endpoint is gone, overflow works
+    # unconditionally rather than waiting forever for a "busy" signal
+    # that will never come again.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps({"files": [{"path": "a.py", "purpose": "x", "depends_on": []}]})
+    local = FakeClient([OllamaError("endpoint died")], host="http://local")
+    homelab = FakeClient(["- spec", "x = 1\n"], host="http://homelab")
+
+    result = MultiFileLoop(
+        FakeClient([plan]),
+        config,
+        session,
+        pool_clients=[local, homelab],
+        overflow_pool=[homelab],
+    ).run("goal")
+
+    assert result.success
+    assert (session.run_dir / "a.py").read_text() == "x = 1"
+
+
+def test_overflow_pool_unset_never_restricts_anything(tmp_path: Path):
+    # Zero behavior change from before overflow existed: with no
+    # overflow_pool given, both endpoints compete for pending work the
+    # ordinary way, same as any other two-worker run.
+    config = make_config(tmp_path)
+    session = Session.create(config.workspace_root)
+    plan = json.dumps(
+        {
+            "files": [
+                {"path": "a.py", "purpose": "x", "depends_on": []},
+                {"path": "b.py", "purpose": "y", "depends_on": []},
+            ]
+        }
+    )
+    a = FakeClient([plan, "- spec", "x = 1\n"], host="http://a")
+    b = FakeClient(["- spec", "y = 1\n"], host="http://b")
+
+    result = MultiFileLoop(a, config, session, pool_clients=[a, b]).run("goal")
+
+    assert result.success
+    assert len(a.calls) + len(b.calls) == 5  # plan + 2x(spec+codegen), split across both
+
+
 def test_run_aborts_gracefully_when_the_model_becomes_unreachable(tmp_path: Path):
     config = make_config(tmp_path)
     session = Session.create(config.workspace_root)
